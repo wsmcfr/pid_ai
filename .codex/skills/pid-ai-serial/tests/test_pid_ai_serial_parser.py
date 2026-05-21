@@ -61,6 +61,48 @@ class PidAiSerialParserTest(unittest.TestCase):
         self.assertFalse(parsed["valid"])
         self.assertIn("mode out of range", parsed["error"])
 
+    def test_pid_rejects_nan_numeric_fields(self) -> None:
+        """
+        函数作用：
+            验证 {PID} 数值字段出现 NaN 时不会进入有效遥测状态。
+
+        主要流程：
+            1. 将 target 字段替换为 nan，模拟串口坏数据或固件格式错误。
+            2. 调用 parse_frame。
+            3. 校验 valid=False，且 error 明确指出 target 必须是有限数。
+
+        返回值：
+            unittest 断言失败时抛出异常。
+            通过时无返回值，表示 parser 会拒绝 NaN 而不是把坏帧写入有效样本。
+        """
+        bad_line = VALID_PID_LINE.replace("1000.000", "nan", 1)
+
+        parsed = pid_ai_serial.parse_frame(bad_line)
+
+        self.assertFalse(parsed["valid"])
+        self.assertIn("target must be finite", parsed["error"])
+
+    def test_cfg_rejects_infinite_numeric_fields(self) -> None:
+        """
+        函数作用：
+            验证 {CFG} 数值字段出现无穷大时不会被当作有效配置。
+
+        主要流程：
+            1. 将 kp 字段替换为 inf，覆盖 Python float 默认可解析无穷大的边界。
+            2. 调用 parse_frame。
+            3. 校验 valid=False，且 error 明确指出 kp 必须是有限数。
+
+        返回值：
+            unittest 断言失败时抛出异常。
+            通过时无返回值，表示 parser 会拒绝无穷大而不是把坏配置写入状态。
+        """
+        bad_line = VALID_CFG_LINE.replace("1.200000", "inf", 1)
+
+        parsed = pid_ai_serial.parse_frame(bad_line)
+
+        self.assertFalse(parsed["valid"])
+        self.assertIn("kp must be finite", parsed["error"])
+
     def test_cfg_sample_from_protocol_doc_is_valid(self) -> None:
         """
         函数作用：

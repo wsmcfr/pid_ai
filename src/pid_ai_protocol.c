@@ -12,6 +12,17 @@
 #define PIDAI_CMD_PREFIX_LEN 5U
 
 /*
+ * 宏作用：
+ *   解析游标的特殊标记，表示上一轮分隔符后存在一个空的尾随字段。
+ *
+ * 使用说明：
+ *   该值不会被解引用，只用于和 cursor 做身份比较。之所以不用空指针表示尾随空字段，
+ *   是因为空指针已经表示“字段刚好解析完毕”；两者必须区分，才能把
+ *   "{CMD}SET_PID,1,2,3," 识别为多余参数而不是合法命令。
+ */
+#define PIDAI_TRAILING_EMPTY_TOKEN ((char *)1)
+
+/*
  * 函数作用：
  *   将字符串安全复制到固定长度缓冲区。
  *
@@ -212,20 +223,25 @@ static int PIDAI_ParseInt(const char *text, int *value)
  * 主要流程：
  *   1. 从 cursor 当前指向位置开始查找逗号。
  *   2. 找到逗号则把逗号替换为 '\0' 并推进 cursor。
- *   3. 找不到逗号则返回最后一个字段并把 cursor 置空。
+ *   3. 如果逗号后已经是字符串结尾，则用 PIDAI_TRAILING_EMPTY_TOKEN 标记尾随空字段。
+ *   4. 找不到逗号则返回最后一个字段并把 cursor 置空。
  *
  * 参数说明：
- *   cursor 指向当前解析位置的指针。
+ *   cursor 指向当前解析位置的指针；函数会原地更新 *cursor。
+ *   cursor 或 *cursor 为空表示已经没有字段可读。
+ *   *cursor 等于 PIDAI_TRAILING_EMPTY_TOKEN 表示上一轮解析遇到尾随逗号。
  *
  * 返回值：
- *   返回当前字段字符串；没有字段时返回空指针。
+ *   返回当前字段字符串，字段内容位于调用方传入的可写缓冲区内。
+ *   返回空指针表示没有可返回字段，可能是正常结束，也可能是尾随空字段已被标记。
  */
 static char *PIDAI_NextToken(char **cursor)
 {
     char *start;
     char *comma;
 
-    if (cursor == 0 || *cursor == 0) {
+    if (cursor == 0 || *cursor == 0 || *cursor == PIDAI_TRAILING_EMPTY_TOKEN) {
+        /* 空指针表示正常无字段；特殊标记表示尾随空字段已经被记录，二者都不能继续取 token。 */
         return 0;
     }
 
@@ -237,8 +253,37 @@ static char *PIDAI_NextToken(char **cursor)
     }
 
     *comma = '\0';
-    *cursor = comma + 1;
+    if (comma[1] == '\0') {
+        /* 末尾逗号代表一个空的多余参数，必须保留下来给 PIDAI_NoMoreTokens 判错。 */
+        *cursor = PIDAI_TRAILING_EMPTY_TOKEN;
+    } else {
+        *cursor = comma + 1;
+    }
     return start;
+}
+
+/*
+ * 函数作用：
+ *   判断命令参数是否已经精确消费完毕。
+ *
+ * 主要流程：
+ *   1. 如果 cursor 为空，表示最后一个字段已经被正常消费，返回 1。
+ *   2. 如果 cursor 非空，表示仍存在未消费字段或尾随空字段，返回 0。
+ *
+ * 参数说明：
+ *   cursor 当前命令解析位置。
+ *   cursor == 0 表示字段刚好结束。
+ *   cursor == PIDAI_TRAILING_EMPTY_TOKEN 表示命令末尾存在多余空参数，例如尾随逗号。
+ *   其他非空值表示还有至少一个未解析参数。
+ *
+ * 返回值：
+ *   返回 1 表示没有多余参数。
+ *   返回 0 表示存在多余参数，调用方应返回 PIDAI_CMD_ARG_INVALID / UNEXPECTED_ARG。
+ */
+static int PIDAI_NoMoreTokens(const char *cursor)
+{
+    /* 只有空指针代表参数精确结束；任何非空值都表示还有多余字段或尾随空字段。 */
+    return cursor == 0;
 }
 
 /*
@@ -338,6 +383,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
             !PIDAI_ParseFloat(arg_kd, &kd)) {
             return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
         }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
 
         ret = PIDAI_SetTunings(pid, kp, ki, kd);
         if (ret == -2) {
@@ -360,6 +408,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
         if (!PIDAI_ParseFloat(arg_kf, &kf)) {
             return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
         }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
 
         ret = PIDAI_SetFeedForward(pid, kf);
         if (ret == -2) {
@@ -381,6 +432,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
         }
         if (!PIDAI_ParseFloat(arg_target, &target)) {
             return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
         }
 
         ret = PIDAI_SetTarget(pid, target);
@@ -406,6 +460,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
         if (!PIDAI_ParseFloat(arg_min, &out_min) || !PIDAI_ParseFloat(arg_max, &out_max)) {
             return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
         }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
 
         ret = PIDAI_SetOutputLimits(pid, out_min, out_max);
         if (ret == -2) {
@@ -430,6 +487,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
         if (!PIDAI_ParseFloat(arg_min, &integral_min) || !PIDAI_ParseFloat(arg_max, &integral_max)) {
             return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
         }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
 
         ret = PIDAI_SetIntegralLimits(pid, integral_min, integral_max);
         if (ret == -2) {
@@ -451,6 +511,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
         }
         if (!PIDAI_ParseInt(arg_mode, &mode_value)) {
             return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "INT_PARSE_FAIL");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
         }
 
         ret = PIDAI_SetMode(pid, (PIDAI_Mode)mode_value);
@@ -474,6 +537,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
         if (!PIDAI_ParseFloat(arg_output, &manual_out)) {
             return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
         }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
 
         ret = PIDAI_SetManualOutput(pid, manual_out);
         if (ret == -2) {
@@ -496,6 +562,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
         if (!PIDAI_ParseInt(arg_enable, &enable)) {
             return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "INT_PARSE_FAIL");
         }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
 
         ret = PIDAI_Enable(pid, enable);
         if (ret != 0) {
@@ -514,6 +583,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
         }
         if (!PIDAI_ParseInt(arg_reverse, &reverse)) {
             return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "INT_PARSE_FAIL");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
         }
 
         ret = PIDAI_SetReverse(pid, reverse);
@@ -534,6 +606,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
         if (!PIDAI_ParseInt(arg_sensor, &sensor_ok)) {
             return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "INT_PARSE_FAIL");
         }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
 
         ret = PIDAI_SetSensorOk(pid, sensor_ok);
         if (ret != 0) {
@@ -544,6 +619,10 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
     }
 
     if (strcmp(command, "RESET_I") == 0) {
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
         ret = PIDAI_ResetIntegral(pid);
         if (ret != 0) {
             return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "RESET_I_FAIL");
@@ -553,6 +632,10 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
     }
 
     if (strcmp(command, "RESET") == 0) {
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
         ret = PIDAI_Reset(pid);
         if (ret != 0) {
             return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "RESET_FAIL");
@@ -562,6 +645,10 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
     }
 
     if (strcmp(command, "CLEAR_FAULT") == 0) {
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
         ret = PIDAI_ClearFault(pid);
         if (ret != 0) {
             return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "CLEAR_FAULT_FAIL");
@@ -571,6 +658,10 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
     }
 
     if (strcmp(command, "GET_CFG") == 0 || strcmp(command, "GET_STAT") == 0) {
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
         return PIDAI_MakeResult(PIDAI_CMD_OK, command, "OK");
     }
 

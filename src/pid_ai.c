@@ -142,6 +142,8 @@ int PIDAI_Reset(PIDAI_Handle *pid)
     float ki;
     float kd;
     float kf;
+    float target;       /* RESET 后继续使用的控制目标值，避免上位机刚下发的目标被清零。 */
+    float manual_out;   /* RESET 后继续使用的手动输出请求，避免手动模式恢复时输出配置丢失。 */
     float out_min;
     float out_max;
     float integral_min;
@@ -154,11 +156,13 @@ int PIDAI_Reset(PIDAI_Handle *pid)
         return -1;
     }
 
-    /* 复位运行状态时保留用户配置，避免 RESET 后丢失上位机刚下发的参数。 */
+    /* 复位运行状态时保留用户配置，避免 RESET 后丢失上位机刚下发的参数、目标或手动输出。 */
     kp = pid->kp;
     ki = pid->ki;
     kd = pid->kd;
     kf = pid->kf;
+    target = pid->target;
+    manual_out = pid->manual_out;
     out_min = pid->out_min;
     out_max = pid->out_max;
     integral_min = pid->integral_min;
@@ -173,6 +177,8 @@ int PIDAI_Reset(PIDAI_Handle *pid)
     pid->ki = ki;
     pid->kd = kd;
     pid->kf = kf;
+    pid->target = target;
+    pid->manual_out = manual_out;
     pid->out_min = out_min;
     pid->out_max = out_max;
     pid->integral_min = integral_min;

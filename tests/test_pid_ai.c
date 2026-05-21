@@ -161,6 +161,108 @@ static int test_protocol_set_pid(void)
 
 /*
  * 函数作用：
+ *   测试 RESET 只复位运行状态，不丢失上位机已经下发的目标值和手动输出配置。
+ *
+ * 主要流程：
+ *   1. 初始化 PID 控制器并写入 target、manual_out、模式和使能状态。
+ *   2. 执行一次 PID 更新，让运行态字段产生非零值。
+ *   3. 通过协议 RESET 命令复位运行状态。
+ *   4. 校验 result.status 为 PIDAI_CMD_OK，说明 RESET 命令已被协议层接受。
+ *   5. 校验配置字段保留，运行态字段清零。
+ *
+ * 返回值：
+ *   返回 1 表示 RESET 保留操作配置且清空运行状态。
+ *   返回 0 表示命令状态、保留字段或清零字段任意一项不符合预期。
+ */
+static int test_protocol_reset_preserves_operator_config(void)
+{
+    PIDAI_Handle pid;
+    PIDAI_CommandResult result;
+
+    PIDAI_Init(&pid);
+    PIDAI_SetTunings(&pid, 1.0f, 0.2f, 0.1f);
+    PIDAI_SetOutputLimits(&pid, -50.0f, 50.0f);
+    PIDAI_SetTarget(&pid, 25.0f);
+    PIDAI_SetManualOutput(&pid, 12.0f);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&pid, 1);
+    PIDAI_Update(&pid, 20.0f, 10U, 10.0f);
+
+    result = PIDAI_ProtocolHandleCommand(&pid, "{CMD}RESET");
+
+    if (result.status != PIDAI_CMD_OK) return 0;
+    if (!float_close(pid.target, 25.0f)) return 0;
+    if (!float_close(pid.manual_out, 12.0f)) return 0;
+    if (pid.mode != PIDAI_MODE_AUTO) return 0;
+    if (pid.enable != 1) return 0;
+    if (!float_close(pid.error, 0.0f)) return 0;
+    if (!float_close(pid.integral, 0.0f)) return 0;
+    if (pid.seq != 0U) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   测试命令参数数量必须精确匹配，避免多余字段被静默忽略。
+ *
+ * 主要流程：
+ *   1. 初始化 PID 控制器。
+ *   2. 发送带 4 个参数的 SET_PID 命令。
+ *   3. 校验 result.status 为 PIDAI_CMD_ARG_INVALID。
+ *   4. 校验 result.detail 为 UNEXPECTED_ARG，且 PID 参数没有被部分更新。
+ *
+ * 返回值：
+ *   返回 1 表示协议层拒绝多余参数且没有修改 PID 参数。
+ *   返回 0 表示多余参数被错误接受、错误明细不对或状态被部分更新。
+ */
+static int test_protocol_rejects_extra_arguments(void)
+{
+    PIDAI_Handle pid;
+    PIDAI_CommandResult result;
+
+    PIDAI_Init(&pid);
+    result = PIDAI_ProtocolHandleCommand(&pid, "{CMD}SET_PID,1.200,0.030,0.080,99.000");
+
+    if (result.status != PIDAI_CMD_ARG_INVALID) return 0;
+    if (strcmp(result.detail, "UNEXPECTED_ARG") != 0) return 0;
+    if (!float_close(pid.kp, 0.0f)) return 0;
+    if (!float_close(pid.ki, 0.0f)) return 0;
+    if (!float_close(pid.kd, 0.0f)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   测试命令末尾多出的空字段也会被拒绝，避免尾随逗号被当作合法命令。
+ *
+ * 主要流程：
+ *   1. 初始化 PID 控制器。
+ *   2. 发送尾随逗号的 SET_PID 命令。
+ *   3. 校验 result.status 为 PIDAI_CMD_ARG_INVALID。
+ *   4. 校验 result.detail 为 UNEXPECTED_ARG，说明尾随空字段按多余参数处理。
+ *
+ * 返回值：
+ *   返回 1 表示尾随空字段被拒绝。
+ *   返回 0 表示尾随逗号被错误当作合法命令或错误明细不符合协议。
+ */
+static int test_protocol_rejects_trailing_empty_argument(void)
+{
+    PIDAI_Handle pid;
+    PIDAI_CommandResult result;
+
+    PIDAI_Init(&pid);
+    result = PIDAI_ProtocolHandleCommand(&pid, "{CMD}SET_PID,1.200,0.030,0.080,");
+
+    if (result.status != PIDAI_CMD_ARG_INVALID) return 0;
+    if (strcmp(result.detail, "UNEXPECTED_ARG") != 0) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
  *   测试遥测帧打包是否包含固定前缀和关键字段。
  *
  * 主要流程：
@@ -225,6 +327,18 @@ int main(void)
     }
     if (!test_protocol_set_pid()) {
         printf("FAIL: test_protocol_set_pid\n");
+        return 1;
+    }
+    if (!test_protocol_reset_preserves_operator_config()) {
+        printf("FAIL: test_protocol_reset_preserves_operator_config\n");
+        return 1;
+    }
+    if (!test_protocol_rejects_extra_arguments()) {
+        printf("FAIL: test_protocol_rejects_extra_arguments\n");
+        return 1;
+    }
+    if (!test_protocol_rejects_trailing_empty_argument()) {
+        printf("FAIL: test_protocol_rejects_trailing_empty_argument\n");
         return 1;
     }
     if (!test_build_telemetry_frame()) {

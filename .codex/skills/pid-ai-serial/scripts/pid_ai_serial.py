@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -263,21 +264,30 @@ def decode_line(raw: bytes) -> str:
 def parse_number(field_name: str, value: str) -> int | float:
     """
     函数作用：
-        按协议字段类型解析数值。
+        按协议字段类型解析数值，并拒绝不能用于 PID 诊断的非有限浮点值。
 
     主要流程：
-        整数字段使用 int 解析；其他字段使用 float 解析。
+        1. 协议中的整数字段使用 int 解析。
+        2. 其他字段使用 float 解析。
+        3. 对 float 结果执行 math.isfinite 校验，拒绝 nan、inf 和 -inf。
 
     参数说明：
-        field_name 为协议字段名。
-        value 为字段文本。
+        field_name 为协议字段名，用于决定 int/float 类型并生成错误消息。
+        value 为字段文本，来自 `{PID}` 或 `{CFG}` 帧的逗号分隔字段。
 
     返回值：
-        返回 int 或 float。
+        返回 int 或 float，类型与协议字段定义一致。
+        int(value) 或 float(value) 失败时抛出 ValueError。
+        浮点值不是有限数时抛出 ValueError，调用方会把该帧标记为 valid=False。
     """
     if field_name in INTEGER_FIELDS:
         return int(value)
-    return float(value)
+
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        # Python 可以把 "nan" 和 "inf" 解析成 float；这里必须拦截，避免坏帧进入有效遥测状态。
+        raise ValueError(f"{field_name} must be finite")
+    return parsed
 
 
 def validate_named_numeric_data(kind: str, data: dict[str, int | float]) -> str | None:
