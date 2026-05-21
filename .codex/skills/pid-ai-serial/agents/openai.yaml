@@ -1,0 +1,4 @@
+interface:
+  display_name: "PID AI Serial"
+  short_description: "Open PID AI serial dashboard"
+  default_prompt: "Use $pid-ai-serial to open the PID AI dashboard, auto-detect the board COM port, and inspect live protocol frames."

@@ -1,8 +1,14 @@
 # 本地 AI/编辑器/任务编排工具目录，不属于 PID AI 项目源码。
 .agents/
 .claude/
-.codex/
 .trellis/
+
+# 项目内 Codex skill 属于本仓库能力，允许提交；其他 .codex 内容继续忽略。
+.codex/*
+!.codex/skills/
+.codex/skills/*
+!.codex/skills/pid-ai-serial/
+!.codex/skills/pid-ai-serial/**
 
 # 本地协作规则文件，避免把个人环境说明误提交到公开仓库。
 AGENTS.md
@@ -12,6 +18,10 @@ Thumbs.db
 Desktop.ini
 *.swp
 *.tmp
+
+# Python 本地运行和测试缓存。
+__pycache__/
+*.pyc
 
 # C/C++ 编译产物。
 *.exe

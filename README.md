@@ -46,8 +46,10 @@
 | `include/pid_ai_protocol.h` | 串口协议头文件，定义命令解析结果、ACK/ERR、遥测打包接口 |
 | `src/pid_ai_protocol.c` | 串口协议实现，负责解析 `{CMD}` 命令并打包 `{PID}`、`{CFG}`、`{ACK}`、`{ERR}` |
 | `docs/pid_ai_serial_protocol.md` | 串口协议详细文档，说明每个上传字段和每条下发命令的含义 |
+| `docs/pid_ai_dashboard.md` | 本地 Web 上位机启动方式、API 契约、错误矩阵和验证命令 |
 | `examples/pid_ai_board_example.c` | 板端接入示例，演示如何初始化 PID、周期计算、上传遥测、处理上位机命令 |
 | `tests/test_pid_ai.c` | PC 侧 C 测试，用于验证 PID 计算、限幅、手动模式和协议解析是否正确 |
+| `.codex/skills/pid-ai-serial/` | Codex skill：自动识别板端 COM 口、读取串口帧，并可打开本地 Web 上位机 |
 
 ## 系统整体架构
 
@@ -81,6 +83,45 @@
 | 记录实验数据 | 保存 CSV 或日志，便于回放和对比 |
 | AI 分析诊断 | 判断超调、震荡、响应慢、积分饱和、输出饱和等问题 |
 | 下发参数修改 | 通过 `{CMD}SET_PID,kp,ki,kd` 修改板端参数 |
+
+## 本地 Web 上位机
+
+仓库内置 `pid-ai-serial` Codex skill，可用于自动识别 PID AI 板端串口，并打开本地 Web 上位机查看曲线和发送参数命令。
+
+### 启动方式
+
+在仓库根目录运行：
+
+```powershell
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --auto --open
+```
+
+如果已经知道板端串口，也可以指定端口和波特率：
+
+```powershell
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port COM5 --baud 115200 --open
+```
+
+上位机默认监听 `127.0.0.1:8765`。如果端口被占用，脚本会自动选择一个空闲端口并在终端输出 URL。
+
+### 当前上位机能力
+
+| 区域 | 功能 |
+|---|---|
+| 串口连接 | 列出 COM 口、自动识别 PID AI 协议串口、连接、断开 |
+| 实时波形 | Canvas 显示 `target`、`feedback`、`error`、`p_out`、`i_out`、`d_out`、`out_limited`、`actuator` |
+| 安全状态 | 显示 `sensor_ok`、`fault`、`sat`、`anti_windup`、`mode`、`enable` |
+| 参数设置 | 生成并发送 `SET_PID`、`SET_KF`、`SET_TARGET`、`SET_OUT_LIMIT`、`SET_I_LIMIT`、`SET_MODE`、`SET_MANUAL_OUT`、`ENABLE`、`SET_REVERSE`、`SET_SENSOR_OK`、`RESET_I`、`CLEAR_FAULT`、`GET_CFG` |
+| 命令历史 | 记录 pending 命令，并只在收到 `{ACK}` 后标记为确认；收到 `{ERR}` 或本地串口错误时显示失败 |
+
+### 安全约束
+
+| 约束 | 说明 |
+|---|---|
+| 自动识别和打开页面是只读操作 | 启动上位机不会主动修改板端参数 |
+| 所有 `{CMD}` 必须由用户点击按钮或显式 API 请求触发 | 避免 AI 或脚本在无人确认时改变真实硬件状态 |
+| 没有 `{ACK}` 不认为命令生效 | 串口写入成功不等于板端应用成功 |
+| `ENABLE,1`、`SET_MODE,2`、`SET_OUT_LIMIT` 会二次确认 | 这些命令可能直接影响执行器输出 |
 
 ## 板端上传什么数据
 
@@ -204,4 +245,3 @@ seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out
 | 自动调参前必须检查 `sensor_ok` 和 `fault` | 传感器异常时调参没有意义，还可能危险 |
 | 第一版建议人工确认 AI 建议 | 不建议一开始就让 AI 无限制自动修改板端参数 |
 | 上位机没有收到 `{ACK}` 不应认为命令生效 | 串口可能丢包、格式可能错误、参数可能越界 |
-

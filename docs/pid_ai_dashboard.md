@@ -1,0 +1,180 @@
+# PID AI 本地 Web 上位机
+
+本文档说明仓库内置的 `pid-ai-serial` skill 上位机。它用于自动识别板端 COM 口、读取 PID AI 串口协议帧、显示实时波形，并在用户显式确认后发送 `{CMD}` 命令。
+
+## 1. 启动命令
+
+在仓库根目录运行：
+
+```powershell
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --auto --open
+```
+
+如果已经知道串口：
+
+```powershell
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port COM5 --baud 115200 --open
+```
+
+| 参数 | 含义 |
+|---|---|
+| `--host` | HTTP 监听地址，默认 `127.0.0.1` |
+| `--port` | 首选 HTTP 端口，默认 `8765`；占用时自动选择空闲端口 |
+| `--open` | 启动后用默认浏览器打开页面 |
+| `--auto` | 启动后后台自动扫描 PID AI 板端串口 |
+| `--serial-port` | 手动指定串口，例如 `COM5` |
+| `--baud` | 手动指定串口波特率，默认 `115200` |
+| `--baud-rates` | 自动扫描候选波特率，例如 `115200,9600` |
+| `--include-bluetooth` | 自动扫描时包含 Windows 蓝牙虚拟串口 |
+| `--max-samples` | Python 侧保留的最大 `{PID}` 样本数 |
+
+## 2. 数据流
+
+```text
+板端 UART 行文本
+    ↓
+pid_ai_serial.parse_frame()
+    ↓
+DashboardState typed state
+    ↓
+本地 HTTP JSON API
+    ↓
+浏览器 UI / Canvas 波形 / 命令历史
+```
+
+| 边界 | 输入 | 输出 | 校验责任 |
+|---|---|---|---|
+| 串口到 parser | 一行文本协议帧 | `kind`、`valid`、`data`、`error` 字典 | `pid_ai_serial.py` 校验前缀、字段数量、数值类型、枚举范围 |
+| parser 到 dashboard state | typed frame | 最新 `{PID}` / `{CFG}` / 命令历史 | `DashboardState.ingest_line()` 只接受 `valid=True` 的 typed frame 进入主状态 |
+| state 到 HTTP API | 内存状态 | JSON 快照或样本列表 | HTTP 层只返回深拷贝，避免调用方修改内部状态 |
+| UI 到命令 API | `{CMD}` 文本 | pending / ack / err / local_error 命令历史 | `normalize_command()` 和 `extract_command_name()` 校验命令前缀和命令名 |
+
+## 3. 本地 API
+
+所有接口只监听本机地址，默认 `127.0.0.1`。响应使用 UTF-8 JSON。
+
+### `GET /api/ports`
+
+返回当前系统可见串口。
+
+响应字段：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `ports[].device` | string | 串口名，例如 `COM5` |
+| `ports[].description` | string | 系统串口描述 |
+| `ports[].hwid` | string | 硬件 ID |
+| `ports[].manufacturer` | string/null | 厂商信息 |
+| `ports[].vid` | number/null | USB VID |
+| `ports[].pid` | number/null | USB PID |
+| `ports[].is_bluetooth` | boolean | 是否判断为蓝牙虚拟串口 |
+
+### `GET /api/status`
+
+返回上位机当前状态。
+
+核心响应字段：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `connected` | boolean | 当前是否已打开串口 |
+| `connecting` | boolean | 是否正在后台扫描或连接 |
+| `port` | string/null | 当前连接串口 |
+| `baud` | number/null | 当前连接波特率 |
+| `connection_error` | string/null | 最近一次连接或读取错误 |
+| `latest_pid` | object/null | 最近一条有效 `{PID}` 样本 |
+| `latest_cfg` | object/null | 最近一条有效 `{CFG}` 配置 |
+| `parse_errors` | number | 坏帧计数 |
+| `last_bad_line` | string/null | 最近一条坏帧 |
+| `sample_count` | number | 当前保留样本数量 |
+| `latest_sample_id` | number | 最新样本自增 ID |
+| `command_history` | array | 命令交易历史 |
+
+### `GET /api/samples?since=0&limit=500`
+
+返回自增 ID 大于 `since` 的 `{PID}` 样本。
+
+| 参数 | 类型 | 默认值 | 含义 |
+|---|---|---:|---|
+| `since` | integer | `0` | 前端已收到的最后样本 ID |
+| `limit` | integer | `500` | 最多返回样本数 |
+
+响应字段：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `samples[].id` | number | 上位机侧样本自增 ID |
+| `samples[].received_at` | number | 本机接收时间戳 |
+| `samples[].kind` | string | 固定为 `pid` |
+| `samples[].valid` | boolean | 固定为 `true` |
+| `samples[].data` | object | 按协议字段名解析后的 `{PID}` 数据 |
+
+### `POST /api/connect`
+
+连接串口。连接和自动扫描在后台线程执行，接口会立即返回当前状态。
+
+请求 JSON：
+
+| 字段 | 类型 | 必填 | 含义 |
+|---|---|---|---|
+| `auto` | boolean | 否 | 是否自动识别 PID AI 板端串口 |
+| `port` | string | 否 | 手动串口名；未传且 `auto=true` 时自动扫描 |
+| `baud` | number | 否 | 手动波特率，默认 `115200` |
+| `baud_rates` | string | 否 | 自动扫描波特率列表，例如 `115200,9600` |
+| `sample_seconds` | number | 否 | 每组端口/波特率采样秒数 |
+| `max_lines` | number | 否 | 每组最多读取行数 |
+| `include_bluetooth` | boolean | 否 | 是否扫描蓝牙虚拟串口 |
+
+### `POST /api/disconnect`
+
+断开当前串口并释放资源。请求体可以为空 JSON。
+
+### `POST /api/command`
+
+发送一条用户显式提交的 `{CMD}` 命令。
+
+请求 JSON：
+
+| 字段 | 类型 | 必填 | 含义 |
+|---|---|---|---|
+| `command` | string | 是 | 完整 `{CMD}` 文本，例如 `{CMD}GET_CFG` |
+
+响应字段：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `command.command` | string | 原始 `{CMD}` 文本 |
+| `command.command_name` | string | 命令名，例如 `GET_CFG` |
+| `command.status` | string | `pending`、`ack`、`err` 或 `error` |
+| `command.response` | object/null | 板端 `{ACK}` / `{ERR}`，或本地错误 |
+
+## 4. 错误矩阵
+
+| 场景 | 行为 | 用户可见状态 |
+|---|---|---|
+| 无串口或没有 PID AI 协议输出 | 自动连接失败，不退出 HTTP 服务 | `connection_error = "No PID AI board port detected."` |
+| 串口被其他工具占用 | 连接失败，不保留半开连接 | `connection_error` 显示 pyserial 错误 |
+| `{PID}` 字段数量不足或枚举越界 | 不进入样本缓冲 | `parse_errors` 增加，`last_bad_line` 记录原始行 |
+| 未连接时发送命令 | 不伪装成板端回复 | 命令历史为 `status=error`，`response.kind=local_error` |
+| 板端回复 `{ACK}` | 更新匹配的 pending 命令 | 命令历史为 `status=ack` |
+| 板端回复 `{ERR}` | 更新匹配的 pending 命令 | 命令历史为 `status=err` 并保留错误详情 |
+| 收到无法匹配的 `{ACK}` / `{ERR}` | 保留为 unsolicited 历史 | 命令历史 `unsolicited=true` |
+
+## 5. Good / Base / Bad 用例
+
+| 类型 | 用例 | 期望 |
+|---|---|---|
+| Good | 板端持续发送合法 `{PID}`，页面打开后自动连接 | 曲线持续刷新，`latest_sample_id` 递增 |
+| Base | 没有插入板端，启动 `--auto --open` | 页面正常打开，显示连接失败原因，不崩溃 |
+| Bad | 发送 `{PID}1,2,3` 截断帧 | 样本缓冲不增加，`parse_errors` 增加 |
+| Bad | 未连接时 POST `{CMD}GET_CFG` | 命令历史为 `error/local_error`，不显示为 ACK |
+
+## 6. 验证命令
+
+```powershell
+python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v
+python -B -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py
+python C:\Users\caofengrui\.codex\skills\.system\skill-creator\scripts\quick_validate.py .codex\skills\pid-ai-serial
+```
+
+无真实板端时，也应能启动服务并请求 `/api/status`，状态中应包含 `connection_error`，但 HTTP 服务本身保持可用。
