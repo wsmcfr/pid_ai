@@ -1,0 +1,7 @@
+{"file": ".trellis/workflow.md", "reason": "Project workflow and conventions"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend development guide"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Frontend development guide"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "C库错误码和fault位图规范"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "C代码风格和注释规范"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "遥测帧和协议规范"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "前端状态管理规范"}

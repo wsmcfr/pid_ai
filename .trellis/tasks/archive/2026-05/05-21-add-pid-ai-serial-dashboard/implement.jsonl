@@ -1,0 +1,8 @@
+{"file": ".trellis/workflow.md", "reason": "Project workflow and conventions"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend development guide"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Frontend development guide"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "Dashboard layout, chart, status, tuning, and command history conventions"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "Typed frame schema, validation, and command builder requirements"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Serial frame to API to UI data-flow boundaries"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "Serial connection, telemetry buffer, confirmed config, and command transaction ownership"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "ACK/ERR safety, parser tests, visible safety state, and bounded telemetry requirements"}

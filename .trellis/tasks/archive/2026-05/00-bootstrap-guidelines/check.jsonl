@@ -1,0 +1,5 @@
+{"file": ".claude/commands/trellis/finish-work.md", "reason": "Finish work checklist"}
+{"file": ".claude/commands/trellis/check.md", "reason": "Code quality check spec"}
+{"file": ".trellis/spec/backend/", "type": "directory", "reason": "Backend guideline documents changed by this task"}
+{"file": "tests/", "type": "directory", "reason": "Regression tests demonstrate required behavior"}
+{"file": ".trellis/spec/frontend/", "type": "directory", "reason": "Frontend guideline documents changed by this task"}
