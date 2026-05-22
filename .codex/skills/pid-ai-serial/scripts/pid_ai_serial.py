@@ -23,6 +23,7 @@ import json
 import math
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import Iterable
 
@@ -509,7 +510,8 @@ def scan_ports(ports: Iterable[str], baud_rates: Iterable[int], sample_seconds: 
         扫描多个串口和多个波特率组合。
 
     主要流程：
-        嵌套遍历端口和波特率，收集每组扫描结果，并按得分降序排序。
+        使用线程池并行执行各组合的 scan_port，再按得分降序排序；
+        串口 IO 大部分时间在等待，因此并行能显著缩短多端口探测时间。
 
     参数说明：
         ports 为串口名集合。
@@ -520,7 +522,18 @@ def scan_ports(ports: Iterable[str], baud_rates: Iterable[int], sample_seconds: 
     返回值：
         返回排序后的扫描结果列表。
     """
-    results = [scan_port(port, baud, sample_seconds, max_lines) for port in ports for baud in baud_rates]
+    tasks = [(port, baud) for port in ports for baud in baud_rates]
+    if not tasks:
+        return []
+
+    max_workers = min(8, len(tasks))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(
+            executor.map(
+                lambda args: scan_port(args[0], args[1], sample_seconds, max_lines),
+                tasks,
+            )
+        )
     return sorted(results, key=lambda item: item.score, reverse=True)
 
 

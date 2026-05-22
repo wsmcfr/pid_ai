@@ -257,8 +257,10 @@ class DashboardState:
                 }
                 self._next_sample_id += 1
                 self._samples.append(sample)
-                self.latest_pid = json_safe_copy(sample)
-                return json_safe_copy(sample)
+                # 一次拷贝同时供 latest_pid 和返回值使用，避免对同一样本调用两次 deepcopy。
+                copied = json_safe_copy(sample)
+                self.latest_pid = copied
+                return copied
 
             if parsed.get("kind") == "cfg" and parsed.get("valid"):
                 record = {"received_at": now, **parsed}
@@ -1021,7 +1023,10 @@ INDEX_HTML = r"""<!doctype html>
       <section class="panel chart-panel">
         <div class="panel-header">
           <div class="panel-title">实时波形</div>
-          <div class="muted" id="sampleText">0 samples</div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button id="pauseBtn">暂停</button>
+            <div class="muted" id="sampleText">0 samples</div>
+          </div>
         </div>
         <div class="legend" id="legend"></div>
         <div class="chart-wrap">
@@ -1135,6 +1140,7 @@ INDEX_HTML = r"""<!doctype html>
     let lastSampleId = 0;
     let latestStatus = null;
     let activePreview = "{CMD}";
+    let paused = false;
 
     const el = (id) => document.getElementById(id);
     const fmt = (value) => {
@@ -1201,6 +1207,8 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function refreshSamples() {
+      // 暂停状态下停止拉取新样本，让画面定格在当前时刻。
+      if (paused) return;
       const data = await api(`/api/samples?since=${lastSampleId}&limit=300`);
       if (data.samples.length) {
         for (const sample of data.samples) {
@@ -1262,6 +1270,7 @@ INDEX_HTML = r"""<!doctype html>
       el("frameText").textContent = `seq ${fmt(pid.seq)} / ms ${fmt(pid.ms)}`;
 
       applyCfgToForm(status.latest_cfg?.data);
+      applyPidToForm(status.latest_pid?.data);
       renderHistory(status.command_history || []);
     }
 
@@ -1273,9 +1282,18 @@ INDEX_HTML = r"""<!doctype html>
       if (!cfg) return;
       const form = el("tuningForm");
       if (form.contains(document.activeElement)) return;
+      // CFG 帧不包含 target，target 字段在 applyPidToForm 中由 latest_pid 单独同步。
       for (const key of ["kp", "ki", "kd", "kf", "out_min", "out_max", "integral_min", "integral_max", "mode", "reverse"]) {
         if (cfg[key] !== undefined && el(key)) el(key).value = cfg[key];
       }
+    }
+
+    function applyPidToForm(pid) {
+      if (!pid) return;
+      const form = el("tuningForm");
+      if (form.contains(document.activeElement)) return;
+      // 只把 PID 帧专有的运行字段（target）回填到表单，避免覆盖 CFG 同步过来的参数。
+      if (pid.target !== undefined && el("target")) el("target").value = pid.target;
     }
 
     function renderHistory(history) {
@@ -1304,8 +1322,22 @@ INDEX_HTML = r"""<!doctype html>
     function drawChart() {
       const canvas = el("chart");
       const ctx = canvas.getContext("2d");
-      const width = canvas.width;
-      const height = canvas.height;
+
+      // 高 DPI 缩放：让 canvas 内部分辨率匹配设备像素，避免高分屏出现模糊。
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      const cssWidth = rect.width || canvas.clientWidth || canvas.width;
+      const cssHeight = rect.height || canvas.clientHeight || canvas.height;
+      const targetW = Math.round(cssWidth * dpr);
+      const targetH = Math.round(cssHeight * dpr);
+      if (canvas.width !== targetW || canvas.height !== targetH) {
+        canvas.width = targetW;
+        canvas.height = targetH;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const width = cssWidth;
+      const height = cssHeight;
       ctx.clearRect(0, 0, width, height);
       ctx.fillStyle = "#ffffff";
       ctx.fillRect(0, 0, width, height);
@@ -1350,10 +1382,33 @@ INDEX_HTML = r"""<!doctype html>
       min -= pad;
       max += pad;
 
+      // X 轴使用样本中的 ms（板端时间戳），让横轴反映真实采样间隔；
+      // 缺少 ms 字段时退化为按下标线性分布，避免坐标计算异常。
+      const msValues = samples
+        .map((sample) => Number(sample.data?.ms))
+        .filter((value) => Number.isFinite(value));
+      const useMs = msValues.length === samples.length && samples.length > 0;
+      const msMin = useMs ? Math.min(...msValues) : 0;
+      const msMax = useMs ? Math.max(...msValues) : 1;
+      const msRange = (msMax - msMin) || 1;
+
       ctx.fillStyle = "#5b6472";
       ctx.font = "12px Consolas";
       ctx.fillText(fmt(max), 8, plot.top + 12);
       ctx.fillText(fmt(min), 8, plot.bottom);
+
+      // X 轴底部时间标签：左、中、右三个刻度（单位：ms）。
+      if (useMs) {
+        const xTicks = [
+          { x: plot.left, value: msMin },
+          { x: (plot.left + plot.right) / 2, value: msMin + msRange / 2 },
+          { x: plot.right, value: msMax }
+        ];
+        for (const tick of xTicks) {
+          const label = `${tick.value.toFixed(0)} ms`;
+          ctx.fillText(label, Math.max(plot.left, tick.x - 28), plot.bottom + 16);
+        }
+      }
 
       for (const item of visible) {
         ctx.strokeStyle = item.color;
@@ -1361,10 +1416,14 @@ INDEX_HTML = r"""<!doctype html>
         ctx.beginPath();
         let started = false;
         samples.forEach((sample, index) => {
-          const value = Number(sample.data?.[item.key]);
-          if (!Number.isFinite(value)) return;
-          const x = plot.left + (plot.right - plot.left) * index / Math.max(1, samples.length - 1);
-          const y = plot.bottom - (plot.bottom - plot.top) * (value - min) / (max - min);
+          const v = Number(sample.data?.[item.key]);
+          if (!Number.isFinite(v)) return;
+          const ms = Number(sample.data?.ms);
+          const xRatio = useMs && Number.isFinite(ms)
+            ? (ms - msMin) / msRange
+            : index / Math.max(1, samples.length - 1);
+          const x = plot.left + (plot.right - plot.left) * xRatio;
+          const y = plot.bottom - (plot.bottom - plot.top) * (v - min) / (max - min);
           if (!started) {
             ctx.moveTo(x, y);
             started = true;
@@ -1451,6 +1510,11 @@ INDEX_HTML = r"""<!doctype html>
         control.addEventListener("input", () => {
           el("commandPreview").textContent = activePreview;
         });
+      });
+      // 暂停/继续按钮：暂停时停止追加新样本，继续时下一次轮询恢复抓取。
+      el("pauseBtn").addEventListener("click", () => {
+        paused = !paused;
+        el("pauseBtn").textContent = paused ? "继续" : "暂停";
       });
     }
 

@@ -30,12 +30,13 @@ static int float_close(float actual, float expected)
 
 /*
  * 函数作用：
- *   测试 PID 正常计算流程是否符合公式。
+ *   测试 PID 正常计算流程是否符合公式（dt 归一化 + Derivative on Measurement 算法）。
  *
  * 主要流程：
  *   1. 初始化 PID 控制器并设置参数。
- *   2. 执行一次 PID 更新。
- *   3. 校验误差、P/I/D 项、原始输出和限幅输出。
+ *   2. 第一次调用 Update 让 last_feedback 同步为 7，避免初始 last_feedback=0 引起 D 项尖峰。
+ *   3. 第二次调用 Update（feedback 不变），此时 d_error=0，整体输出可预测。
+ *   4. 校验误差、积分、P/I/D 项、原始输出和限幅输出。
  *
  * 返回值：
  *   返回 1 表示测试通过，返回 0 表示测试失败。
@@ -52,16 +53,30 @@ static int test_pid_update_normal(void)
     PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
     PIDAI_Enable(&pid, 1);
 
+    /* 先调用一次让 last_feedback 同步为 7，避免初始 last_feedback=0 时 D 项产生大冲击。 */
     PIDAI_Update(&pid, 7.0f, 10U, 10.0f);
+    /* 第二次调用时 d_error=0，D 项为 0，整体输出可预测。 */
+    PIDAI_Update(&pid, 7.0f, 20U, 10.0f);
 
+    /*
+     * 期望值（dt=10ms=0.01s 归一化后）：
+     *   error    = 10 - 7 = 3
+     *   d_error  = 7 - 7 = 0（feedback 不变）
+     *   integral = 0.03 + 3 * 0.01 = 0.06
+     *   p_out    = 2 * 3 = 6
+     *   i_out    = 0.5 * 0.06 = 0.03
+     *   d_out    = -1 * 0 / 0.01 = 0
+     *   out_raw  = 6 + 0.03 + 0 = 6.03
+     */
     if (!float_close(pid.error, 3.0f)) return 0;
-    if (!float_close(pid.integral, 3.0f)) return 0;
+    if (!float_close(pid.d_error, 0.0f)) return 0;
+    if (!float_close(pid.integral, 0.06f)) return 0;
     if (!float_close(pid.p_out, 6.0f)) return 0;
-    if (!float_close(pid.i_out, 1.5f)) return 0;
-    if (!float_close(pid.d_out, 3.0f)) return 0;
-    if (!float_close(pid.out_raw, 10.5f)) return 0;
-    if (!float_close(pid.out_limited, 10.5f)) return 0;
-    if (!float_close(pid.actuator, 10.5f)) return 0;
+    if (!float_close(pid.i_out, 0.03f)) return 0;
+    if (!float_close(pid.d_out, 0.0f)) return 0;
+    if (!float_close(pid.out_raw, 6.03f)) return 0;
+    if (!float_close(pid.out_limited, 6.03f)) return 0;
+    if (!float_close(pid.actuator, 6.03f)) return 0;
     if (pid.sat != PIDAI_SAT_NONE) return 0;
 
     return 1;
@@ -69,12 +84,12 @@ static int test_pid_update_normal(void)
 
 /*
  * 函数作用：
- *   测试 PID 输出超过执行器范围时是否正确限幅并设置饱和标志。
+ *   测试 PID 输出超过执行器范围时是否正确限幅、设置饱和标志并触发抗饱和。
  *
  * 主要流程：
  *   1. 设置较大的 Kp 让输出超过上限。
  *   2. 执行一次 PID 更新。
- *   3. 校验原始输出、限幅输出和饱和标志。
+ *   3. 校验原始输出、限幅输出、饱和标志，以及 Conditional Integration 的 anti_windup 标志。
  *
  * 返回值：
  *   返回 1 表示测试通过，返回 0 表示测试失败。
@@ -84,7 +99,7 @@ static int test_pid_output_saturation(void)
     PIDAI_Handle pid;
 
     PIDAI_Init(&pid);
-    PIDAI_SetTunings(&pid, 20.0f, 0.0f, 0.0f);
+    PIDAI_SetTunings(&pid, 20.0f, 0.1f, 0.0f);
     PIDAI_SetOutputLimits(&pid, 0.0f, 100.0f);
     PIDAI_SetTarget(&pid, 10.0f);
     PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
@@ -92,10 +107,16 @@ static int test_pid_output_saturation(void)
 
     PIDAI_Update(&pid, 0.0f, 20U, 20.0f);
 
-    if (!float_close(pid.out_raw, 200.0f)) return 0;
+    /*
+     * P 项主导输出：p_out = 20 * 10 = 200，已经远超上限 100，
+     * Conditional Integration 检测到饱和方向（HIGH）与误差方向（>0）一致，
+     * 因此 anti_windup=1，integral 不累加。
+     */
     if (!float_close(pid.out_limited, 100.0f)) return 0;
     if (!float_close(pid.actuator, 100.0f)) return 0;
     if (pid.sat != PIDAI_SAT_HIGH) return 0;
+    if (pid.anti_windup != 1) return 0;
+    if (!float_close(pid.integral, 0.0f)) return 0;
 
     return 1;
 }
@@ -300,6 +321,44 @@ static int test_build_telemetry_frame(void)
 
 /*
  * 函数作用：
+ *   测试 Derivative on Measurement 算法在 target 阶跃时不产生 D 项尖峰。
+ *
+ * 主要流程：
+ *   1. 让 feedback 稳定在 10，调用一次 Update 让控制器进入稳态。
+ *   2. 把 target 从 10 阶跃到 100，但 feedback 保持不变。
+ *   3. 校验 D 项为 0（feedback 没变化），输出仅由 P 项构成。
+ *
+ * 返回值：
+ *   返回 1 表示 D 项被正确抑制；返回 0 表示出现 Derivative Kick。
+ */
+static int test_derivative_kick_suppressed(void)
+{
+    PIDAI_Handle pid;
+    float out2;
+
+    PIDAI_Init(&pid);
+    PIDAI_SetTunings(&pid, 1.0f, 0.0f, 1.0f);
+    PIDAI_SetOutputLimits(&pid, -10000.0f, 10000.0f);
+    PIDAI_SetTarget(&pid, 10.0f);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&pid, 1);
+
+    /* 第一次：feedback 稳定在 10，让 last_feedback 同步为 10。 */
+    PIDAI_Update(&pid, 10.0f, 10U, 10.0f);
+
+    /* target 阶跃到 100，但 feedback 不变；D 项应当为 0。 */
+    PIDAI_SetTarget(&pid, 100.0f);
+    out2 = PIDAI_Update(&pid, 10.0f, 20U, 10.0f);
+
+    /* feedback 没变化，d_error=0，d_out=0；输出只剩 P 项 = kp*(100-10) = 90。 */
+    if (!float_close(pid.d_out, 0.0f)) return 0;
+    if (!float_close(out2, 90.0f)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
  *   运行所有 PID AI 库的基础测试。
  *
  * 主要流程：
@@ -343,6 +402,10 @@ int main(void)
     }
     if (!test_build_telemetry_frame()) {
         printf("FAIL: test_build_telemetry_frame\n");
+        return 1;
+    }
+    if (!test_derivative_kick_suppressed()) {
+        printf("FAIL: test_derivative_kick_suppressed\n");
         return 1;
     }
 

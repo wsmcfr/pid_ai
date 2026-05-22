@@ -85,7 +85,8 @@ typedef struct
 
     float error;           /* 当前误差，通常等于 target - feedback。 */
     float last_error;      /* 上一次误差，用于计算误差变化量。 */
-    float d_error;         /* 误差变化量，通常等于 error - last_error。 */
+    float last_feedback;   /* 上一次反馈值，用于对 feedback 求导计算 D 项，避免 target 阶跃时产生尖峰。 */
+    float d_error;         /* 误差变化量，新算法下等于 feedback - last_feedback，仅用于 D 项物理诊断。 */
     float integral;        /* 积分累计量，用于计算 I 项输出。 */
 
     float p_out;           /* P 项输出，等于 kp * error。 */

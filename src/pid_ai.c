@@ -412,39 +412,53 @@ float PIDAI_Update(PIDAI_Handle *pid, float feedback, uint32_t ms, float dt_ms)
     /* reverse 用于统一处理反向执行器，避免用户通过负 PID 参数绕过诊断逻辑。 */
     computed_error = pid->reverse ? (pid->feedback - pid->target) : (pid->target - pid->feedback);
     pid->error = computed_error;
-    pid->d_error = pid->error - pid->last_error;
 
-    next_integral = pid->integral + pid->error;
+    /*
+     * D 项对 feedback 求值，避免 target 阶跃时产生尖峰（Derivative Kick 问题）。
+     * 符号取反是因为 feedback 增大时误差会减小，D 项应该抑制输出。
+     * dt_ms / 1000.0f 把变化量归一到秒，使 kd 的物理含义与采样周期无关。
+     */
+    pid->d_error = pid->feedback - pid->last_feedback;
+    pid->d_out   = -pid->kd * pid->d_error / (dt_ms / 1000.0f);
+
+    /* 积分归一化到物理时间单位（秒），使 ki 的含义与控制周期无关。 */
+    next_integral = pid->integral + pid->error * (dt_ms / 1000.0f);
     next_integral = PIDAI_ClampWithSat(next_integral, pid->integral_min, pid->integral_max, 0);
 
-    pid->p_out = pid->kp * pid->error;
-    pid->i_out = pid->ki * next_integral;
-    pid->d_out = pid->kd * pid->d_error;
+    pid->p_out  = pid->kp * pid->error;
+    pid->i_out  = pid->ki * next_integral;
+    /* d_out 已在上面计算。 */
     pid->ff_out = pid->kf * pid->target;
 
-    candidate_raw = pid->p_out + pid->i_out + pid->d_out + pid->ff_out;
+    candidate_raw     = pid->p_out + pid->i_out + pid->d_out + pid->ff_out;
     candidate_limited = PIDAI_ClampWithSat(candidate_raw, pid->out_min, pid->out_max, &candidate_sat);
 
     /*
-     * 简单积分抗饱和策略：
-     *   当输出已顶到上限且误差仍推动输出继续增大，或输出已顶到下限且误差仍推动输出继续减小时，
-     *   撤销本次积分，避免 integral 越积越大导致解除饱和后严重超调。
+     * Conditional Integration 抗饱和策略：
+     *   仅在输出未饱和，或饱和方向与误差方向相反（误差正在把输出拉离饱和边界）时
+     *   才累计积分；比 clamping 策略更稳定，不会在饱和边界附近振荡。
      */
-    if ((candidate_sat == PIDAI_SAT_HIGH && pid->error > 0.0f) ||
-        (candidate_sat == PIDAI_SAT_LOW && pid->error < 0.0f)) {
+    if (candidate_sat == PIDAI_SAT_NONE ||
+        (candidate_sat == PIDAI_SAT_HIGH && pid->error < 0.0f) ||
+        (candidate_sat == PIDAI_SAT_LOW  && pid->error > 0.0f))
+    {
+        pid->integral = next_integral;
+        pid->anti_windup = 0;
+    }
+    else
+    {
         pid->anti_windup = 1;
         pid->i_out = pid->ki * pid->integral;
-        candidate_raw = pid->p_out + pid->i_out + pid->d_out + pid->ff_out;
+        candidate_raw     = pid->p_out + pid->i_out + pid->d_out + pid->ff_out;
         candidate_limited = PIDAI_ClampWithSat(candidate_raw, pid->out_min, pid->out_max, &candidate_sat);
-    } else {
-        pid->integral = next_integral;
     }
 
-    pid->out_raw = candidate_raw;
-    pid->out_limited = candidate_limited;
-    pid->actuator = candidate_limited;
-    pid->sat = candidate_sat;
-    pid->last_error = pid->error;
+    pid->out_raw       = candidate_raw;
+    pid->out_limited   = candidate_limited;
+    pid->actuator      = candidate_limited;
+    pid->sat           = candidate_sat;
+    pid->last_error    = pid->error;
+    pid->last_feedback = pid->feedback;  /* 保存本次 feedback，供下次 D 项计算使用。 */
 
     return pid->actuator;
 }

@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "pid_ai.h"
 #include "pid_ai_protocol.h"
@@ -235,6 +236,7 @@ void Board_PidAiControlTick(void)
  *   2. 成功时回复 {ACK}。
  *   3. 失败时回复 {ERR}。
  *   4. 对 GET_CFG 命令额外回复当前 {CFG}。
+ *   5. 对 GET_STAT 命令保留位置，真实项目应回送 {STAT} 帧。
  *
  * 参数说明：
  *   line 串口收到的一行文本，例如 "{CMD}SET_PID,0.9,0.03,0.12"。
@@ -255,10 +257,17 @@ void Board_PidAiOnUartLine(const char *line)
             Board_UartWriteString(tx_buffer);
         }
 
-        if (result.command[0] == 'G' && result.command[1] == 'E' && result.command[2] == 'T' &&
-            result.command[3] == '_' && result.command[4] == 'C' && result.command[5] == 'F' &&
-            result.command[6] == 'G' && result.command[7] == '\0') {
+        /* GET_CFG 命令额外回送一帧 {CFG}，让上位机一次拿到全部配置。 */
+        if (strcmp(result.command, "GET_CFG") == 0) {
             Board_SendConfig();
+        }
+
+        /*
+         * GET_STAT 命令：当前示例没有完整的 {STAT} 帧实现，仅以 ACK 占位即可；
+         * 真实项目应在此调用 Board_SendStat() 输出电压、电流、温度等板端健康字段。
+         */
+        if (strcmp(result.command, "GET_STAT") == 0) {
+            /* 真实项目：Board_SendStat(); */
         }
     } else {
         written = PIDAI_ProtocolBuildError(&result, tx_buffer, sizeof(tx_buffer));
