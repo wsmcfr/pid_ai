@@ -76,15 +76,8 @@ def extract_command_name(command: str) -> str:
     返回值：
         返回命令名，例如 "SET_PID"；格式非法时抛出 ValueError。
     """
-    text = command.strip()
-    if not text.startswith("{CMD}"):
-        raise ValueError("command must start with {CMD}")
-
-    payload = text[len("{CMD}") :].strip()
-    command_name = payload.split(",", 1)[0].strip().upper()
-    if not command_name:
-        raise ValueError("command name is required")
-    return command_name
+    metadata = serial_tool.extract_command_metadata(command)
+    return str(metadata["command_name"])
 
 
 def make_local_response(kind: str, command_name: str, detail: str) -> dict[str, Any]:
@@ -145,6 +138,7 @@ class DashboardState:
         self._command_history: deque[dict[str, Any]] = deque(maxlen=max(1, max_command_history))
         self._next_sample_id = 1
         self._next_command_id = 1
+        self._loops: dict[str, dict[str, Any]] = {}
 
         # 串口资源字段只由 connect/disconnect 和读取线程修改，必须在锁内访问。
         self._serial_handle: Any | None = None
@@ -162,8 +156,20 @@ class DashboardState:
 
         self.latest_pid: dict[str, Any] | None = None
         self.latest_cfg: dict[str, Any] | None = None
+        self.latest_sens: dict[str, Any] | None = None
         self.latest_stat: dict[str, Any] | None = None
         self.latest_evt: dict[str, Any] | None = None
+        self._autotune_controller = serial_tool.AutoTuneController(serial_tool.AutoTuneConfig())
+        self.autotune: dict[str, Any] = {
+            "enabled": False,
+            "mode": "observe",
+            "profile": "line-car-cascade",
+            "state": "IDLE",
+            "current_loop": None,
+            "last_action": None,
+        }
+        self.scores: dict[str, Any] = {}
+        self.rollback_history: list[dict[str, Any]] = []
         self.parse_errors = 0
         self.last_bad_line: str | None = None
 
@@ -194,8 +200,13 @@ class DashboardState:
                 "last_line_at": self.last_line_at,
                 "latest_pid": json_safe_copy(self.latest_pid),
                 "latest_cfg": json_safe_copy(self.latest_cfg),
+                "latest_sens": json_safe_copy(self.latest_sens),
                 "latest_stat": json_safe_copy(self.latest_stat),
                 "latest_evt": json_safe_copy(self.latest_evt),
+                "loops": json_safe_copy(self._loops),
+                "autotune": json_safe_copy(self.autotune),
+                "scores": json_safe_copy(self.scores),
+                "rollback_history": json_safe_copy(self.rollback_history),
                 "parse_errors": self.parse_errors,
                 "last_bad_line": self.last_bad_line,
                 "sample_count": len(self._samples),
@@ -249,7 +260,7 @@ class DashboardState:
         with self._lock:
             self.last_line_at = now
 
-            if parsed.get("kind") == "pid" and parsed.get("valid"):
+            if parsed.get("kind") in ("pid", "pidx") and parsed.get("valid"):
                 sample = {
                     "id": self._next_sample_id,
                     "received_at": now,
@@ -257,14 +268,34 @@ class DashboardState:
                 }
                 self._next_sample_id += 1
                 self._samples.append(sample)
+                if parsed.get("kind") == "pidx":
+                    loop_id = str(parsed.get("data", {}).get("loop_id", ""))
+                    if loop_id:
+                        loop_state = self._loops.setdefault(loop_id, {"latest_pid": None, "latest_cfg": None})
+                        loop_state["latest_pid"] = json_safe_copy(sample)
+                        loop_state["updated_at"] = now
+                self._update_autotune_locked(parsed, now)
                 # 一次拷贝同时供 latest_pid 和返回值使用，避免对同一样本调用两次 deepcopy。
                 copied = json_safe_copy(sample)
                 self.latest_pid = copied
                 return copied
 
-            if parsed.get("kind") == "cfg" and parsed.get("valid"):
+            if parsed.get("kind") in ("cfg", "cfgx") and parsed.get("valid"):
                 record = {"received_at": now, **parsed}
+                if parsed.get("kind") == "cfgx":
+                    loop_id = str(parsed.get("data", {}).get("loop_id", ""))
+                    if loop_id:
+                        loop_state = self._loops.setdefault(loop_id, {"latest_pid": None, "latest_cfg": None})
+                        loop_state["latest_cfg"] = json_safe_copy(record)
+                        loop_state["updated_at"] = now
+                self._update_autotune_locked(parsed, now)
                 self.latest_cfg = json_safe_copy(record)
+                return json_safe_copy(record)
+
+            if parsed.get("kind") == "sens" and parsed.get("valid"):
+                record = {"received_at": now, **parsed}
+                self._update_autotune_locked(parsed, now)
+                self.latest_sens = json_safe_copy(record)
                 return json_safe_copy(record)
 
             if parsed.get("kind") == "stat" and parsed.get("valid"):
@@ -278,6 +309,7 @@ class DashboardState:
                 return json_safe_copy(record)
 
             if parsed.get("kind") in ("ack", "err") and parsed.get("valid"):
+                self._update_autotune_locked(parsed, now)
                 self._attach_command_response_locked(parsed, now)
                 return json_safe_copy(parsed)
 
@@ -287,7 +319,7 @@ class DashboardState:
                 self.last_bad_line = text
             return json_safe_copy(parsed)
 
-    def record_command(self, command: str) -> dict[str, Any]:
+    def record_command(self, command: str, reason: str | None = None) -> dict[str, Any]:
         """
         函数作用：
             记录一条用户显式请求发送的 {CMD} 命令。
@@ -303,8 +335,10 @@ class DashboardState:
         返回值：
             返回新建的命令历史条目；格式非法时抛出 ValueError。
         """
-        normalized = serial_tool.normalize_command(command).strip()
-        command_name = extract_command_name(normalized)
+        metadata = serial_tool.extract_command_metadata(command)
+        normalized = str(metadata["command"])
+        command_name = str(metadata["command_name"])
+        loop_id = metadata.get("loop_id")
 
         with self._lock:
             entry = {
@@ -313,6 +347,8 @@ class DashboardState:
                 "updated_at": time.time(),
                 "command": normalized,
                 "command_name": command_name,
+                "loop_id": loop_id,
+                "reason": reason,
                 "status": "pending",
                 "response": None,
                 "unsolicited": False,
@@ -346,7 +382,7 @@ class DashboardState:
                 return json_safe_copy(entry)
         return None
 
-    def send_command(self, command: str) -> dict[str, Any]:
+    def send_command(self, command: str, reason: str | None = None) -> dict[str, Any]:
         """
         函数作用：
             向已连接串口发送一条用户显式给出的 {CMD} 命令。
@@ -363,7 +399,7 @@ class DashboardState:
         返回值：
             返回命令历史条目；串口未连接或写入失败时条目状态为 error。
         """
-        entry = self.record_command(command)
+        entry = self.record_command(command, reason=reason)
         wire_text = serial_tool.normalize_command(command)
 
         with self._lock:
@@ -424,7 +460,7 @@ class DashboardState:
         for entry in reversed(self._command_history):
             if entry["status"] != "pending":
                 continue
-            if entry["command_name"] != response_command:
+            if not serial_tool.response_matches_pending_command(entry, parsed):
                 continue
             entry["status"] = response_kind
             entry["updated_at"] = now
@@ -437,12 +473,119 @@ class DashboardState:
             "updated_at": now,
             "command": "",
             "command_name": response_command,
+            "loop_id": None,
+            "reason": None,
             "status": response_kind,
             "response": json_safe_copy(parsed),
             "unsolicited": True,
         }
         self._next_command_id += 1
         self._command_history.append(entry)
+
+    def configure_autotune(
+        self,
+        enabled: bool,
+        mode: str = "observe",
+        profile: str = "line-car-cascade",
+        max_step: float = 0.10,
+        window_seconds: float = 3.0,
+        rollback_on_regression: bool = True,
+    ) -> dict[str, Any]:
+        """
+        函数作用：
+            配置 dashboard 内置自动调参状态机。
+
+        主要流程：
+            1. 校验模式、profile 和步长。
+            2. 创建新的 AutoTuneController，避免旧窗口和 pending 命令污染新会话。
+            3. 更新 status 中的 autotune 快照。
+
+        参数说明：
+            enabled 表示是否启用自动调参状态机。
+            mode 为 observe、suggest 或 auto-tune；只有 auto-tune 会自动写命令。
+            profile 为串级 profile，目前支持 line-car-cascade。
+            max_step 为单次参数最大变化比例。
+            window_seconds 为评分窗口秒数。
+            rollback_on_regression 表示评分变差时是否生成回滚命令。
+
+        返回值：
+            返回更新后的 dashboard 快照。
+        """
+        if mode not in ("observe", "suggest", "auto-tune"):
+            raise ValueError("mode must be observe, suggest, or auto-tune")
+        if profile != "line-car-cascade":
+            raise ValueError("profile must be line-car-cascade")
+        if max_step <= 0.0 or max_step > 0.5:
+            raise ValueError("max_step must be within 0.0 and 0.5")
+        if window_seconds <= 0.0:
+            raise ValueError("window_seconds must be positive")
+
+        config = serial_tool.AutoTuneConfig(
+            auto=bool(enabled and mode == "auto-tune"),
+            profile=profile,
+            mode=mode,
+            max_step=max_step,
+            window_seconds=window_seconds,
+            rollback_on_regression=rollback_on_regression,
+        )
+        with self._lock:
+            self._autotune_controller = serial_tool.AutoTuneController(config)
+            self.scores = {}
+            self.rollback_history = []
+            self.autotune = {
+                "enabled": bool(enabled),
+                "mode": mode,
+                "profile": profile,
+                "state": "DISCOVER" if enabled else "IDLE",
+                "current_loop": None,
+                "last_action": None,
+                "max_step": max_step,
+                "window_seconds": window_seconds,
+                "rollback_on_regression": bool(rollback_on_regression),
+            }
+        return self.snapshot()
+
+    def _update_autotune_locked(self, parsed: dict[str, Any], now: float) -> None:
+        """
+        函数作用：
+            在已持锁状态下把协议帧喂给自动调参状态机并同步 dashboard 快照。
+
+        主要流程：
+            1. 未启用时直接返回，保证 dashboard 默认只读。
+            2. ACK/ERR 走 handle_response，其余 typed frame 走 ingest_frame。
+            3. 调用 plan_next_action 得到建议、写参或回滚动作。
+            4. 仅当 mode=auto-tune 时自动发送动作命令，并记录 reason。
+
+        参数说明：
+            parsed 为本次解析出的协议帧。
+            now 为收到该帧的本机时间戳。
+
+        返回值：
+            无返回值，直接更新 autotune、scores、rollback_history 和命令历史。
+        """
+        if not self.autotune.get("enabled"):
+            return
+
+        if parsed.get("kind") in ("ack", "err"):
+            self._autotune_controller.handle_response(parsed)
+        else:
+            self._autotune_controller.ingest_frame(parsed)
+
+        action = self._autotune_controller.plan_next_action()
+        self.scores = json_safe_copy(self._autotune_controller.scores)
+        self.rollback_history = json_safe_copy(self._autotune_controller.rollback_history)
+        self.autotune["state"] = self._autotune_controller.state
+        self.autotune["current_loop"] = action.get("loop_id")
+        self.autotune["last_action"] = json_safe_copy(action)
+        self.autotune["updated_at"] = now
+
+        if action.get("type") not in ("send", "rollback"):
+            return
+        if self.autotune.get("mode") != "auto-tune":
+            return
+
+        entry = self.send_command(str(action["command"]), reason=str(action.get("reason") or "auto-tune"))
+        self.autotune["last_sent_command_id"] = entry.get("id")
 
     def connect(
         self,
@@ -941,6 +1084,32 @@ INDEX_HTML = r"""<!doctype html>
       padding: 8px 12px 12px;
     }
 
+    .loop-list,
+    .autotune-box {
+      display: grid;
+      gap: 8px;
+      padding: 12px;
+    }
+
+    .loop-row {
+      display: grid;
+      grid-template-columns: minmax(84px, 0.7fr) repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: #fbfcfe;
+      font-family: Consolas, "Cascadia Mono", monospace;
+      font-size: 12px;
+    }
+
+    .autotune-controls {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+
     .history-row {
       display: grid;
       grid-template-columns: 74px 1fr;
@@ -1049,6 +1218,45 @@ INDEX_HTML = r"""<!doctype html>
             <span class="muted" id="frameText">seq --</span>
           </div>
           <div class="term-grid" id="termGrid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div class="panel-title">多环状态</div>
+            <span class="muted" id="loopCountText">0 loops</span>
+          </div>
+          <div class="loop-list" id="loopList"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div class="panel-title">自动调参</div>
+            <span class="badge" id="autotuneBadge">OFF</span>
+          </div>
+          <div class="autotune-box">
+            <div class="autotune-controls">
+              <label>mode
+                <select id="autotuneMode">
+                  <option value="observe">observe</option>
+                  <option value="suggest">suggest</option>
+                  <option value="auto-tune">auto-tune</option>
+                </select>
+              </label>
+              <label>max_step
+                <input id="autotuneMaxStep" type="number" value="0.10" min="0.01" max="0.50" step="0.01" />
+              </label>
+              <label>window_s
+                <input id="autotuneWindow" type="number" value="3.0" min="0.1" step="0.1" />
+              </label>
+            </div>
+            <div class="command-preview" id="autotunePreview">IDLE</div>
+            <div class="actions">
+              <button id="autotuneObserveBtn">观察</button>
+              <button id="autotuneSuggestBtn">建议</button>
+              <button id="autotuneAutoBtn" class="primary">自动</button>
+              <button id="autotuneStopBtn" class="danger">停止</button>
+            </div>
+          </div>
         </section>
 
         <section class="panel">
@@ -1271,6 +1479,8 @@ INDEX_HTML = r"""<!doctype html>
 
       applyCfgToForm(status.latest_cfg?.data);
       applyPidToForm(status.latest_pid?.data);
+      renderLoops(status.loops || {});
+      renderAutotune(status.autotune || {}, status.scores || {}, status.rollback_history || []);
       renderHistory(status.command_history || []);
     }
 
@@ -1296,6 +1506,41 @@ INDEX_HTML = r"""<!doctype html>
       if (pid.target !== undefined && el("target")) el("target").value = pid.target;
     }
 
+    function renderLoops(loops) {
+      const entries = Object.entries(loops);
+      el("loopCountText").textContent = `${entries.length} loops`;
+      const container = el("loopList");
+      if (!entries.length) {
+        container.innerHTML = `<div class="muted">等待 PIDX/CFGX</div>`;
+        return;
+      }
+      container.innerHTML = entries.map(([loopId, loop]) => {
+        const pid = loop.latest_pid?.data || {};
+        const cfg = loop.latest_cfg?.data || {};
+        return `
+          <div class="loop-row">
+            <strong>${loopId}</strong>
+            <span>kp ${fmt(cfg.kp)}</span>
+            <span>err ${fmt(pid.error)}</span>
+            <span>sat ${fmt(pid.sat)}</span>
+            <span>fault ${fmt(pid.fault ?? cfg.fault)}</span>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function renderAutotune(autotune, scores, rollbackHistory) {
+      const badge = el("autotuneBadge");
+      badge.className = autotune.enabled ? (autotune.mode === "auto-tune" ? "badge warn" : "badge ok") : "badge";
+      badge.textContent = autotune.enabled ? autotune.mode : "OFF";
+      const action = autotune.last_action || {};
+      const loopId = autotune.current_loop || action.loop_id || "--";
+      const score = scores[loopId]?.score;
+      const rollbackCount = rollbackHistory.length || 0;
+      el("autotunePreview").textContent =
+        `state=${autotune.state || "IDLE"} loop=${loopId} action=${action.type || "--"} score=${fmt(score)} rollback=${rollbackCount} command=${action.command || "--"}`;
+    }
+
     function renderHistory(history) {
       const container = el("history");
       if (!history.length) {
@@ -1307,11 +1552,15 @@ INDEX_HTML = r"""<!doctype html>
         const response = item.response
           ? (item.response.raw || `${item.response.kind}:${item.response.detail || ""}`)
           : "等待 ACK/ERR";
+        const meta = [item.loop_id ? `loop=${item.loop_id}` : "", item.reason ? `reason=${item.reason}` : ""]
+          .filter(Boolean)
+          .join(" ");
         return `
           <div class="history-row">
             <span class="badge ${statusClass}">${item.status}</span>
             <div>
               <div class="history-command">${item.command || item.command_name}</div>
+              <div class="history-response muted">${meta}</div>
               <div class="history-response muted">${response}</div>
             </div>
           </div>
@@ -1497,6 +1746,14 @@ INDEX_HTML = r"""<!doctype html>
         await refreshStatus();
       });
       el("getCfgBtn").addEventListener("click", () => sendCommand("{CMD}GET_CFG").catch(alert));
+      el("autotuneObserveBtn").addEventListener("click", () => configureAutotune(true, "observe").catch(alert));
+      el("autotuneSuggestBtn").addEventListener("click", () => configureAutotune(true, "suggest").catch(alert));
+      el("autotuneAutoBtn").addEventListener("click", async () => {
+        const ok = confirm("确认启用 auto-tune？启用后会在收到 ACK 后自动小步下发和回滚 SET_PIDX。");
+        if (!ok) return;
+        await configureAutotune(true, "auto-tune");
+      });
+      el("autotuneStopBtn").addEventListener("click", () => configureAutotune(false, "observe").catch(alert));
       document.querySelectorAll("[data-command]").forEach((button) => {
         button.addEventListener("click", () => {
           try {
@@ -1516,6 +1773,21 @@ INDEX_HTML = r"""<!doctype html>
         paused = !paused;
         el("pauseBtn").textContent = paused ? "继续" : "暂停";
       });
+    }
+
+    async function configureAutotune(enabled, mode) {
+      await api("/api/autotune", {
+        method: "POST",
+        body: JSON.stringify({
+          enabled,
+          mode,
+          profile: "line-car-cascade",
+          max_step: Number(value("autotuneMaxStep")) || 0.10,
+          window_seconds: Number(value("autotuneWindow")) || 3.0,
+          rollback_on_regression: true
+        })
+      });
+      await refreshStatus();
     }
 
     async function boot() {
@@ -1643,6 +1915,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/command":
                 self.handle_command(payload)
                 return
+            if parsed.path == "/api/autotune":
+                self.handle_autotune(payload)
+                return
             self.write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         except ValueError as exc:
             self.write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -1742,10 +2017,36 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             无返回值，通过 HTTP JSON 响应返回命令历史条目。
         """
         command = str(payload.get("command") or "").strip()
+        reason = str(payload.get("reason") or "").strip() or None
         if not command:
             raise ValueError("command is required")
-        entry = self.state.send_command(command)
+        entry = self.state.send_command(command, reason=reason)
         self.write_json({"command": entry, "status": self.state.snapshot()})
+
+    def handle_autotune(self, payload: dict[str, Any]) -> None:
+        """
+        函数作用：
+            配置 dashboard 内置自动调参状态机。
+
+        主要流程：
+            读取 enabled、mode、profile、max_step、window_seconds 和 rollback_on_regression，
+            调用 DashboardState.configure_autotune 后返回最新状态快照。
+
+        参数说明：
+            payload 为 JSON body，字段均可选；未传时使用安全默认值并保持自动写参关闭。
+
+        返回值：
+            无返回值，通过 HTTP JSON 响应返回 dashboard 状态。
+        """
+        status = self.state.configure_autotune(
+            enabled=bool(payload.get("enabled", False)),
+            mode=str(payload.get("mode") or "observe"),
+            profile=str(payload.get("profile") or "line-car-cascade"),
+            max_step=float(payload.get("max_step") or 0.10),
+            window_seconds=float(payload.get("window_seconds") or 3.0),
+            rollback_on_regression=bool(payload.get("rollback_on_regression", True)),
+        )
+        self.write_json(status)
 
     def read_json_body(self) -> dict[str, Any]:
         """

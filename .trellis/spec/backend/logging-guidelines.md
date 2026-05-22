@@ -12,7 +12,10 @@ through deterministic serial protocol frames and state fields:
 | Observability Type | Current Mechanism | Owner |
 |---|---|---|
 | High-frequency runtime telemetry | `{PID}` frame | `PIDAI_ProtocolBuildTelemetry()` |
+| Multi-loop runtime telemetry | `{PIDX}` frame | `PIDAI_ProtocolBuildTelemetryX()` |
 | Configuration snapshot | `{CFG}` frame | `PIDAI_ProtocolBuildConfig()` |
+| Multi-loop configuration snapshot | `{CFGX}` frame | `PIDAI_ProtocolBuildConfigX()` |
+| Line-car sensor snapshot | `{SENS}` frame | Board application layer |
 | Command success | `{ACK}` frame | `PIDAI_ProtocolBuildAck()` |
 | Command failure | `{ERR}` frame | `PIDAI_ProtocolBuildError()` |
 | Board events | Recommended `{EVT}` frame | Board application layer |
@@ -30,7 +33,10 @@ the purpose instead.
 | Frame | Equivalent Log Intent | When To Emit |
 |---|---|---|
 | `{PID}` | Debug/telemetry stream | Periodically during control operation, possibly downsampled |
+| `{PIDX}` | Debug/telemetry stream | Periodically for each configured loop in cascade or multi-loop control |
 | `{CFG}` | Info/config snapshot | On boot, after config changes, or after `{CMD}GET_CFG` |
+| `{CFGX}` | Info/config snapshot | On boot, after per-loop config changes, `{CMD}GET_CFGX`, or `{CMD}GET_ALL_CFG` |
+| `{SENS}` | Debug/safety sensor stream | Application-level line-car sensors used by host safety gates |
 | `{ACK}` | Info/command accepted | After a command is parsed and applied |
 | `{ERR}` | Warn/error command rejected | After parse, validation, or internal failure |
 | `{EVT}` | Info/warn event marker | Application-level mode switch, target change, fault event |
@@ -73,6 +79,36 @@ The `sample_ms` value currently comes from `pid->dt_ms`. If a fixed-period board
 needs a nominal sample period before the first update, the board/application layer
 should manage that context.
 
+### `{PIDX}` / `{CFGX}` / `{SENS}` Extension Contract
+
+Multi-loop and cascade tuning extends the single-loop frames without changing the
+legacy `{PID}` and `{CFG}` contracts. The field order is fixed and must stay
+synchronized across docs, C builders, host parsers, dashboard state, and tests.
+
+`{PIDX}` order:
+
+```text
+loop_id,loop_name,seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out_raw,out_limited,actuator,out_min,out_max,sat,anti_windup,mode,enable,sensor_ok,fault
+```
+
+`{CFGX}` order:
+
+```text
+loop_id,loop_name,kp,ki,kd,kf,sample_ms,integral_min,integral_max,out_min,out_max,reverse,mode,version,fault
+```
+
+`{SENS}` order:
+
+```text
+ms,line0,line1,line2,line3,line4,line5,line6,line7,line_pos,line_lost,yaw,yaw_rate,enc_l,enc_r,v_l,v_r,v_avg,battery
+```
+
+Any change to these contracts requires the same update set as `{PID}` / `{CFG}`,
+plus host-side parser and dashboard tests under `.codex/skills/pid-ai-serial/tests/`.
+The portable C library owns `{PIDX}` and `{CFGX}` builders; `{SENS}` remains an
+application-layer frame because line sensors, IMU, encoders, and battery signals
+are board-specific.
+
 ---
 
 ## What to Log
@@ -80,9 +116,11 @@ should manage that context.
 | Signal | Reason |
 |---|---|
 | `target`, `feedback`, `error`, `d_error` | Required to diagnose response speed, overshoot, and oscillation. |
+| `loop_id`, `loop_name` in extension frames | Required to route cascade telemetry and command results to the correct controller. |
 | `integral`, `i_out`, `anti_windup` | Required to diagnose integral buildup and anti-windup behavior. |
 | `out_raw`, `out_limited`, `actuator`, `sat` | Required to distinguish controller demand from actuator saturation. |
 | `mode`, `enable`, `sensor_ok`, `fault` | Required to avoid tuning when the controller is stopped or data is invalid. |
+| `line_lost` and sensor quality in `{SENS}` | Required to abort line-car auto-tuning when the robot loses the track. |
 | ACK/ERR command results | Host must only treat commands as applied after ACK. |
 
 ---
@@ -107,3 +145,5 @@ should manage that context.
 | Printing from an interrupt or high-frequency control function. | Jitter, blocking, or missed deadlines. | Buffer or downsample in board code, as noted in the protocol docs. |
 | Treating `{ERR}` as a debug-only message. | Host may assume a rejected command succeeded. | Surface `{ERR}` in host UI and do not update applied state until ACK. |
 | Changing decimal precision casually. | Snapshot comparisons and host display may drift. | Keep existing `snprintf()` precision unless tests/docs are updated. |
+| Emitting `{PIDX}` without stable `loop_id`. | Host auto-tuning can apply a suggestion to the wrong loop. | Use the configured loop table and exact `loop_id` routing. |
+| Treating `{SENS}` as optional during line-car auto-tune. | Lost-line or bad sensor data can drive unsafe parameter changes. | Abort or remain read-only when required sensor safety fields are missing or invalid. |

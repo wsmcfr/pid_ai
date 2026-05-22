@@ -21,6 +21,22 @@ VALID_CFG_LINE = (
     "5000.000,0.000,1000.000,0,1,1,0"
 )
 
+VALID_PIDX_LINE = (
+    "{PIDX}speed_l,left_speed,1024,123456,10.000,1000.000,850.000,150.000,"
+    "5.000,3200.000,120.000,40.000,10.000,0.000,170.000,170.000,"
+    "170.000,0.000,1000.000,0,0,1,1,1,0"
+)
+
+VALID_CFGX_LINE = (
+    "{CFGX}speed_l,left_speed,1.200000,0.030000,0.080000,0.000000,10.000,"
+    "-5000.000,5000.000,0.000,1000.000,0,1,3,0"
+)
+
+VALID_SENS_LINE = (
+    "{SENS}123456,1,0,1,0,1,0,1,0,0.125,0,1.500,0.250,"
+    "1234,1235,0.800,0.810,0.805,7.400"
+)
+
 
 class PidAiSerialParserTest(unittest.TestCase):
     """测试共享串口协议解析器的 typed frame 校验。"""
@@ -138,6 +154,275 @@ class PidAiSerialParserTest(unittest.TestCase):
 
         self.assertFalse(parsed["valid"])
         self.assertIn("version must be non-negative", parsed["error"])
+
+    def test_pidx_sample_is_valid_and_preserves_loop_identity(self) -> None:
+        """
+        函数作用：
+            验证 {PIDX} 多环遥测帧能解析为带 loop_id/loop_name 的 typed frame。
+
+        主要流程：
+            调用 parse_frame 解析多环样例，并校验 loop 标识和原 {PID} 关键字段。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        parsed = pid_ai_serial.parse_frame(VALID_PIDX_LINE)
+
+        self.assertTrue(parsed["valid"])
+        self.assertEqual(parsed["kind"], "pidx")
+        self.assertEqual(parsed["data"]["loop_id"], "speed_l")
+        self.assertEqual(parsed["data"]["loop_name"], "left_speed")
+        self.assertEqual(parsed["data"]["seq"], 1024)
+        self.assertAlmostEqual(parsed["data"]["error"], 150.0)
+
+    def test_cfgx_sample_is_valid_and_preserves_loop_identity(self) -> None:
+        """
+        函数作用：
+            验证 {CFGX} 多环配置帧能解析为带 loop_id/loop_name 的 typed frame。
+
+        主要流程：
+            调用 parse_frame 解析多环配置样例，并校验 PID 参数、模式和版本字段。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        parsed = pid_ai_serial.parse_frame(VALID_CFGX_LINE)
+
+        self.assertTrue(parsed["valid"])
+        self.assertEqual(parsed["kind"], "cfgx")
+        self.assertEqual(parsed["data"]["loop_id"], "speed_l")
+        self.assertEqual(parsed["data"]["loop_name"], "left_speed")
+        self.assertAlmostEqual(parsed["data"]["kp"], 1.2)
+        self.assertEqual(parsed["data"]["version"], 3)
+
+    def test_sens_sample_is_valid(self) -> None:
+        """
+        函数作用：
+            验证 {SENS} 小车传感器帧能解析 8 路循迹、姿态、编码器、速度和电池字段。
+
+        主要流程：
+            调用 parse_frame 解析传感器样例，并校验 line、yaw_rate、v_avg 和 battery。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        parsed = pid_ai_serial.parse_frame(VALID_SENS_LINE)
+
+        self.assertTrue(parsed["valid"])
+        self.assertEqual(parsed["kind"], "sens")
+        self.assertEqual(parsed["data"]["line0"], 1)
+        self.assertEqual(parsed["data"]["line7"], 0)
+        self.assertAlmostEqual(parsed["data"]["yaw_rate"], 0.25)
+        self.assertAlmostEqual(parsed["data"]["v_avg"], 0.805)
+        self.assertAlmostEqual(parsed["data"]["battery"], 7.4)
+
+    def test_pidx_rejects_nan_numeric_fields(self) -> None:
+        """
+        函数作用：
+            验证 {PIDX} 中的非有限数会被拒绝，避免多环坏遥测进入调参状态机。
+
+        主要流程：
+            把 target 字段替换为 nan 后解析，并校验错误文本。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        bad_line = VALID_PIDX_LINE.replace("1000.000", "nan", 1)
+
+        parsed = pid_ai_serial.parse_frame(bad_line)
+
+        self.assertFalse(parsed["valid"])
+        self.assertIn("target must be finite", parsed["error"])
+
+    def test_build_loop_commands_use_three_decimal_parameters(self) -> None:
+        """
+        函数作用：
+            验证 typed command builder 会生成分环命令，并按自动调参约定保留三位小数。
+
+        主要流程：
+            调用 SET_PIDX 和 SET_TARGETX 构建函数，校验完整 {CMD} 文本。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        self.assertEqual(
+            pid_ai_serial.build_set_pidx_command("speed_l", 1.23456, 0.03, 0.08),
+            "{CMD}SET_PIDX,speed_l,1.235,0.030,0.080",
+        )
+        self.assertEqual(
+            pid_ai_serial.build_set_targetx_command("yaw_rate", 2.5),
+            "{CMD}SET_TARGETX,yaw_rate,2.500",
+        )
+
+    def test_loop_aware_command_metadata_and_ack_matching(self) -> None:
+        """
+        函数作用：
+            验证命令元数据提取能识别 loop_id，并用于 ACK/ERR 匹配辅助逻辑。
+
+        主要流程：
+            1. 从 SET_PIDX 命令提取 command_name 和 loop_id。
+            2. 构造 ACK 帧。
+            3. 校验 helper 判断该 ACK 可匹配这条 pending 命令。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        metadata = pid_ai_serial.extract_command_metadata("{CMD}SET_PIDX,speed_l,1.000,0.100,0.010")
+        ack = pid_ai_serial.parse_frame("{ACK}SET_PIDX,OK")
+
+        self.assertEqual(metadata["command_name"], "SET_PIDX")
+        self.assertEqual(metadata["loop_id"], "speed_l")
+        self.assertTrue(pid_ai_serial.response_matches_pending_command(metadata, ack))
+
+
+class PidAiAutoTuneTest(unittest.TestCase):
+    """测试自动调参纯状态机，不依赖真实串口。"""
+
+    def make_controller(self) -> "pid_ai_serial.AutoTuneController":
+        """
+        函数作用：
+            构造默认 line-car-cascade profile 自动调参控制器。
+
+        主要流程：
+            使用 --auto-tune 的默认安全参数，便于各测试复用同一配置。
+
+        返回值：
+            返回 AutoTuneController 实例。
+        """
+        config = pid_ai_serial.AutoTuneConfig(
+            auto=True,
+            profile="line-car-cascade",
+            mode="auto-tune",
+            max_step=0.10,
+            window_seconds=0.02,
+            rollback_on_regression=True,
+        )
+        return pid_ai_serial.AutoTuneController(config)
+
+    def ingest_cfgs(self, controller: "pid_ai_serial.AutoTuneController") -> None:
+        """
+        函数作用：
+            向自动调参控制器注入小车串级 profile 的全部 loop 配置。
+
+        主要流程：
+            按 speed_l、speed_r、yaw_rate、line_outer 顺序写入 CFGX，模拟配置同步阶段。
+
+        返回值：
+            无返回值。
+        """
+        for loop_id in ["speed_l", "speed_r", "yaw_rate", "line_outer"]:
+            line = VALID_CFGX_LINE.replace("speed_l", loop_id, 1).replace("left_speed", loop_id)
+            controller.ingest_frame(pid_ai_serial.parse_frame(line))
+
+    def ingest_window(
+        self,
+        controller: "pid_ai_serial.AutoTuneController",
+        loop_id: str,
+        errors: list[float],
+        *,
+        fault: int = 0,
+        line_lost: int = 0,
+    ) -> None:
+        """
+        函数作用：
+            向自动调参控制器注入一个测试遥测窗口。
+
+        主要流程：
+            逐条生成 PIDX 帧，按 errors 覆盖 error 字段；必要时注入 fault 或 SENS 丢线状态。
+
+        参数说明：
+            controller 为被测自动调参控制器。
+            loop_id 为目标环路。
+            errors 为窗口内误差序列。
+            fault 为注入到最后一条 PIDX 的故障位图。
+            line_lost 为注入到 SENS 的丢线状态。
+
+        返回值：
+            无返回值。
+        """
+        for index, error in enumerate(errors, start=1):
+            line = (
+                f"{{PIDX}}{loop_id},{loop_id},{index},{index * 10},10.000,100.000,"
+                f"{100.0 - error:.3f},{error:.3f},0.000,0.000,0.000,0.000,0.000,"
+                "0.000,0.000,0.000,0.000,0.000,1000.000,0,0,1,1,1,"
+                f"{fault if index == len(errors) else 0}"
+            )
+            controller.ingest_frame(pid_ai_serial.parse_frame(line))
+
+        if line_lost:
+            sens_line = VALID_SENS_LINE.replace(",0,1.500", ",1,1.500")
+            controller.ingest_frame(pid_ai_serial.parse_frame(sens_line))
+
+    def test_state_machine_tunes_speed_loop_before_outer_loop(self) -> None:
+        """
+        函数作用：
+            验证串级自动调参会先选择速度内环，不会越级先调 yaw_rate 或 line_outer。
+
+        主要流程：
+            1. 注入四个 loop 的配置和基线遥测窗口。
+            2. 反复调用 plan_next_action 推进状态机。
+            3. 校验第一个待发送命令是 speed_l 的 SET_PIDX。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        for loop_id in ["speed_l", "speed_r", "yaw_rate", "line_outer"]:
+            self.ingest_window(controller, loop_id, [12.0, 11.0, 10.0])
+
+        action = controller.plan_next_action()
+
+        self.assertEqual(action["type"], "send")
+        self.assertEqual(action["loop_id"], "speed_l")
+        self.assertTrue(action["command"].startswith("{CMD}SET_PIDX,speed_l,"))
+
+    def test_fault_or_line_lost_aborts_without_sending_command(self) -> None:
+        """
+        函数作用：
+            验证故障位或循迹丢线时自动调参进入 ABORT，且不会产生写参命令。
+
+        主要流程：
+            注入配置、故障遥测和丢线传感器帧，然后调用 plan_next_action。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [10.0, 9.0, 8.0], fault=1, line_lost=1)
+
+        action = controller.plan_next_action()
+
+        self.assertEqual(action["type"], "abort")
+        self.assertEqual(controller.state, "ABORT")
+
+    def test_regression_after_ack_sends_rollback_command(self) -> None:
+        """
+        函数作用：
+            验证自动调参只有 ACK 后才观察结果，并在评分变差时生成回滚命令。
+
+        主要流程：
+            1. 注入配置和较好基线窗口，生成 speed_l 写参动作。
+            2. 注入 ACK 让状态机进入观察结果阶段。
+            3. 注入更差窗口，校验下一个动作是回滚 SET_PIDX。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [5.0, 4.0, 3.0])
+        action = controller.plan_next_action()
+        self.assertEqual(action["type"], "send")
+
+        controller.handle_response(pid_ai_serial.parse_frame("{ACK}SET_PIDX,OK"))
+        self.ingest_window(controller, "speed_l", [20.0, 21.0, 22.0])
+        rollback = controller.plan_next_action()
+
+        self.assertEqual(rollback["type"], "rollback")
+        self.assertEqual(rollback["loop_id"], "speed_l")
+        self.assertEqual(rollback["command"], "{CMD}SET_PIDX,speed_l,1.200,0.030,0.080")
 
 
 if __name__ == "__main__":

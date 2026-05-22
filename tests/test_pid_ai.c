@@ -321,6 +321,230 @@ static int test_build_telemetry_frame(void)
 
 /*
  * 函数作用：
+ *   构造一个用于多环协议测试的 loop 表。
+ *
+ * 主要流程：
+ *   1. 初始化左右两个 PID 控制器。
+ *   2. 写入不同目标值，便于确认命令只路由到匹配 loop。
+ *   3. 填充调用方持有的固定 loop 表，不使用动态内存。
+ *
+ * 参数说明：
+ *   left   左轮速度环 PID 句柄，不能为空。
+ *   right  右轮速度环 PID 句柄，不能为空。
+ *   routes 输出 loop 路由数组，至少包含 2 个元素。
+ *
+ * 返回值：
+ *   无返回值；测试调用方保证参数有效。
+ */
+static void setup_two_loop_routes(PIDAI_Handle *left, PIDAI_Handle *right, PIDAI_LoopRoute routes[2])
+{
+    PIDAI_Init(left);
+    PIDAI_Init(right);
+    PIDAI_SetTarget(left, 100.0f);
+    PIDAI_SetTarget(right, 200.0f);
+
+    routes[0].loop_id = "speed_l";
+    routes[0].loop_name = "left_speed";
+    routes[0].pid = left;
+    routes[0].profile_id = 1;
+    routes[0].version = 3;
+
+    routes[1].loop_id = "speed_r";
+    routes[1].loop_name = "right_speed";
+    routes[1].pid = right;
+    routes[1].profile_id = 2;
+    routes[1].version = 3;
+}
+
+/*
+ * 函数作用：
+ *   测试多环 {PIDX} 遥测帧是否按 loop_id、loop_name 和原 {PID} 字段顺序打包。
+ *
+ * 主要流程：
+ *   1. 构造 speed_l loop 并执行一次 PID 更新。
+ *   2. 调用 PIDAI_ProtocolBuildTelemetryX 打包多环遥测。
+ *   3. 校验前缀、loop 标识和关键数值字段。
+ *
+ * 返回值：
+ *   返回 1 表示 {PIDX} 字段顺序和关键内容正确；否则返回 0。
+ */
+static int test_build_pidx_frame(void)
+{
+    char frame[320];
+    PIDAI_Handle left;
+    PIDAI_Handle right;
+    PIDAI_LoopRoute routes[2];
+    int written;
+
+    setup_two_loop_routes(&left, &right, routes);
+    PIDAI_SetTunings(&left, 1.0f, 0.0f, 0.0f);
+    PIDAI_SetOutputLimits(&left, 0.0f, 100.0f);
+    PIDAI_SetMode(&left, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&left, 1);
+    PIDAI_Update(&left, 80.0f, 50U, 10.0f);
+
+    written = PIDAI_ProtocolBuildTelemetryX(&routes[0], frame, sizeof(frame));
+
+    if (written <= 0) return 0;
+    if (strncmp(frame, "{PIDX}speed_l,left_speed,", 25U) != 0) return 0;
+    if (strstr(frame, ",50,10.000,100.000,80.000,20.000,") == NULL) return 0;
+    if (strstr(frame, ",0,0,1,1,1,0") == NULL) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   测试多环 {CFGX} 配置帧是否按 loop 标识和原 {CFG} 配置字段顺序打包。
+ *
+ * 主要流程：
+ *   1. 构造 speed_l loop 并写入 PID 参数和限幅。
+ *   2. 调用 PIDAI_ProtocolBuildConfigX。
+ *   3. 校验前缀、loop 标识、PID 参数、版本号和故障位图。
+ *
+ * 返回值：
+ *   返回 1 表示 {CFGX} 配置帧符合扩展协议；否则返回 0。
+ */
+static int test_build_cfgx_frame(void)
+{
+    char frame[256];
+    PIDAI_Handle left;
+    PIDAI_Handle right;
+    PIDAI_LoopRoute routes[2];
+    int written;
+
+    setup_two_loop_routes(&left, &right, routes);
+    PIDAI_SetTunings(&left, 1.2f, 0.03f, 0.08f);
+    PIDAI_SetFeedForward(&left, 0.01f);
+    PIDAI_SetOutputLimits(&left, 0.0f, 1000.0f);
+    PIDAI_SetIntegralLimits(&left, -500.0f, 500.0f);
+    PIDAI_SetMode(&left, PIDAI_MODE_AUTO);
+
+    written = PIDAI_ProtocolBuildConfigX(&routes[0], frame, sizeof(frame));
+
+    if (written <= 0) return 0;
+    if (strncmp(frame, "{CFGX}speed_l,left_speed,", 25U) != 0) return 0;
+    if (strstr(frame, "1.200000,0.030000,0.080000,0.010000") == NULL) return 0;
+    if (strstr(frame, ",0,1,3,0") == NULL) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   测试 SET_PIDX 命令只会修改 loop_id 精确匹配的 PID 控制器。
+ *
+ * 主要流程：
+ *   1. 构造左右轮两个 loop。
+ *   2. 对 speed_r 发送 SET_PIDX。
+ *   3. 校验右轮参数被更新，左轮参数保持不变。
+ *
+ * 返回值：
+ *   返回 1 表示多环命令路由正确；否则返回 0。
+ */
+static int test_protocol_set_pidx_routes_to_matching_loop(void)
+{
+    PIDAI_Handle left;
+    PIDAI_Handle right;
+    PIDAI_LoopRoute routes[2];
+    PIDAI_LoopTable table;
+    PIDAI_CommandResult result;
+
+    setup_two_loop_routes(&left, &right, routes);
+    table.loops = routes;
+    table.count = 2U;
+
+    result = PIDAI_ProtocolHandleCommandX(&table, "{CMD}SET_PIDX,speed_r,1.200,0.030,0.080");
+
+    if (result.status != PIDAI_CMD_OK) return 0;
+    if (!float_close(left.kp, 0.0f) || !float_close(left.ki, 0.0f) || !float_close(left.kd, 0.0f)) return 0;
+    if (!float_close(right.kp, 1.2f)) return 0;
+    if (!float_close(right.ki, 0.03f)) return 0;
+    if (!float_close(right.kd, 0.08f)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   测试未知 loop_id 会被 SET_PIDX 拒绝，且不会修改任何 PID 参数。
+ *
+ * 主要流程：
+ *   1. 构造只包含 speed_l/speed_r 的 loop 表。
+ *   2. 发送 loop_id 为 yaw_rate_bad 的 SET_PIDX。
+ *   3. 校验返回 ARG_INVALID/LOOP_NOT_FOUND，并确认左右 PID 均未改变。
+ *
+ * 返回值：
+ *   返回 1 表示未知 loop 被安全拒绝；否则返回 0。
+ */
+static int test_protocol_set_pidx_rejects_unknown_loop(void)
+{
+    PIDAI_Handle left;
+    PIDAI_Handle right;
+    PIDAI_LoopRoute routes[2];
+    PIDAI_LoopTable table;
+    PIDAI_CommandResult result;
+
+    setup_two_loop_routes(&left, &right, routes);
+    table.loops = routes;
+    table.count = 2U;
+
+    result = PIDAI_ProtocolHandleCommandX(&table, "{CMD}SET_PIDX,yaw_rate_bad,1.200,0.030,0.080");
+
+    if (result.status != PIDAI_CMD_ARG_INVALID) return 0;
+    if (strcmp(result.detail, "LOOP_NOT_FOUND") != 0) return 0;
+    if (!float_close(left.kp, 0.0f) || !float_close(right.kp, 0.0f)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   测试 SET_PIDX 对缺参、坏数字、多余参数和尾随逗号都执行精确拒绝。
+ *
+ * 主要流程：
+ *   1. 构造多环表。
+ *   2. 分别发送缺参、坏数字、多余参数、尾随逗号四类非法命令。
+ *   3. 校验错误状态和 detail，且目标 PID 参数不发生部分更新。
+ *
+ * 返回值：
+ *   返回 1 表示所有非法输入都被拒绝；否则返回 0。
+ */
+static int test_protocol_set_pidx_rejects_malformed_commands(void)
+{
+    PIDAI_Handle left;
+    PIDAI_Handle right;
+    PIDAI_LoopRoute routes[2];
+    PIDAI_LoopTable table;
+    PIDAI_CommandResult result;
+
+    setup_two_loop_routes(&left, &right, routes);
+    table.loops = routes;
+    table.count = 2U;
+
+    result = PIDAI_ProtocolHandleCommandX(&table, "{CMD}SET_PIDX,speed_l,1.000,0.200");
+    if (result.status != PIDAI_CMD_ARG_MISSING) return 0;
+    if (strcmp(result.detail, "NEED_LOOP_KP_KI_KD") != 0) return 0;
+
+    result = PIDAI_ProtocolHandleCommandX(&table, "{CMD}SET_PIDX,speed_l,1.000,nope,0.200");
+    if (result.status != PIDAI_CMD_ARG_INVALID) return 0;
+    if (strcmp(result.detail, "FLOAT_PARSE_FAIL") != 0) return 0;
+
+    result = PIDAI_ProtocolHandleCommandX(&table, "{CMD}SET_PIDX,speed_l,1.000,0.100,0.200,9.000");
+    if (result.status != PIDAI_CMD_ARG_INVALID) return 0;
+    if (strcmp(result.detail, "UNEXPECTED_ARG") != 0) return 0;
+
+    result = PIDAI_ProtocolHandleCommandX(&table, "{CMD}SET_PIDX,speed_l,1.000,0.100,0.200,");
+    if (result.status != PIDAI_CMD_ARG_INVALID) return 0;
+    if (strcmp(result.detail, "UNEXPECTED_ARG") != 0) return 0;
+
+    if (!float_close(left.kp, 0.0f) || !float_close(left.ki, 0.0f) || !float_close(left.kd, 0.0f)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
  *   测试 Derivative on Measurement 算法在 target 阶跃时不产生 D 项尖峰。
  *
  * 主要流程：
@@ -402,6 +626,26 @@ int main(void)
     }
     if (!test_build_telemetry_frame()) {
         printf("FAIL: test_build_telemetry_frame\n");
+        return 1;
+    }
+    if (!test_build_pidx_frame()) {
+        printf("FAIL: test_build_pidx_frame\n");
+        return 1;
+    }
+    if (!test_build_cfgx_frame()) {
+        printf("FAIL: test_build_cfgx_frame\n");
+        return 1;
+    }
+    if (!test_protocol_set_pidx_routes_to_matching_loop()) {
+        printf("FAIL: test_protocol_set_pidx_routes_to_matching_loop\n");
+        return 1;
+    }
+    if (!test_protocol_set_pidx_rejects_unknown_loop()) {
+        printf("FAIL: test_protocol_set_pidx_rejects_unknown_loop\n");
+        return 1;
+    }
+    if (!test_protocol_set_pidx_rejects_malformed_commands()) {
+        printf("FAIL: test_protocol_set_pidx_rejects_malformed_commands\n");
         return 1;
     }
     if (!test_derivative_kick_suppressed()) {

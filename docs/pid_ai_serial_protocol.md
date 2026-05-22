@@ -100,6 +100,76 @@
 | 13 | `version` | int | 协议或配置版本 |
 | 14 | `fault` | uint32 | 当前故障位图 |
 
+## 3.4 多环兼容扩展帧 `{PIDX}` / `{CFGX}` / `{SENS}`
+
+`{PID}` 和 `{CFG}` 保持单环兼容。串级小车、左右轮速度环、角速度中环和循迹外环等多 PID 场景使用扩展帧。扩展帧的原则是：先输出 `loop_id` 和 `loop_name`，再复用单环帧的字段顺序，避免上位机为每个环路维护不同 schema。
+
+### 3.4.1 多环遥测 `{PIDX}`
+
+字段顺序：
+
+```text
+{PIDX}loop_id,loop_name,seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out_raw,out_limited,actuator,out_min,out_max,sat,anti_windup,mode,enable,sensor_ok,fault
+```
+
+示例：
+
+```text
+{PIDX}speed_l,left_speed,1024,123456,10.000,1000.000,850.000,150.000,5.000,3200.000,120.000,40.000,10.000,0.000,170.000,170.000,170.000,0.000,1000.000,0,0,1,1,1,0
+```
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `loop_id` | string | 稳定环路 ID，例如 `speed_l`、`speed_r`、`yaw_rate`、`line_outer` |
+| `loop_name` | string | 展示名称，例如 `left_speed`；为空时建议板端用 `loop_id` 代替 |
+| 其余字段 | 同 `{PID}` | 与 `{PID}` 第 1 到 23 字段完全一致 |
+
+### 3.4.2 多环配置 `{CFGX}`
+
+字段顺序：
+
+```text
+{CFGX}loop_id,loop_name,kp,ki,kd,kf,sample_ms,integral_min,integral_max,out_min,out_max,reverse,mode,version,fault
+```
+
+示例：
+
+```text
+{CFGX}speed_l,left_speed,1.200000,0.030000,0.080000,0.000000,10.000,-5000.000,5000.000,0.000,1000.000,0,1,3,0
+```
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `loop_id` | string | 稳定环路 ID，必须和 `*X` 命令中的 loop_id 精确一致 |
+| `loop_name` | string | 展示名称 |
+| 其余字段 | 同 `{CFG}` 去掉 `profile_id` | `kp` 到 `fault` 的含义与 `{CFG}` 一致 |
+
+### 3.4.3 小车传感器 `{SENS}`
+
+`{SENS}` 由板端应用层生成，用于自动调参安全门槛和串级外环诊断。通用 C 库不强制生成该帧。
+
+字段顺序：
+
+```text
+{SENS}ms,line0,line1,line2,line3,line4,line5,line6,line7,line_pos,line_lost,yaw,yaw_rate,enc_l,enc_r,v_l,v_r,v_avg,battery
+```
+
+示例：
+
+```text
+{SENS}123456,1,0,1,0,1,0,1,0,0.125,0,1.500,0.250,1234,1235,0.800,0.810,0.805,7.400
+```
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `line0` 到 `line7` | int | 8 路循迹传感器状态，`0/1` |
+| `line_pos` | float | 归一化或应用层定义的线位置 |
+| `line_lost` | int | `1` 表示丢线，自动调参必须停止 |
+| `yaw` / `yaw_rate` | float | 姿态角和角速度 |
+| `enc_l` / `enc_r` | int | 左右编码器计数 |
+| `v_l` / `v_r` / `v_avg` | float | 左右轮和平均速度 |
+| `battery` | float | 电池电压 |
+
 ## 4. 状态帧 `{STAT}`
 
 `{STAT}` 是推荐扩展帧，不在当前通用库中强制生成，因为不同板子的电源、电机、编码器字段差异很大。建议应用层按下面格式实现。
@@ -159,6 +229,28 @@
 | 清除故障 | `{CMD}CLEAR_FAULT` | 清除 PID 库故障位图 |
 | 请求配置 | `{CMD}GET_CFG` | 板端应回复 `{CFG}` |
 | 请求状态 | `{CMD}GET_STAT` | 板端应回复 `{STAT}` |
+
+多环扩展命令：
+
+| 命令 | 格式 | 作用 |
+|---|---|---|
+| 分环设置 PID 参数 | `{CMD}SET_PIDX,loop_id,kp,ki,kd` | 精确匹配 `loop_id` 后修改该环路 `kp/ki/kd` |
+| 分环设置前馈 | `{CMD}SET_KFX,loop_id,kf` | 修改该环路 `kf` |
+| 分环设置目标值 | `{CMD}SET_TARGETX,loop_id,target` | 修改该环路目标值 |
+| 分环设置输出范围 | `{CMD}SET_OUT_LIMITX,loop_id,out_min,out_max` | 修改该环路输出上下限 |
+| 分环设置积分范围 | `{CMD}SET_I_LIMITX,loop_id,integral_min,integral_max` | 修改该环路积分上下限 |
+| 分环清空积分 | `{CMD}RESET_IX,loop_id` | 清空该环路积分 |
+| 分环使能输出 | `{CMD}ENABLEX,loop_id,enable` | 修改该环路 enable |
+| 请求单环配置 | `{CMD}GET_CFGX,loop_id` | 板端应回复对应 `{CFGX}` |
+| 请求全部配置 | `{CMD}GET_ALL_CFG` | 板端应按 loop 表顺序回复多条 `{CFGX}` |
+
+未知 `loop_id` 必须返回：
+
+```text
+{ERR}SET_PIDX,ARG_INVALID,LOOP_NOT_FOUND
+```
+
+所有 `*X` 命令仍然遵守精确字段数量规则。参数不足返回 `ARG_MISSING`，多余字段或尾随逗号返回 `ARG_INVALID,UNEXPECTED_ARG`，坏数字返回 `ARG_INVALID,FLOAT_PARSE_FAIL`。
 
 示例：
 
@@ -220,6 +312,8 @@
 | 5 | 上位机发送 `{CMD}SET_PID` | 发送前检查参数上下限 |
 | 6 | 板端回复 `{ACK}` | 没有 ACK 不认为生效 |
 | 7 | 继续观察 `{PID}` | 对比超调、稳定时间和稳态误差 |
+
+串级小车 profile 的默认顺序为 `speed_l`、`speed_r`、`yaw_rate`、`line_outer`。内环没有完成前不要调外环；每次只修改一个 loop 的一组 `kp/ki/kd`，默认最大变化幅度不超过 10%。自动写参必须等待 `{ACK}` 后进入观察窗口，若评分变差则发送旧参数的 `SET_PIDX` 回滚命令；出现 `fault != 0`、`sensor_ok = 0`、`line_lost = 1`、`{ERR}`、ACK 超时或蓝牙断流时进入停止状态。
 
 ## 9. 上位机字段配置模板
 

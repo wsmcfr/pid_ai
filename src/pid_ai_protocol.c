@@ -288,6 +288,92 @@ static int PIDAI_NoMoreTokens(const char *cursor)
 
 /*
  * 函数作用：
+ *   判断 loop_id 是否适合放入逗号分隔文本协议。
+ *
+ * 主要流程：
+ *   1. 拒绝空指针和空字符串。
+ *   2. 拒绝包含逗号、回车或换行的字符串，避免破坏字段边界。
+ *
+ * 参数说明：
+ *   text 为待检查的 loop_id 或 loop_name。
+ *
+ * 返回值：
+ *   返回 1 表示可安全输出到协议字段；返回 0 表示不合法。
+ */
+static int PIDAI_IsSafeProtocolText(const char *text)
+{
+    if (text == 0 || text[0] == '\0') {
+        return 0;
+    }
+
+    while (*text != '\0') {
+        if (*text == ',' || *text == '\r' || *text == '\n') {
+            return 0;
+        }
+        text++;
+    }
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   取得多环 route 的展示名称。
+ *
+ * 主要流程：
+ *   如果 loop_name 为空或包含协议分隔符，则退化使用 loop_id，保证输出帧字段可解析。
+ *
+ * 参数说明：
+ *   route 为多环路由配置。
+ *
+ * 返回值：
+ *   返回可输出到协议帧的名称字符串；route 无效时返回空字符串。
+ */
+static const char *PIDAI_LoopDisplayName(const PIDAI_LoopRoute *route)
+{
+    if (route == 0 || !PIDAI_IsSafeProtocolText(route->loop_id)) {
+        return "";
+    }
+
+    if (PIDAI_IsSafeProtocolText(route->loop_name)) {
+        return route->loop_name;
+    }
+
+    return route->loop_id;
+}
+
+/*
+ * 函数作用：
+ *   返回 loop 表中的第一个有效 PID 句柄，用于多环处理器兼容旧单环命令。
+ *
+ * 主要流程：
+ *   线性扫描调用方提供的固定数组，返回第一项 pid 非空的 route。
+ *
+ * 参数说明：
+ *   table 为应用层提供的多环表。
+ *
+ * 返回值：
+ *   找到时返回 route 指针；没有有效 loop 时返回空指针。
+ */
+static PIDAI_LoopRoute *PIDAI_FirstValidLoop(PIDAI_LoopTable *table)
+{
+    size_t i;
+
+    if (table == 0 || table->loops == 0) {
+        return 0;
+    }
+
+    for (i = 0U; i < table->count; i++) {
+        if (table->loops[i].pid != 0) {
+            return &table->loops[i];
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * 函数作用：
  *   将 snprintf 的返回值转换成本库统一返回值。
  *
  * 主要流程：
@@ -335,6 +421,27 @@ const char *PIDAI_ProtocolStatusText(PIDAI_CommandStatus status)
     default:
         return "UNKNOWN_STATUS";
     }
+}
+
+PIDAI_LoopRoute *PIDAI_ProtocolFindLoop(PIDAI_LoopTable *table, const char *loop_id)
+{
+    size_t i;
+
+    if (table == 0 || table->loops == 0 || !PIDAI_IsSafeProtocolText(loop_id)) {
+        return 0;
+    }
+
+    for (i = 0U; i < table->count; i++) {
+        PIDAI_LoopRoute *route = &table->loops[i];
+        if (route->pid == 0 || route->loop_id == 0) {
+            continue;
+        }
+        if (strcmp(route->loop_id, loop_id) == 0) {
+            return route;
+        }
+    }
+
+    return 0;
 }
 
 PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *line)
@@ -668,6 +775,290 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
     return PIDAI_MakeResult(PIDAI_CMD_UNKNOWN, command, "COMMAND_NOT_SUPPORTED");
 }
 
+PIDAI_CommandResult PIDAI_ProtocolHandleCommandX(PIDAI_LoopTable *table, const char *line)
+{
+    char copy[PIDAI_PROTOCOL_LINE_MAX];
+    char *cursor;
+    char *command;
+    PIDAI_LoopRoute *route;
+    int ret;
+
+    if (table == 0 || line == 0) {
+        return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, "UNKNOWN", "NULL_ARGUMENT");
+    }
+
+    if (!PIDAI_StartsWith(line, "{CMD}")) {
+        return PIDAI_MakeResult(PIDAI_CMD_BAD_PREFIX, "UNKNOWN", "EXPECTED_CMD_PREFIX");
+    }
+
+    /*
+     * 多环命令同样复制到局部固定缓冲区解析，避免修改串口接收缓存；
+     * 命令过长会被截断，后续字段数量或参数解析会给出显式错误。
+     */
+    (void)snprintf(copy, sizeof(copy), "%s", line + PIDAI_CMD_PREFIX_LEN);
+    copy[sizeof(copy) - 1U] = '\0';
+    PIDAI_TrimRight(copy);
+
+    cursor = copy;
+    command = PIDAI_NextToken(&cursor);
+    if (command == 0 || command[0] == '\0') {
+        return PIDAI_MakeResult(PIDAI_CMD_ARG_MISSING, "UNKNOWN", "MISSING_COMMAND");
+    }
+
+    if (strcmp(command, "SET_PIDX") == 0) {
+        float kp;
+        float ki;
+        float kd;
+        char *arg_loop = PIDAI_NextToken(&cursor);
+        char *arg_kp = PIDAI_NextToken(&cursor);
+        char *arg_ki = PIDAI_NextToken(&cursor);
+        char *arg_kd = PIDAI_NextToken(&cursor);
+
+        if (arg_loop == 0 || arg_kp == 0 || arg_ki == 0 || arg_kd == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_MISSING, command, "NEED_LOOP_KP_KI_KD");
+        }
+        if (!PIDAI_ParseFloat(arg_kp, &kp) ||
+            !PIDAI_ParseFloat(arg_ki, &ki) ||
+            !PIDAI_ParseFloat(arg_kd, &kd)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
+        route = PIDAI_ProtocolFindLoop(table, arg_loop);
+        if (route == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "LOOP_NOT_FOUND");
+        }
+
+        ret = PIDAI_SetTunings(route->pid, kp, ki, kd);
+        if (ret == -2) {
+            return PIDAI_MakeResult(PIDAI_CMD_PARAM_RANGE, command, "KP_KI_KD_OUT_OF_RANGE");
+        }
+        if (ret != 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "SET_TUNINGS_FAIL");
+        }
+
+        return PIDAI_MakeResult(PIDAI_CMD_OK, command, "OK");
+    }
+
+    if (strcmp(command, "SET_KFX") == 0) {
+        float kf;
+        char *arg_loop = PIDAI_NextToken(&cursor);
+        char *arg_kf = PIDAI_NextToken(&cursor);
+
+        if (arg_loop == 0 || arg_kf == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_MISSING, command, "NEED_LOOP_KF");
+        }
+        if (!PIDAI_ParseFloat(arg_kf, &kf)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
+        route = PIDAI_ProtocolFindLoop(table, arg_loop);
+        if (route == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "LOOP_NOT_FOUND");
+        }
+
+        ret = PIDAI_SetFeedForward(route->pid, kf);
+        if (ret == -2) {
+            return PIDAI_MakeResult(PIDAI_CMD_PARAM_RANGE, command, "KF_OUT_OF_RANGE");
+        }
+        if (ret != 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "SET_KF_FAIL");
+        }
+
+        return PIDAI_MakeResult(PIDAI_CMD_OK, command, "OK");
+    }
+
+    if (strcmp(command, "SET_TARGETX") == 0) {
+        float target;
+        char *arg_loop = PIDAI_NextToken(&cursor);
+        char *arg_target = PIDAI_NextToken(&cursor);
+
+        if (arg_loop == 0 || arg_target == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_MISSING, command, "NEED_LOOP_TARGET");
+        }
+        if (!PIDAI_ParseFloat(arg_target, &target)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
+        route = PIDAI_ProtocolFindLoop(table, arg_loop);
+        if (route == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "LOOP_NOT_FOUND");
+        }
+
+        ret = PIDAI_SetTarget(route->pid, target);
+        if (ret == -2) {
+            return PIDAI_MakeResult(PIDAI_CMD_PARAM_RANGE, command, "TARGET_OUT_OF_RANGE");
+        }
+        if (ret != 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "SET_TARGET_FAIL");
+        }
+
+        return PIDAI_MakeResult(PIDAI_CMD_OK, command, "OK");
+    }
+
+    if (strcmp(command, "SET_OUT_LIMITX") == 0) {
+        float out_min;
+        float out_max;
+        char *arg_loop = PIDAI_NextToken(&cursor);
+        char *arg_min = PIDAI_NextToken(&cursor);
+        char *arg_max = PIDAI_NextToken(&cursor);
+
+        if (arg_loop == 0 || arg_min == 0 || arg_max == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_MISSING, command, "NEED_LOOP_OUT_MIN_MAX");
+        }
+        if (!PIDAI_ParseFloat(arg_min, &out_min) || !PIDAI_ParseFloat(arg_max, &out_max)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
+        route = PIDAI_ProtocolFindLoop(table, arg_loop);
+        if (route == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "LOOP_NOT_FOUND");
+        }
+
+        ret = PIDAI_SetOutputLimits(route->pid, out_min, out_max);
+        if (ret == -2) {
+            return PIDAI_MakeResult(PIDAI_CMD_PARAM_RANGE, command, "OUT_LIMIT_INVALID");
+        }
+        if (ret != 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "SET_OUT_LIMIT_FAIL");
+        }
+
+        return PIDAI_MakeResult(PIDAI_CMD_OK, command, "OK");
+    }
+
+    if (strcmp(command, "SET_I_LIMITX") == 0) {
+        float integral_min;
+        float integral_max;
+        char *arg_loop = PIDAI_NextToken(&cursor);
+        char *arg_min = PIDAI_NextToken(&cursor);
+        char *arg_max = PIDAI_NextToken(&cursor);
+
+        if (arg_loop == 0 || arg_min == 0 || arg_max == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_MISSING, command, "NEED_LOOP_I_MIN_MAX");
+        }
+        if (!PIDAI_ParseFloat(arg_min, &integral_min) || !PIDAI_ParseFloat(arg_max, &integral_max)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "FLOAT_PARSE_FAIL");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
+        route = PIDAI_ProtocolFindLoop(table, arg_loop);
+        if (route == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "LOOP_NOT_FOUND");
+        }
+
+        ret = PIDAI_SetIntegralLimits(route->pid, integral_min, integral_max);
+        if (ret == -2) {
+            return PIDAI_MakeResult(PIDAI_CMD_PARAM_RANGE, command, "I_LIMIT_INVALID");
+        }
+        if (ret != 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "SET_I_LIMIT_FAIL");
+        }
+
+        return PIDAI_MakeResult(PIDAI_CMD_OK, command, "OK");
+    }
+
+    if (strcmp(command, "RESET_IX") == 0) {
+        char *arg_loop = PIDAI_NextToken(&cursor);
+
+        if (arg_loop == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_MISSING, command, "NEED_LOOP");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
+        route = PIDAI_ProtocolFindLoop(table, arg_loop);
+        if (route == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "LOOP_NOT_FOUND");
+        }
+
+        ret = PIDAI_ResetIntegral(route->pid);
+        if (ret != 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "RESET_I_FAIL");
+        }
+
+        return PIDAI_MakeResult(PIDAI_CMD_OK, command, "OK");
+    }
+
+    if (strcmp(command, "ENABLEX") == 0) {
+        int enable;
+        char *arg_loop = PIDAI_NextToken(&cursor);
+        char *arg_enable = PIDAI_NextToken(&cursor);
+
+        if (arg_loop == 0 || arg_enable == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_MISSING, command, "NEED_LOOP_ENABLE");
+        }
+        if (!PIDAI_ParseInt(arg_enable, &enable)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "INT_PARSE_FAIL");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
+        route = PIDAI_ProtocolFindLoop(table, arg_loop);
+        if (route == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "LOOP_NOT_FOUND");
+        }
+
+        ret = PIDAI_Enable(route->pid, enable);
+        if (ret != 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "ENABLE_FAIL");
+        }
+
+        return PIDAI_MakeResult(PIDAI_CMD_OK, command, "OK");
+    }
+
+    if (strcmp(command, "GET_CFGX") == 0) {
+        char *arg_loop = PIDAI_NextToken(&cursor);
+
+        if (arg_loop == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_MISSING, command, "NEED_LOOP");
+        }
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
+        route = PIDAI_ProtocolFindLoop(table, arg_loop);
+        if (route == 0) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "LOOP_NOT_FOUND");
+        }
+
+        return PIDAI_MakeResult(PIDAI_CMD_OK, command, "OK");
+    }
+
+    if (strcmp(command, "GET_ALL_CFG") == 0) {
+        if (!PIDAI_NoMoreTokens(cursor)) {
+            return PIDAI_MakeResult(PIDAI_CMD_ARG_INVALID, command, "UNEXPECTED_ARG");
+        }
+
+        return PIDAI_MakeResult(PIDAI_CMD_OK, command, "OK");
+    }
+
+    /*
+     * 兼容旧单环命令：多环应用可以继续把 GET_CFG、SET_PID 等旧命令交给第一个有效环路。
+     * 串级小车建议上位机优先使用 *X 命令，避免写错环路。
+     */
+    route = PIDAI_FirstValidLoop(table);
+    if (route == 0) {
+        return PIDAI_MakeResult(PIDAI_CMD_INTERNAL_ERROR, command, "NO_VALID_LOOP");
+    }
+
+    return PIDAI_ProtocolHandleCommand(route->pid, line);
+}
+
 int PIDAI_ProtocolBuildTelemetry(const PIDAI_Handle *pid, char *buffer, size_t buffer_length)
 {
     int written;
@@ -679,6 +1070,52 @@ int PIDAI_ProtocolBuildTelemetry(const PIDAI_Handle *pid, char *buffer, size_t b
     written = snprintf(buffer,
                        buffer_length,
                        "{PID}%lu,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%lu\r\n",
+                       (unsigned long)pid->seq,
+                       (unsigned long)pid->ms,
+                       pid->dt_ms,
+                       pid->target,
+                       pid->feedback,
+                       pid->error,
+                       pid->d_error,
+                       pid->integral,
+                       pid->p_out,
+                       pid->i_out,
+                       pid->d_out,
+                       pid->ff_out,
+                       pid->out_raw,
+                       pid->out_limited,
+                       pid->actuator,
+                       pid->out_min,
+                       pid->out_max,
+                       (int)pid->sat,
+                       pid->anti_windup,
+                       (int)pid->mode,
+                       pid->enable,
+                       pid->sensor_ok,
+                       (unsigned long)pid->fault);
+
+    return PIDAI_CheckFormatResult(written, buffer_length);
+}
+
+int PIDAI_ProtocolBuildTelemetryX(const PIDAI_LoopRoute *route, char *buffer, size_t buffer_length)
+{
+    const PIDAI_Handle *pid;
+    const char *loop_name;
+    int written;
+
+    if (route == 0 || route->pid == 0 || !PIDAI_IsSafeProtocolText(route->loop_id) ||
+        buffer == 0 || buffer_length == 0U) {
+        return -1;
+    }
+
+    pid = route->pid;
+    loop_name = PIDAI_LoopDisplayName(route);
+
+    written = snprintf(buffer,
+                       buffer_length,
+                       "{PIDX}%s,%s,%lu,%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%lu\r\n",
+                       route->loop_id,
+                       loop_name,
                        (unsigned long)pid->seq,
                        (unsigned long)pid->ms,
                        pid->dt_ms,
@@ -734,6 +1171,42 @@ int PIDAI_ProtocolBuildConfig(const PIDAI_Handle *pid,
                        pid->reverse,
                        (int)pid->mode,
                        version,
+                       (unsigned long)pid->fault);
+
+    return PIDAI_CheckFormatResult(written, buffer_length);
+}
+
+int PIDAI_ProtocolBuildConfigX(const PIDAI_LoopRoute *route, char *buffer, size_t buffer_length)
+{
+    const PIDAI_Handle *pid;
+    const char *loop_name;
+    int written;
+
+    if (route == 0 || route->pid == 0 || !PIDAI_IsSafeProtocolText(route->loop_id) ||
+        buffer == 0 || buffer_length == 0U) {
+        return -1;
+    }
+
+    pid = route->pid;
+    loop_name = PIDAI_LoopDisplayName(route);
+
+    written = snprintf(buffer,
+                       buffer_length,
+                       "{CFGX}%s,%s,%.6f,%.6f,%.6f,%.6f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%lu\r\n",
+                       route->loop_id,
+                       loop_name,
+                       pid->kp,
+                       pid->ki,
+                       pid->kd,
+                       pid->kf,
+                       pid->dt_ms,
+                       pid->integral_min,
+                       pid->integral_max,
+                       pid->out_min,
+                       pid->out_max,
+                       pid->reverse,
+                       (int)pid->mode,
+                       route->version,
                        (unsigned long)pid->fault);
 
     return PIDAI_CheckFormatResult(written, buffer_length);

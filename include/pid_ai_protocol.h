@@ -20,6 +20,17 @@ extern "C" {
 #define PIDAI_PROTOCOL_DETAIL_MAX 64U
 
 /*
+ * 宏作用：
+ *   定义多环协议中 loop 标识和显示名称的建议最大长度。
+ *
+ * 使用说明：
+ *   当前公共 API 只保存调用方传入的 const char*，不复制字符串；该长度用于文档和上位机
+ *   约束，提醒应用层保持 loop_id 短小且不包含逗号，避免文本帧变长或难以解析。
+ */
+#define PIDAI_PROTOCOL_LOOP_ID_MAX 24U
+#define PIDAI_PROTOCOL_LOOP_NAME_MAX 32U
+
+/*
  * 枚举作用：
  *   描述上位机命令解析和执行结果。
  *
@@ -60,6 +71,40 @@ typedef struct
 } PIDAI_CommandResult;
 
 /*
+ * 结构体作用：
+ *   描述一个可被多环协议路由的 PID 环路。
+ *
+ * 字段说明：
+ *   loop_id   协议层精确匹配的环路标识，例如 speed_l、yaw_rate；必须唯一且不能包含逗号。
+ *   loop_name 给上位机展示的人类可读名称；为空时打包函数会退化使用 loop_id。
+ *   pid       指向该环路的 PIDAI_Handle，命令处理会通过它修改对应 PID 状态。
+ *   profile_id 保留给应用层区分配置槽；当前 {CFGX} 不输出该字段，避免破坏已定义字段顺序。
+ *   version   该环路配置版本，会输出到 {CFGX} 的 version 字段。
+ */
+typedef struct
+{
+    const char *loop_id;       /* 多环命令和 {PIDX}/{CFGX} 帧中的稳定环路 ID。 */
+    const char *loop_name;     /* 展示名称，便于 dashboard 区分左右轮、角速度、循迹外环。 */
+    PIDAI_Handle *pid;         /* 该环路实际 PID 状态；为空时该 route 不可用。 */
+    int profile_id;            /* 应用层配置槽编号，保留给板端 GET_ALL_CFG 组织发送顺序。 */
+    int version;               /* 多环配置版本号，输出到 {CFGX}。 */
+} PIDAI_LoopRoute;
+
+/*
+ * 结构体作用：
+ *   保存一组由应用层静态分配的 PID 环路路由。
+ *
+ * 字段说明：
+ *   loops 指向固定数组，不由协议库申请或释放。
+ *   count 数组元素数量；协议库会按顺序线性扫描并精确匹配 loop_id。
+ */
+typedef struct
+{
+    PIDAI_LoopRoute *loops;    /* 调用方持有的固定 loop 数组，库内只读取和路由。 */
+    size_t count;              /* loop 数组长度，单位为元素个数。 */
+} PIDAI_LoopTable;
+
+/*
  * 函数作用：
  *   解析并执行一条上位机 {CMD} 命令。
  *
@@ -80,6 +125,43 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
 
 /*
  * 函数作用：
+ *   在多环 loop 表中按 loop_id 精确查找 PID 环路。
+ *
+ * 主要流程：
+ *   1. 校验 table、loops 和 loop_id 是否有效。
+ *   2. 按数组顺序逐项比较 loop_id。
+ *   3. 只返回 pid 非空且 ID 精确相同的 route。
+ *
+ * 参数说明：
+ *   table   指向应用层静态分配的 loop 表。
+ *   loop_id 协议命令中的环路标识，不能为空。
+ *
+ * 返回值：
+ *   找到时返回 route 指针；未找到或参数无效时返回空指针。
+ */
+PIDAI_LoopRoute *PIDAI_ProtocolFindLoop(PIDAI_LoopTable *table, const char *loop_id);
+
+/*
+ * 函数作用：
+ *   解析并执行一条多环 {CMD} 命令。
+ *
+ * 主要流程：
+ *   1. 检查 {CMD} 前缀并解析命令名。
+ *   2. 对 SET_PIDX、SET_KFX、SET_TARGETX 等分环命令先精确匹配 loop_id。
+ *   3. 校验参数数量和类型后调用对应 PIDAI_Set* 接口。
+ *   4. 对非 X 旧命令兼容路由到 table 中第一个 PID 环路。
+ *
+ * 参数说明：
+ *   table 指向应用层提供的多环表。
+ *   line  串口收到的一整行文本，不要求包含结尾 \r\n。
+ *
+ * 返回值：
+ *   返回 PIDAI_CommandResult，调用者可用它生成 {ACK} 或 {ERR} 回复。
+ */
+PIDAI_CommandResult PIDAI_ProtocolHandleCommandX(PIDAI_LoopTable *table, const char *line);
+
+/*
+ * 函数作用：
  *   将当前 PID 运行状态打包为 {PID} 遥测帧。
  *
  * 主要流程：
@@ -94,6 +176,23 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommand(PIDAI_Handle *pid, const char *l
  *   返回写入字符数；返回负数表示参数错误或缓冲区不足。
  */
 int PIDAI_ProtocolBuildTelemetry(const PIDAI_Handle *pid, char *buffer, size_t buffer_length);
+
+/*
+ * 函数作用：
+ *   将指定 PID 环路的运行状态打包为 {PIDX} 多环遥测帧。
+ *
+ * 主要流程：
+ *   先输出 loop_id 和 loop_name，再按 {PID} 的固定字段顺序输出该环路 PID 状态。
+ *
+ * 参数说明：
+ *   route         指向多环 route，route->pid 和 route->loop_id 必须有效。
+ *   buffer        输出字符串缓冲区。
+ *   buffer_length 缓冲区字节长度。
+ *
+ * 返回值：
+ *   返回写入字符数；返回负数表示参数错误或缓冲区不足。
+ */
+int PIDAI_ProtocolBuildTelemetryX(const PIDAI_LoopRoute *route, char *buffer, size_t buffer_length);
 
 /*
  * 函数作用：
@@ -117,6 +216,23 @@ int PIDAI_ProtocolBuildConfig(const PIDAI_Handle *pid,
                               int version,
                               char *buffer,
                               size_t buffer_length);
+
+/*
+ * 函数作用：
+ *   将指定 PID 环路的配置打包为 {CFGX} 多环配置帧。
+ *
+ * 主要流程：
+ *   先输出 loop_id 和 loop_name，再按扩展协议固定顺序输出 kp、ki、kd、kf、限幅、模式和版本。
+ *
+ * 参数说明：
+ *   route         指向多环 route，route->pid 和 route->loop_id 必须有效。
+ *   buffer        输出字符串缓冲区。
+ *   buffer_length 缓冲区字节长度。
+ *
+ * 返回值：
+ *   返回写入字符数；返回负数表示参数错误或缓冲区不足。
+ */
+int PIDAI_ProtocolBuildConfigX(const PIDAI_LoopRoute *route, char *buffer, size_t buffer_length);
 
 /*
  * 函数作用：

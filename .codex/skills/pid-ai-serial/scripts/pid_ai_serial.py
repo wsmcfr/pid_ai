@@ -25,7 +25,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
 try:
     import serial
@@ -36,7 +36,7 @@ except ImportError as exc:  # pragma: no cover - depends on local environment
 
 
 DEFAULT_BAUD_RATES = [115200, 921600, 57600, 38400, 19200, 9600]
-PROTOCOL_PREFIXES = ("{PID}", "{CFG}", "{ACK}", "{ERR}", "{STAT}", "{EVT}")
+PROTOCOL_PREFIXES = ("{PID}", "{PIDX}", "{CFG}", "{CFGX}", "{SENS}", "{ACK}", "{ERR}", "{STAT}", "{EVT}")
 BLUETOOTH_MARKERS = ("bthenum", "bluetooth", "蓝牙")
 PID_FIELDS = [
     "seq",
@@ -79,6 +79,46 @@ CFG_FIELDS = [
     "version",
     "fault",
 ]
+PIDX_FIELDS = ["loop_id", "loop_name", *PID_FIELDS]
+CFGX_FIELDS = [
+    "loop_id",
+    "loop_name",
+    "kp",
+    "ki",
+    "kd",
+    "kf",
+    "sample_ms",
+    "integral_min",
+    "integral_max",
+    "out_min",
+    "out_max",
+    "reverse",
+    "mode",
+    "version",
+    "fault",
+]
+SENS_FIELDS = [
+    "ms",
+    "line0",
+    "line1",
+    "line2",
+    "line3",
+    "line4",
+    "line5",
+    "line6",
+    "line7",
+    "line_pos",
+    "line_lost",
+    "yaw",
+    "yaw_rate",
+    "enc_l",
+    "enc_r",
+    "v_l",
+    "v_r",
+    "v_avg",
+    "battery",
+]
+TEXT_FIELDS = {"loop_id", "loop_name"}
 INTEGER_FIELDS = {
     "seq",
     "ms",
@@ -91,6 +131,17 @@ INTEGER_FIELDS = {
     "profile_id",
     "reverse",
     "version",
+    "line0",
+    "line1",
+    "line2",
+    "line3",
+    "line4",
+    "line5",
+    "line6",
+    "line7",
+    "line_lost",
+    "enc_l",
+    "enc_r",
 }
 FRAME_ALLOWED_VALUES = {
     "pid": {
@@ -104,6 +155,28 @@ FRAME_ALLOWED_VALUES = {
         "reverse": {0, 1},
         "mode": {0, 1, 2},
     },
+    "pidx": {
+        "sat": {-1, 0, 1},
+        "anti_windup": {0, 1},
+        "mode": {0, 1, 2},
+        "enable": {0, 1},
+        "sensor_ok": {0, 1},
+    },
+    "cfgx": {
+        "reverse": {0, 1},
+        "mode": {0, 1, 2},
+    },
+    "sens": {
+        "line0": {0, 1},
+        "line1": {0, 1},
+        "line2": {0, 1},
+        "line3": {0, 1},
+        "line4": {0, 1},
+        "line5": {0, 1},
+        "line6": {0, 1},
+        "line7": {0, 1},
+        "line_lost": {0, 1},
+    },
 }
 NON_NEGATIVE_INTEGER_FIELDS = {
     "seq",
@@ -111,6 +184,25 @@ NON_NEGATIVE_INTEGER_FIELDS = {
     "fault",
     "profile_id",
     "version",
+    "line0",
+    "line1",
+    "line2",
+    "line3",
+    "line4",
+    "line5",
+    "line6",
+    "line7",
+}
+CASCADE_PROFILE_ORDER = ("speed_l", "speed_r", "yaw_rate", "line_outer")
+LOOP_COMMANDS = {
+    "SET_PIDX",
+    "SET_KFX",
+    "SET_TARGETX",
+    "SET_OUT_LIMITX",
+    "SET_I_LIMITX",
+    "RESET_IX",
+    "ENABLEX",
+    "GET_CFGX",
 }
 
 
@@ -281,6 +373,9 @@ def parse_number(field_name: str, value: str) -> int | float:
         int(value) 或 float(value) 失败时抛出 ValueError。
         浮点值不是有限数时抛出 ValueError，调用方会把该帧标记为 valid=False。
     """
+    if field_name in TEXT_FIELDS:
+        raise ValueError(f"{field_name} is not numeric")
+
     if field_name in INTEGER_FIELDS:
         return int(value)
 
@@ -291,7 +386,51 @@ def parse_number(field_name: str, value: str) -> int | float:
     return parsed
 
 
-def validate_named_numeric_data(kind: str, data: dict[str, int | float]) -> str | None:
+def parse_text_field(field_name: str, value: str) -> str:
+    """
+    函数作用：
+        解析协议中的文本字段，例如 loop_id 和 loop_name。
+
+    主要流程：
+        1. 去掉字段两侧空白。
+        2. 拒绝空字符串、逗号和换行，避免破坏 CSV 协议边界。
+
+    参数说明：
+        field_name 为字段名，用于生成错误消息。
+        value 为协议字段原文。
+
+    返回值：
+        返回清理后的文本；非法时抛出 ValueError。
+    """
+    text = value.strip()
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    if "," in text or "\r" in text or "\n" in text:
+        raise ValueError(f"{field_name} contains invalid separator")
+    return text
+
+
+def parse_protocol_field(field_name: str, value: str) -> str | int | float:
+    """
+    函数作用：
+        按字段定义解析协议字段，统一处理文本、整数和浮点数。
+
+    主要流程：
+        文本字段走 parse_text_field；数值字段走 parse_number 并继承非有限数拒绝逻辑。
+
+    参数说明：
+        field_name 为协议字段名。
+        value 为字段文本。
+
+    返回值：
+        返回 str、int 或 float；解析失败时抛出 ValueError。
+    """
+    if field_name in TEXT_FIELDS:
+        return parse_text_field(field_name, value)
+    return parse_number(field_name, value)
+
+
+def validate_named_numeric_data(kind: str, data: dict[str, str | int | float]) -> str | None:
     """
     函数作用：
         校验已解析数值帧中的枚举字段和非负整数字段。
@@ -316,7 +455,7 @@ def validate_named_numeric_data(kind: str, data: dict[str, int | float]) -> str 
 
     for field_name in NON_NEGATIVE_INTEGER_FIELDS:
         value = data.get(field_name)
-        if value is not None and value < 0:
+        if isinstance(value, (int, float)) and value < 0:
             return f"{field_name} must be non-negative: {value}"
 
     return None
@@ -350,7 +489,7 @@ def parse_named_numeric_frame(kind: str, prefix: str, fields: list[str], line: s
 
     try:
         data = {
-            field_name: parse_number(field_name, field_value.strip())
+            field_name: parse_protocol_field(field_name, field_value.strip())
             for field_name, field_value in zip(fields, parts)
         }
     except ValueError as exc:
@@ -386,8 +525,14 @@ def parse_frame(line: str) -> dict:
     """
     if line.startswith("{PID}"):
         return parse_named_numeric_frame("pid", "{PID}", PID_FIELDS, line)
+    if line.startswith("{PIDX}"):
+        return parse_named_numeric_frame("pidx", "{PIDX}", PIDX_FIELDS, line)
     if line.startswith("{CFG}"):
         return parse_named_numeric_frame("cfg", "{CFG}", CFG_FIELDS, line)
+    if line.startswith("{CFGX}"):
+        return parse_named_numeric_frame("cfgx", "{CFGX}", CFGX_FIELDS, line)
+    if line.startswith("{SENS}"):
+        return parse_named_numeric_frame("sens", "{SENS}", SENS_FIELDS, line)
     if line.startswith("{ACK}"):
         parts = line[len("{ACK}") :].split(",")
         return {
@@ -762,6 +907,553 @@ def normalize_command(command: str) -> str:
     return text + "\r\n"
 
 
+def format_command_float(value: float) -> str:
+    """
+    函数作用：
+        将待下发参数格式化为自动调参约定的三位小数字符串。
+
+    主要流程：
+        1. 转成 float，确保可以做数值校验。
+        2. 使用 math.isfinite 拒绝 nan/inf。
+        3. 返回固定三位小数，保证命令文本稳定可比对。
+
+    参数说明：
+        value 为待写入 {CMD} 的数值。
+
+    返回值：
+        返回形如 "1.235" 的字符串；非法数值抛出 ValueError。
+    """
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("command value must be finite")
+    return f"{number:.3f}"
+
+
+def validate_loop_id(loop_id: str) -> str:
+    """
+    函数作用：
+        校验分环命令中的 loop_id。
+
+    主要流程：
+        去除首尾空白后拒绝空值、逗号和换行，避免生成不可解析的 CSV 命令。
+
+    参数说明：
+        loop_id 为环路标识，例如 speed_l、yaw_rate。
+
+    返回值：
+        返回清理后的 loop_id；非法时抛出 ValueError。
+    """
+    return parse_text_field("loop_id", loop_id)
+
+
+def build_set_pidx_command(loop_id: str, kp: float, ki: float, kd: float) -> str:
+    """
+    函数作用：
+        构造分环 PID 参数下发命令。
+
+    主要流程：
+        校验 loop_id 和三个有限数值，并按三位小数输出 `{CMD}SET_PIDX`。
+
+    参数说明：
+        loop_id 为目标环路。
+        kp、ki、kd 为待下发 PID 参数。
+
+    返回值：
+        返回完整 `{CMD}SET_PIDX,loop_id,kp,ki,kd` 文本，不包含换行。
+    """
+    loop = validate_loop_id(loop_id)
+    return (
+        f"{{CMD}}SET_PIDX,{loop},"
+        f"{format_command_float(kp)},{format_command_float(ki)},{format_command_float(kd)}"
+    )
+
+
+def build_set_kfx_command(loop_id: str, kf: float) -> str:
+    """
+    函数作用：
+        构造分环前馈系数下发命令。
+
+    主要流程：
+        校验 loop_id 和有限数值，并按三位小数输出 `{CMD}SET_KFX`。
+
+    参数说明：
+        loop_id 为目标环路。
+        kf 为前馈系数。
+
+    返回值：
+        返回完整 `{CMD}SET_KFX,loop_id,kf` 文本，不包含换行。
+    """
+    loop = validate_loop_id(loop_id)
+    return f"{{CMD}}SET_KFX,{loop},{format_command_float(kf)}"
+
+
+def build_set_targetx_command(loop_id: str, target: float) -> str:
+    """
+    函数作用：
+        构造分环目标值下发命令。
+
+    主要流程：
+        校验 loop_id 和有限 target，并按三位小数输出 `{CMD}SET_TARGETX`。
+
+    参数说明：
+        loop_id 为目标环路。
+        target 为目标值。
+
+    返回值：
+        返回完整 `{CMD}SET_TARGETX,loop_id,target` 文本，不包含换行。
+    """
+    loop = validate_loop_id(loop_id)
+    return f"{{CMD}}SET_TARGETX,{loop},{format_command_float(target)}"
+
+
+def build_reset_ix_command(loop_id: str) -> str:
+    """
+    函数作用：
+        构造分环积分清空命令。
+
+    主要流程：
+        校验 loop_id 后输出 `{CMD}RESET_IX`。
+
+    参数说明：
+        loop_id 为目标环路。
+
+    返回值：
+        返回完整 `{CMD}RESET_IX,loop_id` 文本，不包含换行。
+    """
+    return f"{{CMD}}RESET_IX,{validate_loop_id(loop_id)}"
+
+
+def extract_command_metadata(command: str) -> dict[str, Any]:
+    """
+    函数作用：
+        从完整 {CMD} 命令提取命令名和可选 loop_id。
+
+    主要流程：
+        1. 复用 normalize_command 校验 `{CMD}` 前缀。
+        2. 拆分命令 payload，提取大写 command_name。
+        3. 对 `*X` 分环命令提取第一个参数作为 loop_id。
+
+    参数说明：
+        command 为完整命令文本，可带或不带换行。
+
+    返回值：
+        返回包含 command、command_name、loop_id 的字典；格式错误时抛出 ValueError。
+    """
+    normalized = normalize_command(command).strip()
+    payload = normalized[len("{CMD}") :]
+    parts = [part.strip() for part in payload.split(",")]
+    command_name = parts[0].upper() if parts else ""
+    if not command_name:
+        raise ValueError("command name is required")
+
+    loop_id = None
+    if command_name in LOOP_COMMANDS:
+        if len(parts) < 2 or not parts[1]:
+            raise ValueError("loop_id is required")
+        loop_id = validate_loop_id(parts[1])
+
+    return {
+        "command": normalized,
+        "command_name": command_name,
+        "loop_id": loop_id,
+    }
+
+
+def response_matches_pending_command(metadata: dict[str, Any], response: dict[str, Any]) -> bool:
+    """
+    函数作用：
+        判断 ACK/ERR 是否能匹配一条 pending 命令。
+
+    主要流程：
+        1. 只接受 valid 的 `{ACK}` 或 `{ERR}`。
+        2. 比较响应 command 与 pending command_name。
+        3. 当前板端 ACK/ERR 不携带 loop_id，因此分环命令按命令名匹配，由 dashboard 保留 loop_id。
+
+    参数说明：
+        metadata 为 extract_command_metadata 或 dashboard 命令历史中的命令元数据。
+        response 为 parse_frame 解析出的 ACK/ERR 字典。
+
+    返回值：
+        返回 True 表示可以关联；否则返回 False。
+    """
+    if response.get("kind") not in ("ack", "err") or not response.get("valid"):
+        return False
+    response_command = str(response.get("command", "")).strip().upper()
+    return response_command == str(metadata.get("command_name", "")).strip().upper()
+
+
+@dataclass
+class AutoTuneConfig:
+    """自动调参运行配置，全部字段来自 CLI 或 dashboard 显式开关。"""
+
+    auto: bool = False
+    profile: str = "line-car-cascade"
+    mode: str = "observe"
+    max_step: float = 0.10
+    window_seconds: float = 3.0
+    rollback_on_regression: bool = True
+
+
+class AutoTuneController:
+    """
+    串级 PID 自动调参纯状态机。
+
+    类作用：
+        接收已解析的 `{PIDX}`、`{CFGX}`、`{SENS}`、`{ACK}`、`{ERR}` 帧，按固定小车
+        profile 生成观察、建议、自动发送或回滚动作。该类不直接读写串口，便于单元测试和
+        dashboard/CLI 复用。
+    """
+
+    def __init__(self, config: AutoTuneConfig):
+        """
+        函数作用：
+            初始化自动调参控制器。
+
+        主要流程：
+            保存配置、确定串级 loop 顺序、创建配置表/样本表/历史表，并进入 DISCOVER 状态。
+
+        参数说明：
+            config 为自动调参配置；auto=False 或 mode 非 auto-tune 时不会自动生成发送动作。
+
+        返回值：
+            构造函数无显式返回值。
+        """
+        self.config = config
+        self.loop_order = list(CASCADE_PROFILE_ORDER if config.profile == "line-car-cascade" else CASCADE_PROFILE_ORDER)
+        self.state = "DISCOVER"
+        self.loop_configs: dict[str, dict[str, Any]] = {}
+        self.samples_by_loop: dict[str, list[dict[str, Any]]] = {}
+        self.latest_sens: dict[str, Any] | None = None
+        self.scores: dict[str, dict[str, float]] = {}
+        self.rollback_history: list[dict[str, Any]] = []
+        self.pending_step: dict[str, Any] | None = None
+        self.completed_loops: set[str] = set()
+        self.abort_reason: str | None = None
+
+    def ingest_frame(self, frame: dict[str, Any]) -> None:
+        """
+        函数作用：
+            注入一条已解析协议帧并更新自动调参内部状态。
+
+        主要流程：
+            1. 忽略 invalid 帧，避免坏数据参与调参。
+            2. `{CFGX}` 更新 loop 配置。
+            3. `{PIDX}` 追加到对应 loop 窗口并执行安全门槛检查。
+            4. `{SENS}` 记录小车传感器状态，丢线时触发 ABORT。
+
+        参数说明：
+            frame 为 parse_frame 返回的结构化字典。
+
+        返回值：
+            无返回值。
+        """
+        if not frame.get("valid"):
+            return
+
+        kind = frame.get("kind")
+        data = frame.get("data", {})
+        if kind == "cfgx":
+            loop_id = str(data["loop_id"])
+            self.loop_configs[loop_id] = dict(data)
+            if self.state == "DISCOVER":
+                self.state = "SYNC_CONFIG"
+            return
+
+        if kind == "pidx":
+            loop_id = str(data["loop_id"])
+            self.samples_by_loop.setdefault(loop_id, []).append(dict(data))
+            self.samples_by_loop[loop_id] = self.samples_by_loop[loop_id][-200:]
+            if int(data.get("fault", 0)) != 0:
+                self._abort(f"fault on {loop_id}")
+            if int(data.get("sensor_ok", 1)) != 1:
+                self._abort(f"sensor bad on {loop_id}")
+            return
+
+        if kind == "sens":
+            self.latest_sens = dict(data)
+            if int(data.get("line_lost", 0)) != 0:
+                self._abort("line lost")
+
+    def handle_response(self, response: dict[str, Any]) -> None:
+        """
+        函数作用：
+            处理自动调参 pending 命令对应的 ACK/ERR。
+
+        主要流程：
+            ACK 让状态机从 SEND_STEP 进入 OBSERVE_RESULT；ERR 说明板端拒绝参数，立即 ABORT。
+
+        参数说明：
+            response 为 parse_frame 返回的 ACK/ERR 字典。
+
+        返回值：
+            无返回值。
+        """
+        if self.pending_step is None:
+            return
+        if not response_matches_pending_command(self.pending_step, response):
+            return
+        if response.get("kind") == "ack":
+            self.pending_step["ack_received"] = True
+            self.pending_step["ack_sample_count"] = len(
+                self.samples_by_loop.get(str(self.pending_step.get("loop_id", "")), [])
+            )
+            self.state = "OBSERVE_RESULT"
+            return
+        if response.get("kind") == "err":
+            self._abort(f"board rejected {self.pending_step.get('command_name')}")
+
+    def plan_next_action(self) -> dict[str, Any]:
+        """
+        函数作用：
+            根据当前状态生成下一步自动调参动作。
+
+        主要流程：
+            1. ABORT 状态只返回 abort。
+            2. 存在已 ACK 的 pending_step 时，对比当前窗口评分，决定保留或回滚。
+            3. 没有 pending_step 时按 speed_l、speed_r、yaw_rate、line_outer 顺序选第一个可调 loop。
+            4. observe 模式只返回诊断，suggest 模式只返回建议，auto-tune 模式且 auto=True 才返回 send。
+
+        参数说明：
+            无参数。
+
+        返回值：
+            返回动作字典，type 可为 wait、observe、suggest、send、rollback、abort。
+        """
+        if self.state == "ABORT":
+            return {"type": "abort", "reason": self.abort_reason}
+
+        if self.pending_step is not None and self.pending_step.get("ack_received"):
+            loop_id = str(self.pending_step.get("loop_id", ""))
+            ack_sample_count = int(self.pending_step.get("ack_sample_count", 0))
+            if len(self.samples_by_loop.get(loop_id, [])) <= ack_sample_count:
+                return {
+                    "type": "wait",
+                    "state": self.state,
+                    "loop_id": loop_id,
+                    "reason": "waiting for post-ACK telemetry",
+                    "command": self.pending_step["command"],
+                }
+            return self._evaluate_pending_step()
+
+        if self.pending_step is not None:
+            return {
+                "type": "wait",
+                "state": self.state,
+                "reason": "waiting for ACK",
+                "command": self.pending_step["command"],
+            }
+
+        loop_id = self._select_next_loop()
+        if loop_id is None:
+            return {"type": "wait", "state": self.state, "reason": "waiting for loop config and telemetry"}
+
+        score = self.score_loop(loop_id)
+        self.scores[loop_id] = score
+        proposal = self._build_step(loop_id, score)
+
+        if self.config.mode == "observe":
+            self.state = "OBSERVE_BASELINE"
+            return {"type": "observe", "loop_id": loop_id, "score": score}
+
+        if self.config.mode == "suggest" or not self.config.auto:
+            self.state = "PROPOSE_STEP"
+            return {"type": "suggest", "loop_id": loop_id, "score": score, "command": proposal["command"]}
+
+        self.pending_step = proposal
+        self.state = "SEND_STEP"
+        return {
+            "type": "send",
+            "loop_id": loop_id,
+            "score": score,
+            "command": proposal["command"],
+            "reason": proposal["reason"],
+        }
+
+    def score_loop(self, loop_id: str) -> dict[str, float]:
+        """
+        函数作用：
+            计算某个 loop 最近窗口的调参评分指标。
+
+        主要流程：
+            从最近样本中统计平均误差、最大误差、过零次数、饱和比例、抗饱和比例、传感器异常比例和综合分。
+
+        参数说明：
+            loop_id 为目标环路。
+
+        返回值：
+            返回指标字典；score 越低表示效果越好。
+        """
+        samples = self.samples_by_loop.get(loop_id, [])[-50:]
+        if not samples:
+            return {
+                "mean_abs_error": float("inf"),
+                "max_abs_error": float("inf"),
+                "zero_crossings": 0.0,
+                "sat_ratio": 1.0,
+                "anti_windup_ratio": 1.0,
+                "sensor_bad_ratio": 1.0,
+                "line_lost_count": float(int(self.latest_sens.get("line_lost", 0)) if self.latest_sens else 0),
+                "score": float("inf"),
+            }
+
+        errors = [float(sample.get("error", 0.0)) for sample in samples]
+        abs_errors = [abs(error) for error in errors]
+        zero_crossings = 0
+        for previous, current in zip(errors, errors[1:]):
+            if previous == 0.0 or current == 0.0:
+                continue
+            if (previous > 0.0) != (current > 0.0):
+                zero_crossings += 1
+
+        sat_ratio = sum(1 for sample in samples if int(sample.get("sat", 0)) != 0) / len(samples)
+        anti_ratio = sum(1 for sample in samples if int(sample.get("anti_windup", 0)) != 0) / len(samples)
+        sensor_bad_ratio = sum(1 for sample in samples if int(sample.get("sensor_ok", 1)) != 1) / len(samples)
+        line_lost_count = float(int(self.latest_sens.get("line_lost", 0)) if self.latest_sens else 0)
+        mean_abs_error = sum(abs_errors) / len(abs_errors)
+        max_abs_error = max(abs_errors)
+        score = mean_abs_error + 0.25 * max_abs_error + zero_crossings * 2.0
+        score += sat_ratio * 20.0 + anti_ratio * 10.0 + sensor_bad_ratio * 100.0 + line_lost_count * 100.0
+
+        return {
+            "mean_abs_error": mean_abs_error,
+            "max_abs_error": max_abs_error,
+            "zero_crossings": float(zero_crossings),
+            "sat_ratio": sat_ratio,
+            "anti_windup_ratio": anti_ratio,
+            "sensor_bad_ratio": sensor_bad_ratio,
+            "line_lost_count": line_lost_count,
+            "score": score,
+        }
+
+    def _select_next_loop(self) -> str | None:
+        """
+        函数作用：
+            按串级调参顺序选择下一个可调 loop。
+
+        主要流程：
+            只选择同时具备 CFGX 配置和 PIDX 样本、且尚未完成的 loop。
+
+        参数说明：
+            无参数。
+
+        返回值：
+            返回 loop_id；没有可调 loop 时返回 None。
+        """
+        for loop_id in self.loop_order:
+            if loop_id in self.completed_loops:
+                continue
+            if loop_id not in self.loop_configs:
+                continue
+            if not self.samples_by_loop.get(loop_id):
+                continue
+            return loop_id
+        return None
+
+    def _build_step(self, loop_id: str, score: dict[str, float]) -> dict[str, Any]:
+        """
+        函数作用：
+            基于当前评分和配置生成一次小步 PID 参数修改。
+
+        主要流程：
+            默认仅调整 Kp：误差较大且未明显饱和时按 max_step 增大，否则按 max_step 减小。
+            这是保守首版策略，确保每次只改一个 loop 的一组三参数。
+
+        参数说明：
+            loop_id 为目标环路。
+            score 为 score_loop 返回的当前窗口指标。
+
+        返回值：
+            返回 pending step 字典，包含新旧参数、命令、原因和 ACK 状态。
+        """
+        cfg = self.loop_configs[loop_id]
+        old_kp = float(cfg["kp"])
+        old_ki = float(cfg["ki"])
+        old_kd = float(cfg["kd"])
+        step = max(0.0, min(float(self.config.max_step), 0.5))
+        if score["sat_ratio"] > 0.2 or score["zero_crossings"] >= 2.0:
+            factor = 1.0 - step
+            reason = "reduce kp due to saturation or oscillation"
+        else:
+            factor = 1.0 + step
+            reason = "increase kp to reduce mean error"
+        new_kp = max(0.0, old_kp * factor)
+        command = build_set_pidx_command(loop_id, new_kp, old_ki, old_kd)
+        metadata = extract_command_metadata(command)
+        return {
+            **metadata,
+            "loop_id": loop_id,
+            "old": {"kp": old_kp, "ki": old_ki, "kd": old_kd},
+            "new": {"kp": new_kp, "ki": old_ki, "kd": old_kd},
+            "baseline_score": score,
+            "reason": reason,
+            "ack_received": False,
+        }
+
+    def _evaluate_pending_step(self) -> dict[str, Any]:
+        """
+        函数作用：
+            对已 ACK 的参数修改观察结果并决定保留或回滚。
+
+        主要流程：
+            计算当前窗口评分；若综合分高于基线且允许回滚，则生成旧参数 SET_PIDX 回滚命令。
+
+        参数说明：
+            无参数，使用 self.pending_step。
+
+        返回值：
+            返回 keep 或 rollback 动作字典。
+        """
+        assert self.pending_step is not None
+        loop_id = str(self.pending_step["loop_id"])
+        current_score = self.score_loop(loop_id)
+        baseline = float(self.pending_step["baseline_score"]["score"])
+        current = float(current_score["score"])
+        if self.config.rollback_on_regression and current > baseline:
+            old = self.pending_step["old"]
+            command = build_set_pidx_command(loop_id, old["kp"], old["ki"], old["kd"])
+            record = {
+                "loop_id": loop_id,
+                "command": command,
+                "baseline_score": self.pending_step["baseline_score"],
+                "current_score": current_score,
+                "reason": "score regression",
+            }
+            self.rollback_history.append(record)
+            self.completed_loops.add(loop_id)
+            self.pending_step = None
+            self.state = "KEEP_OR_ROLLBACK"
+            return {"type": "rollback", **record}
+
+        self.completed_loops.add(loop_id)
+        self.pending_step = None
+        self.state = "NEXT_LOOP"
+        return {
+            "type": "keep",
+            "loop_id": loop_id,
+            "baseline_score": baseline,
+            "current_score": current,
+        }
+
+    def _abort(self, reason: str) -> None:
+        """
+        函数作用：
+            进入 ABORT 状态并记录停止原因。
+
+        主要流程：
+            保存首个停止原因，清空 pending_step，防止后续继续生成写参动作。
+
+        参数说明：
+            reason 为触发停止的安全原因。
+
+        返回值：
+            无返回值。
+        """
+        if self.state != "ABORT":
+            self.abort_reason = reason
+        self.pending_step = None
+        self.state = "ABORT"
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     """
     函数作用：
@@ -807,6 +1499,123 @@ def cmd_send(args: argparse.Namespace) -> int:
 
     print("No ACK/ERR response received.", file=sys.stderr)
     return 1
+
+
+def print_autotune_action(action: dict[str, Any], as_json: bool) -> None:
+    """
+    函数作用：
+        输出自动调参状态机动作。
+
+    主要流程：
+        JSONL 模式直接输出完整动作；普通模式只输出关键信息，避免长时间读取刷屏。
+
+    参数说明：
+        action 为 AutoTuneController.plan_next_action 返回的动作字典。
+        as_json 表示是否按 JSONL 输出。
+
+    返回值：
+        无返回值。
+    """
+    if as_json:
+        print(json.dumps({"time": time.time(), "autotune": action}, ensure_ascii=False), flush=True)
+        return
+
+    action_type = action.get("type")
+    loop_id = action.get("loop_id", "-")
+    if action_type in ("send", "suggest", "rollback"):
+        print(f"{action_type}\tloop={loop_id}\tcommand={action.get('command')}\treason={action.get('reason', '')}", flush=True)
+    elif action_type == "abort":
+        print(f"abort\treason={action.get('reason')}", flush=True)
+    elif action_type == "keep":
+        print(
+            f"keep\tloop={loop_id}\tbaseline={action.get('baseline_score')}\tcurrent={action.get('current_score')}",
+            flush=True,
+        )
+
+
+def cmd_autotune(args: argparse.Namespace) -> int:
+    """
+    函数作用：
+        执行串级 PID 自动调参 CLI。
+
+    主要流程：
+        1. 解析串口并创建 AutoTuneController。
+        2. 可选发送 `{CMD}GET_ALL_CFG`，促使板端回传全部 `{CFGX}`。
+        3. 持续读取 `{PIDX}`、`{CFGX}`、`{SENS}`、`{ACK}`、`{ERR}` 帧并推进状态机。
+        4. observe/suggest 模式只输出动作；auto-tune 模式才会自动发送 SET_PIDX 或回滚命令。
+
+    参数说明：
+        args 为 argparse 解析后的参数。
+
+    返回值：
+        正常结束返回 0；串口失败返回 1；用户中断返回 130。
+    """
+    resolved = resolve_port_and_baud(args)
+    if resolved is None:
+        return 1
+    port, baud = resolved
+    config = AutoTuneConfig(
+        auto=args.mode == "auto-tune",
+        profile=args.profile,
+        mode=args.mode,
+        max_step=args.max_step,
+        window_seconds=args.window_seconds,
+        rollback_on_regression=args.rollback_on_regression,
+    )
+    controller = AutoTuneController(config)
+    deadline = time.monotonic() + args.duration if args.duration > 0 else None
+    frame_count = 0
+    last_printed_action: str | None = None
+
+    try:
+        with open_serial(port, baud, timeout=0.5) as ser:
+            if args.request_config:
+                # GET_ALL_CFG 是只读同步请求，用于让多环板端立即发送 CFGX 配置快照。
+                ser.write(normalize_command("{CMD}GET_ALL_CFG").encode("ascii"))
+                ser.flush()
+
+            while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                if args.count > 0 and frame_count >= args.count:
+                    break
+
+                raw = ser.readline()
+                if not raw:
+                    continue
+                line = decode_line(raw)
+                if not line:
+                    continue
+                parsed = parse_frame(line)
+                frame_count += 1
+
+                if parsed.get("kind") in ("ack", "err"):
+                    controller.handle_response(parsed)
+                else:
+                    controller.ingest_frame(parsed)
+
+                action = controller.plan_next_action()
+                signature = json.dumps(action, sort_keys=True, default=str)
+                if action.get("type") != "wait" and signature != last_printed_action:
+                    print_autotune_action(action, args.jsonl)
+                    last_printed_action = signature
+
+                if action.get("type") in ("send", "rollback") and config.auto:
+                    command = normalize_command(str(action["command"]))
+                    ser.write(command.encode("ascii"))
+                    ser.flush()
+                    if not args.jsonl:
+                        print(f"sent\t{command.strip()}", flush=True)
+
+                if action.get("type") == "abort":
+                    return 1
+    except KeyboardInterrupt:
+        return 130
+    except (OSError, serial.SerialException) as exc:
+        print(f"Autotune serial session failed: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -866,6 +1675,59 @@ def build_parser() -> argparse.ArgumentParser:
     send_parser.add_argument("--response-seconds", type=float, default=2.0, help="Seconds to wait for ACK/ERR.")
     send_parser.add_argument("--jsonl", action="store_true", help="Output parsed JSONL records.")
     send_parser.set_defaults(func=cmd_send)
+
+    autotune_parser = subparsers.add_parser("autotune", help="Run cascade PID observe/suggest/auto-tune workflow.")
+    autotune_parser.add_argument("--port", help="Serial port, for example COM5.")
+    autotune_parser.add_argument("--baud", type=int, default=115200, help="Baud rate when --port is used.")
+    autotune_parser.add_argument("--auto", action="store_true", help="Auto-detect port before tuning.")
+    autotune_parser.add_argument("--baud-rates", help="Comma-separated baud rates for --auto.")
+    autotune_parser.add_argument("--sample-seconds", type=float, default=2.0, help="Auto-detect sample seconds.")
+    autotune_parser.add_argument("--max-lines", type=int, default=20, help="Auto-detect max lines.")
+    autotune_parser.add_argument("--include-bluetooth", action="store_true", help="Also scan Bluetooth virtual ports in --auto mode.")
+    autotune_parser.add_argument(
+        "--profile",
+        default="line-car-cascade",
+        choices=["line-car-cascade"],
+        help="Cascade loop profile; default line-car-cascade.",
+    )
+    autotune_parser.add_argument(
+        "--mode",
+        default="observe",
+        choices=["observe", "suggest", "auto-tune"],
+        help="observe only reads scores, suggest prints commands, auto-tune sends and rolls back automatically.",
+    )
+    autotune_parser.add_argument("--max-step", type=float, default=0.10, help="Maximum one-step kp/ki/kd ratio change.")
+    autotune_parser.add_argument("--window-seconds", type=float, default=3.0, help="Scoring window length in seconds.")
+    autotune_parser.add_argument(
+        "--rollback-on-regression",
+        dest="rollback_on_regression",
+        action="store_true",
+        default=True,
+        help="Send rollback command when score gets worse after ACK.",
+    )
+    autotune_parser.add_argument(
+        "--no-rollback-on-regression",
+        dest="rollback_on_regression",
+        action="store_false",
+        help="Keep changed parameters even if score gets worse.",
+    )
+    autotune_parser.add_argument(
+        "--request-config",
+        dest="request_config",
+        action="store_true",
+        default=True,
+        help="Send read-only {CMD}GET_ALL_CFG at session start.",
+    )
+    autotune_parser.add_argument(
+        "--no-request-config",
+        dest="request_config",
+        action="store_false",
+        help="Do not send GET_ALL_CFG automatically.",
+    )
+    autotune_parser.add_argument("--duration", type=float, default=0.0, help="Session duration in seconds; 0 means until stopped.")
+    autotune_parser.add_argument("--count", type=int, default=0, help="Maximum input frames to process; 0 means no count limit.")
+    autotune_parser.add_argument("--jsonl", action="store_true", help="Output actions as JSONL.")
+    autotune_parser.set_defaults(func=cmd_autotune)
 
     return parser
 

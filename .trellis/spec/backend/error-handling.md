@@ -135,6 +135,8 @@ Supported command payloads are exactly the forms documented in
 {CMD}SET_PID,kp,ki,kd
 {CMD}SET_TARGET,target
 {CMD}RESET
+{CMD}SET_PIDX,loop_id,kp,ki,kd
+{CMD}GET_CFGX,loop_id
 ```
 
 #### 3. Contracts
@@ -160,6 +162,7 @@ Supported command payloads are exactly the forms documented in
 | `{CMD}SET_PID,1.0,nope,0.01` | `PIDAI_CMD_ARG_INVALID` | `FLOAT_PARSE_FAIL` | No update. |
 | `{CMD}SET_PID,1.0,0.1,0.01,9` | `PIDAI_CMD_ARG_INVALID` | `UNEXPECTED_ARG` | No update. |
 | `{CMD}SET_PID,1.0,0.1,0.01,` | `PIDAI_CMD_ARG_INVALID` | `UNEXPECTED_ARG` | No update. |
+| `{CMD}SET_PIDX,missing,1.0,0.1,0.01` | `PIDAI_CMD_ARG_INVALID` | `LOOP_NOT_FOUND` | No update to any loop. |
 
 #### 5. Good/Base/Bad Cases
 
@@ -179,6 +182,7 @@ Add or update `tests/test_pid_ai.c` with assertions for:
 | Extra argument | `result.status == PIDAI_CMD_ARG_INVALID`; `detail == "UNEXPECTED_ARG"`; affected fields unchanged. |
 | Trailing empty argument | Same as extra argument. |
 | Missing argument | `result.status == PIDAI_CMD_ARG_MISSING`; affected fields unchanged. |
+| Unknown `loop_id` for `*X` commands | `result.status == PIDAI_CMD_ARG_INVALID`; `detail == "LOOP_NOT_FOUND"`; all loop handles unchanged. |
 
 #### 7. Wrong vs Correct
 
@@ -204,6 +208,54 @@ if (!PIDAI_NoMoreTokens(cursor)) {
 
 ---
 
+### Scenario: Multi-Loop Command Routing
+
+#### 1. Scope / Trigger
+
+Use this contract whenever adding or changing commands handled by
+`PIDAI_ProtocolHandleCommandX()`. Multi-loop routing is safety-critical because
+the host may tune `speed_l`, `speed_r`, `yaw_rate`, and `line_outer` with
+different stability assumptions.
+
+#### 2. Signatures
+
+```c
+const PIDAI_LoopRoute *PIDAI_ProtocolFindLoop(const PIDAI_LoopTable *table, const char *loop_id);
+PIDAI_CommandResult PIDAI_ProtocolHandleCommandX(const PIDAI_LoopTable *table, const char *line);
+```
+
+#### 3. Contracts
+
+| Input shape | Contract |
+|---|---|
+| `table == NULL`, `routes == NULL`, or `count == 0` | Return `PIDAI_CMD_INTERNAL_ERROR`; do not touch PID handles. |
+| Missing `loop_id` | Return `PIDAI_CMD_ARG_MISSING`; do not call any core setter. |
+| Unknown `loop_id` | Return `PIDAI_CMD_ARG_INVALID` with `detail="LOOP_NOT_FOUND"`. |
+| Bad numeric argument after valid `loop_id` | Return `PIDAI_CMD_ARG_INVALID`; do not update the matched loop. |
+| Extra field, including trailing comma | Return `PIDAI_CMD_ARG_INVALID` with `detail="UNEXPECTED_ARG"`. |
+| Exact valid `*X` command | Apply only the matched loop handle and return `PIDAI_CMD_OK`. |
+| `GET_ALL_CFG` | Return ACK for the command handler; board/application code is responsible for emitting each `{CFGX}` snapshot in loop-table order. |
+
+#### 4. Required `*X` Command Coverage
+
+| Command | Minimum failure coverage |
+|---|---|
+| `SET_PIDX` | Success, unknown loop, missing PID field, bad float, extra argument, trailing comma. |
+| `SET_KFX` / `SET_TARGETX` | Bad float and unknown loop. |
+| `SET_OUT_LIMITX` / `SET_I_LIMITX` | Bad limit order maps through core setter as `PARAM_RANGE`. |
+| `RESET_IX` / `ENABLEX` | Unknown loop and extra argument. |
+| `GET_CFGX` / `GET_ALL_CFG` | Unknown loop for `GET_CFGX`; no extra arguments for `GET_ALL_CFG`. |
+
+#### 5. Good/Base/Bad Cases
+
+| Case | Example | Required behavior |
+|---|---|---|
+| Good | `{CMD}SET_PIDX,speed_l,1.0,0.1,0.01` | Only `speed_l` changes and ACK names `SET_PIDX`. |
+| Base | `{CMD}SET_PIDX,missing,1.0,0.1,0.01` | ERR `ARG_INVALID/LOOP_NOT_FOUND`; no loop changes. |
+| Bad | `{CMD}SET_PIDX,speed_l,1.0,0.1,0.01,9` | ERR `ARG_INVALID/UNEXPECTED_ARG`; matched loop remains unchanged. |
+
+---
+
 ## API Error Responses
 
 The serial protocol is the API response layer.
@@ -214,6 +266,8 @@ The serial protocol is the API response layer.
 | Failure | `PIDAI_ProtocolBuildError()` | `{ERR}command,status,detail\r\n` |
 | Telemetry state | `PIDAI_ProtocolBuildTelemetry()` | `{PID}...fault\r\n` |
 | Config state | `PIDAI_ProtocolBuildConfig()` | `{CFG}...fault\r\n` |
+| Multi-loop telemetry state | `PIDAI_ProtocolBuildTelemetryX()` | `{PIDX}loop_id,loop_name,...fault\r\n` |
+| Multi-loop config state | `PIDAI_ProtocolBuildConfigX()` | `{CFGX}loop_id,loop_name,...fault\r\n` |
 
 Frame builders return `-1` for bad pointers/zero buffers and `-2` for buffer
 capacity failures, as implemented by `PIDAI_CheckFormatResult()`.
@@ -230,3 +284,4 @@ capacity failures, as implemented by `PIDAI_CheckFormatResult()`.
 | Emitting actuator output after bad `dt_ms` or sensor data. | Unsafe for real hardware. | Force outputs to `0.0f` and expose the fault. |
 | Ignoring frame builder return values in board code. | UART may transmit stale or truncated data. | Send only when `written > 0`, as in `examples/pid_ai_board_example.c`. |
 | Ignoring extra command fields. | Host command builders can be wrong while the board still applies a partial command. | Reject the command with `ARG_INVALID/UNEXPECTED_ARG` before calling the core setter. |
+| Falling back to the first loop when `loop_id` is unknown. | A typo from the host could retune the wrong controller. | Return `ARG_INVALID/LOOP_NOT_FOUND` and keep every loop unchanged. |

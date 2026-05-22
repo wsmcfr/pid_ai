@@ -111,8 +111,10 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port C
 | 串口连接 | 列出 COM 口、自动识别 PID AI 协议串口、连接、断开 |
 | 实时波形 | Canvas 显示 `target`、`feedback`、`error`、`p_out`、`i_out`、`d_out`、`out_limited`、`actuator` |
 | 安全状态 | 显示 `sensor_ok`、`fault`、`sat`、`anti_windup`、`mode`、`enable` |
+| 多环状态 | 显示 `{PIDX}` / `{CFGX}` 中每个 `loop_id` 的最新误差、参数、饱和和故障 |
+| 自动调参 | 支持 `observe`、`suggest`、`auto-tune`，按串级顺序生成小步 `SET_PIDX`，ACK 后观察，变差时回滚 |
 | 参数设置 | 生成并发送 `SET_PID`、`SET_KF`、`SET_TARGET`、`SET_OUT_LIMIT`、`SET_I_LIMIT`、`SET_MODE`、`SET_MANUAL_OUT`、`ENABLE`、`SET_REVERSE`、`SET_SENSOR_OK`、`RESET_I`、`CLEAR_FAULT`、`GET_CFG` |
-| 命令历史 | 记录 pending 命令，并只在收到 `{ACK}` 后标记为确认；收到 `{ERR}` 或本地串口错误时显示失败 |
+| 命令历史 | 记录 pending 命令、`loop_id` 和调参原因，并只在收到 `{ACK}` 后标记为确认；收到 `{ERR}` 或本地串口错误时显示失败 |
 
 ### 安全约束
 
@@ -120,6 +122,8 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port C
 |---|---|
 | 自动识别和打开页面是只读操作 | 启动上位机不会主动修改板端参数 |
 | 所有 `{CMD}` 必须由用户点击按钮或显式 API 请求触发 | 避免 AI 或脚本在无人确认时改变真实硬件状态 |
+| `auto-tune` 必须显式启用 | 启用后允许全自动发送 `SET_PIDX` 和回滚命令 |
+| 每次只改一个 loop 的一组 PID 参数 | 降低串级系统耦合风险，便于判断效果 |
 | 没有 `{ACK}` 不认为命令生效 | 串口写入成功不等于板端应用成功 |
 | `ENABLE,1`、`SET_MODE,2`、`SET_OUT_LIMIT` 会二次确认 | 这些命令可能直接影响执行器输出 |
 
@@ -158,6 +162,16 @@ seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out
 | `sensor_ok` | 传感器数据是否有效 |
 | `fault` | 板端故障位图 |
 
+多环或串级小车场景使用兼容扩展帧：
+
+```text
+{PIDX}loop_id,loop_name,seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out_raw,out_limited,actuator,out_min,out_max,sat,anti_windup,mode,enable,sensor_ok,fault
+{CFGX}loop_id,loop_name,kp,ki,kd,kf,sample_ms,integral_min,integral_max,out_min,out_max,reverse,mode,version,fault
+{SENS}ms,line0,line1,line2,line3,line4,line5,line6,line7,line_pos,line_lost,yaw,yaw_rate,enc_l,enc_r,v_l,v_r,v_avg,battery
+```
+
+默认小车 profile 使用 `speed_l`、`speed_r` 左右轮速度内环，`yaw_rate` 角速度中环，`line_outer` 8 路循迹外环。自动调参顺序固定为先内环后外环：`speed_l -> speed_r -> yaw_rate -> line_outer`。
+
 ## 上位机如何修改 PID 参数
 
 上位机通过 `{CMD}` 命令帧给板端下发控制命令。
@@ -174,6 +188,18 @@ seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out
 | 使能输出 | `{CMD}ENABLE,1` | 开启或关闭 PID 输出 |
 | 清空积分 | `{CMD}RESET_I` | 清空积分项 |
 | 请求配置 | `{CMD}GET_CFG` | 让板端回复当前 `{CFG}` 配置 |
+
+多环命令在命令名后增加 `loop_id`，例如：
+
+| 命令 | 示例 | 作用 |
+|---|---|---|
+| 分环设置 PID 参数 | `{CMD}SET_PIDX,speed_l,0.900,0.030,0.120` | 修改 `speed_l` 的 `kp/ki/kd` |
+| 分环设置目标 | `{CMD}SET_TARGETX,yaw_rate,2.500` | 修改 `yaw_rate` 目标值 |
+| 分环清空积分 | `{CMD}RESET_IX,line_outer` | 清空 `line_outer` 积分项 |
+| 请求单环配置 | `{CMD}GET_CFGX,speed_l` | 让板端回复对应 `{CFGX}` |
+| 请求全部配置 | `{CMD}GET_ALL_CFG` | 让板端按 loop 表回复全部 `{CFGX}` |
+
+未知 `loop_id` 会返回 `{ERR}SET_PIDX,ARG_INVALID,LOOP_NOT_FOUND`，不会修改任何 PID 参数。
 
 命令成功时，板端回复：
 
@@ -199,6 +225,18 @@ seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out
 | 输出能力不足 | `sat=1` 长时间存在，`feedback` 仍达不到目标 | 目标值可能过高，电源/电机/负载能力可能不足 |
 | 传感器异常 | `sensor_ok=0` 或 `fault` 非 0 | 停止自动调参，先排查传感器 |
 
+## 自动调参 CLI
+
+串口脚本提供 `autotune` 子命令。默认 `observe` 只读，`suggest` 只输出建议命令，只有 `auto-tune` 会自动写参：
+
+```powershell
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode observe
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode suggest
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode auto-tune --max-step 0.10 --rollback-on-regression
+```
+
+自动调参状态机按 `DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP -> SEND_STEP -> OBSERVE_RESULT -> KEEP_OR_ROLLBACK -> NEXT_LOOP` 推进。写参前会检查 `sensor_ok`、`fault` 和 `{SENS}.line_lost`；发送后必须等 `{ACK}`，若 post-ACK 窗口评分变差则发送旧参数 `SET_PIDX` 回滚。
+
 ## 当前阶段和下一步
 
 当前项目已经完成：
@@ -209,8 +247,12 @@ seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out
 | 已完成 | 串口文本协议 |
 | 已完成 | PID 遥测帧 `{PID}` |
 | 已完成 | 配置帧 `{CFG}` |
+| 已完成 | 多环遥测 `{PIDX}`、多环配置 `{CFGX}`、小车传感器 `{SENS}` parser |
+| 已完成 | 分环命令 `SET_PIDX`、`SET_KFX`、`SET_TARGETX`、`SET_OUT_LIMITX`、`SET_I_LIMITX`、`RESET_IX`、`ENABLEX`、`GET_CFGX`、`GET_ALL_CFG` |
 | 已完成 | 上位机命令 `{CMD}` |
 | 已完成 | ACK/ERR 回复机制 |
+| 已完成 | Python `autotune` 状态机、命令构建、ACK 匹配和变差回滚 |
+| 已完成 | Dashboard 多环状态、自动调参状态、评分和回滚历史 |
 | 已完成 | 板端接入示例 |
 | 已完成 | 基础 C 测试 |
 
@@ -218,11 +260,9 @@ seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out
 
 | 优先级 | 下一步 | 目标 |
 |---|---|---|
-| 高 | Python 串口读取脚本 | 读取 `{PID}` 并保存 CSV |
-| 高 | 上位机曲线界面 | 实时显示目标值、反馈值、误差、P/I/D 输出 |
-| 高 | AI 诊断模块 | 根据一段窗口数据给出调参建议 |
-| 中 | 参数确认和下发界面 | 用户确认后发送 `{CMD}SET_PID` |
+| 高 | 真实小车板端接入 `{PIDX}` / `{CFGX}` / `{SENS}` | 在硬件上验证串级自动调参闭环 |
 | 中 | 实验记录系统 | 保存每次参数修改前后的曲线和结果 |
+| 中 | 更细的调参策略 | 针对 `ki/kd`、外环和饱和场景引入更丰富的规则 |
 | 低 | 二进制协议和 CRC | 提升高频传输可靠性和带宽效率 |
 
 ## 移植到真实板子的最小步骤
