@@ -295,6 +295,7 @@ class PidAiAutoTuneTest(unittest.TestCase):
             mode="auto-tune",
             max_step=0.10,
             window_seconds=0.02,
+            ack_timeout_seconds=0.50,
             rollback_on_regression=True,
         )
         return pid_ai_serial.AutoTuneController(config)
@@ -322,6 +323,8 @@ class PidAiAutoTuneTest(unittest.TestCase):
         *,
         fault: int = 0,
         line_lost: int = 0,
+        start_ms: int = 10,
+        step_ms: int = 10,
     ) -> None:
         """
         函数作用：
@@ -336,13 +339,16 @@ class PidAiAutoTuneTest(unittest.TestCase):
             errors 为窗口内误差序列。
             fault 为注入到最后一条 PIDX 的故障位图。
             line_lost 为注入到 SENS 的丢线状态。
+            start_ms 为第一条样本的板端毫秒时间，用于验证按秒裁剪评分窗口。
+            step_ms 为相邻样本的板端毫秒间隔。
 
         返回值：
             无返回值。
         """
         for index, error in enumerate(errors, start=1):
+            ms = start_ms + (index - 1) * step_ms
             line = (
-                f"{{PIDX}}{loop_id},{loop_id},{index},{index * 10},10.000,100.000,"
+                f"{{PIDX}}{loop_id},{loop_id},{index},{ms},10.000,100.000,"
                 f"{100.0 - error:.3f},{error:.3f},0.000,0.000,0.000,0.000,0.000,"
                 "0.000,0.000,0.000,0.000,0.000,1000.000,0,0,1,1,1,"
                 f"{fault if index == len(errors) else 0}"
@@ -423,6 +429,123 @@ class PidAiAutoTuneTest(unittest.TestCase):
         self.assertEqual(rollback["type"], "rollback")
         self.assertEqual(rollback["loop_id"], "speed_l")
         self.assertEqual(rollback["command"], "{CMD}SET_PIDX,speed_l,1.200,0.030,0.080")
+        self.assertNotIn("speed_l", controller.completed_loops)
+
+    def test_ack_timeout_aborts_pending_step(self) -> None:
+        """
+        函数作用：
+            验证自动调参写参后若超过 ACK 超时仍未收到板端确认，会进入 ABORT。
+
+        主要流程：
+            1. 注入 speed_l 配置和遥测，生成 SET_PIDX 写参动作。
+            2. 不注入 ACK，直接把 plan_next_action 的 now 推进到超时时刻之后。
+            3. 校验状态机返回 abort，避免 CLI/dashboard 永久等待。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [5.0, 4.0, 3.0])
+
+        action = controller.plan_next_action(now=100.0)
+        self.assertEqual(action["type"], "send")
+        timeout = controller.plan_next_action(now=100.6)
+
+        self.assertEqual(timeout["type"], "abort")
+        self.assertIn("ACK timeout", timeout["reason"])
+
+    def test_rollback_ack_is_required_before_loop_completed(self) -> None:
+        """
+        函数作用：
+            验证评分变差后的回滚命令必须等待独立 ACK，不能在发送时直接标记 loop 完成。
+
+        主要流程：
+            1. 生成并 ACK 一个 speed_l 调参 step。
+            2. 注入更差窗口触发 rollback pending。
+            3. 在 rollback ACK 前确认 speed_l 未完成；收到 ACK 后才标记完成。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [5.0, 4.0, 3.0], start_ms=1000)
+        self.assertEqual(controller.plan_next_action(now=100.0)["type"], "send")
+        controller.handle_response(pid_ai_serial.parse_frame("{ACK}SET_PIDX,OK"), now=100.1)
+
+        self.ingest_window(controller, "speed_l", [20.0, 21.0, 22.0], start_ms=1100)
+        rollback = controller.plan_next_action(now=100.2)
+        self.assertEqual(rollback["type"], "rollback")
+        self.assertEqual(controller.pending_step["phase"], "rollback")
+        self.assertNotIn("speed_l", controller.completed_loops)
+
+        waiting = controller.plan_next_action(now=100.3)
+        self.assertEqual(waiting["type"], "wait")
+        self.assertEqual(waiting["reason"], "waiting for rollback ACK")
+        controller.handle_response(pid_ai_serial.parse_frame("{ACK}SET_PIDX,OK"), now=100.4)
+
+        self.assertIn("speed_l", controller.completed_loops)
+        self.assertIsNone(controller.pending_step)
+
+    def test_rollback_err_or_timeout_aborts(self) -> None:
+        """
+        函数作用：
+            验证回滚命令被 ERR 拒绝或等待 ACK 超时时，自动调参都会进入 ABORT。
+
+        主要流程：
+            分别构造 rollback pending，然后注入 ERR 或推进 now 到超时时间之后。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [5.0, 4.0, 3.0], start_ms=1000)
+        self.assertEqual(controller.plan_next_action(now=100.0)["type"], "send")
+        controller.handle_response(pid_ai_serial.parse_frame("{ACK}SET_PIDX,OK"), now=100.1)
+        self.ingest_window(controller, "speed_l", [20.0, 21.0, 22.0], start_ms=1100)
+        self.assertEqual(controller.plan_next_action(now=100.2)["type"], "rollback")
+
+        controller.handle_response(pid_ai_serial.parse_frame("{ERR}SET_PIDX,ARG_INVALID,LOOP_NOT_FOUND"), now=100.3)
+        err_action = controller.plan_next_action(now=100.3)
+        self.assertEqual(err_action["type"], "abort")
+        self.assertIn("board rejected", err_action["reason"])
+
+        timeout_controller = self.make_controller()
+        self.ingest_cfgs(timeout_controller)
+        self.ingest_window(timeout_controller, "speed_l", [5.0, 4.0, 3.0], start_ms=1000)
+        self.assertEqual(timeout_controller.plan_next_action(now=200.0)["type"], "send")
+        timeout_controller.handle_response(pid_ai_serial.parse_frame("{ACK}SET_PIDX,OK"), now=200.1)
+        self.ingest_window(timeout_controller, "speed_l", [20.0, 21.0, 22.0], start_ms=1100)
+        self.assertEqual(timeout_controller.plan_next_action(now=200.2)["type"], "rollback")
+
+        timeout_action = timeout_controller.plan_next_action(now=200.8)
+        self.assertEqual(timeout_action["type"], "abort")
+        self.assertIn("ACK timeout", timeout_action["reason"])
+
+    def test_score_loop_uses_window_seconds(self) -> None:
+        """
+        函数作用：
+            验证评分窗口按 window_seconds 和样本时间戳裁剪，而不是固定最近 50 条。
+
+        主要流程：
+            1. 注入两条很旧且误差很大的样本。
+            2. 注入三条最新且误差很小的样本。
+            3. window_seconds=0.02 时只应统计最新 20ms 内样本，平均误差接近 2。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [100.0, 100.0], start_ms=1000, step_ms=10)
+        self.ingest_window(controller, "speed_l", [1.0, 2.0, 3.0], start_ms=2000, step_ms=10)
+
+        score = controller.score_loop("speed_l")
+
+        self.assertAlmostEqual(score["mean_abs_error"], 2.0)
+        self.assertAlmostEqual(score["max_abs_error"], 3.0)
 
 
 if __name__ == "__main__":

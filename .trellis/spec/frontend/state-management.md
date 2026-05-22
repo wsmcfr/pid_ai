@@ -117,6 +117,7 @@ type DashboardRuntimeState = {
 | Bad `{PIDX}` / `{CFGX}` frames increment parse errors but do not mutate `loops`. | A truncated frame must not erase known-good controller state. |
 | `{SENS}` parse errors do not clear `latest_sens`. | Safety decisions need the last valid sensor evidence plus the parse error. |
 | Command history records `loop_id` and tuning reason when present. | ACK/ERR matching, audit trails, and rollback records need the same routing key. |
+| Legacy ACK/ERR frames without `loop_id` must not coexist with multiple pending commands of the same loop-aware command name. | `{ACK}SET_PIDX,OK` cannot prove whether `speed_l` or `speed_r` was applied if both are pending. |
 | `GET_ALL_CFG` may produce multiple `{CFGX}` frames. | Store each snapshot independently under its loop key. |
 
 ---
@@ -145,14 +146,18 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | Single-loop mutation | Only one loop and one `kp/ki/kd` tuple may be changed per step. |
 | Step size | Default maximum change is `10%`; command builders format PID numbers with three decimals. |
 | ACK gate | `OBSERVE_RESULT` may start only after a matching `{ACK}` for the pending command and `loop_id`. |
-| ERR/timeout gate | `{ERR}`, ACK timeout, or mismatched pending command moves the controller to `ABORT`. |
-| Regression rollback | If post-ACK score is worse and rollback is enabled, send old parameters using `SET_PIDX` and append `rollback_history`. |
+| ACK timeout | Store `sent_at` for each step and rollback command; if `ack_timeout_seconds` elapses without a matching ACK/ERR, move the controller to `ABORT`. |
+| ERR/timeout gate | `{ERR}`, ACK timeout, serial disconnect, or mismatched pending command moves the controller to `ABORT`. |
+| Regression rollback | If post-ACK score is worse and rollback is enabled, send old parameters using `SET_PIDX`, append `rollback_history`, and keep the loop pending until the rollback command receives a matching `{ACK}`. |
+| Rollback failure | Rollback `{ERR}` or rollback ACK timeout moves the controller to `ABORT`; do not mark the loop completed. |
 | Safety abort | `fault != 0`, `sensor_ok != 1`, `{SENS}.line_lost == 1`, serial disconnect, or Bluetooth SPP stream loss aborts auto-tune. |
 | Dangerous changes | Auto-tune must not automatically widen output limits, flip reverse direction, or enable manual output. |
 
 Scores are derived state, not board-confirmed state. They can be recomputed from
 bounded telemetry windows and should not replace `{CFGX}` as the source of truth
-for applied parameters.
+for applied parameters. When an API exposes `window_seconds`, scoring must crop
+samples by receive time or board `ms`; a fixed sample count is only a fallback
+when no usable timestamp exists.
 
 ---
 
@@ -166,4 +171,5 @@ for applied parameters.
 | Deriving diagnosis from raw strings. | Parser differences create subtle bugs. | Parse first, then derive from typed frames. |
 | Updating every loop when one `{PIDX}` arrives. | A single noisy loop can pollute other controller state. | Mutate only `loops[frame.loop_id]`. |
 | Starting post-step evaluation before ACK. | The score may describe old parameters. | Record the ACK sample boundary and wait for new telemetry. |
+| Treating a rollback write as completed immediately. | The dashboard may continue to the next loop while the board still runs bad parameters. | Model rollback as its own pending command and wait for matching ACK. |
 | Clearing auto-tune aborts on the next good frame. | Operators lose the reason the automatic write flow stopped. | Require explicit user action to re-enable after `ABORT`. |

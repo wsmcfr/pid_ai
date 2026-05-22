@@ -64,7 +64,7 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port C
 ```powershell
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode observe
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode suggest
-python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode auto-tune --max-step 0.10 --window-seconds 2.0 --rollback-on-regression
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode auto-tune --max-step 0.10 --window-seconds 2.0 --ack-timeout-seconds 2.0 --rollback-on-regression
 ```
 
 核心状态机：
@@ -74,7 +74,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 -> SEND_STEP -> OBSERVE_RESULT -> KEEP_OR_ROLLBACK -> NEXT_LOOP
 ```
 
-任一安全门槛失败、收到 `{ERR}`、ACK 超时、蓝牙断流或用户停止时进入 `ABORT`。
+任一安全门槛失败、收到 `{ERR}`、ACK 超时、蓝牙断流或用户停止时进入 `ABORT`。`window_seconds` 必须按接收时间或板端 `ms` 裁剪评分窗口；不能把固定样本数伪装成秒级窗口。
 
 ## 串级 PID 顺序
 
@@ -117,7 +117,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 
 ## 分环命令
 
-旧单环命令保持兼容，例如 `{CMD}SET_PID,kp,ki,kd` 仍作用于单个 `PIDAI_Handle`。多环命令必须精确匹配 `loop_id`：
+旧单环命令保持兼容，例如 `{CMD}SET_PID,kp,ki,kd` 仍作用于单个 `PIDAI_Handle`。多环命令必须先精确匹配 `loop_id`，再解析后续数值；未知 loop 即使后续参数是坏数字，也必须返回 `LOOP_NOT_FOUND`，不能修改任何 handle：
 
 | 命令 | 示例 | 说明 |
 |---|---|---|
@@ -142,10 +142,12 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | 规则 | 要求 |
 |---|---|
 | 写参确认 | 串口 write 成功不代表板端应用成功，必须等待匹配 `{ACK}` |
-| Pending 匹配 | host 侧按命令名和 `loop_id` 匹配 pending 命令 |
+| ACK/ERR 格式 | 兼容旧 `{ACK}SET_PIDX,OK`，推荐新 `{ACK}SET_PIDX,speed_l,OK`；ERR 同理可带 `loop_id` |
+| Pending 匹配 | host 侧按命令名和 `loop_id` 匹配 pending 命令；旧 ACK/ERR 不带 `loop_id` 时禁止同名分环命令并发 pending |
 | ERR 处理 | 收到 `{ERR}` 后命令失败，自动调参进入停止状态 |
 | ACK 后观察 | `auto-tune` 必须等 ACK 后再开始 post-ACK 观察窗口 |
-| 回滚条件 | post-ACK 窗口评分变差且启用 `--rollback-on-regression` 时，发送旧参数 `SET_PIDX` |
+| ACK 超时 | step 和 rollback 都要记录发送时间，超过 `--ack-timeout-seconds` 未收到 ACK/ERR 必须 `ABORT` |
+| 回滚条件 | post-ACK 窗口评分变差且启用 `--rollback-on-regression` 时，发送旧参数 `SET_PIDX`；rollback 是独立 pending 命令，收到匹配 ACK 后才算当前 loop 完成 |
 
 ## 安全门槛
 
@@ -160,7 +162,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | 命令结果 | `{ERR}`、ACK 超时或 pending 命令不匹配 |
 | 用户操作 | dashboard stop、CLI 中断或明确要求 emergency-stop |
 
-评分窗口至少考虑平均误差、最大误差、过零/震荡、饱和比例、anti-windup 比例、传感器异常比例和丢线次数。内环未达标时不要继续调外环。
+评分窗口至少考虑平均误差、最大误差、过零/震荡、饱和比例、anti-windup 比例、传感器异常比例和丢线次数。内环未达标时不要继续调外环。回滚收到 `{ERR}` 或 rollback ACK 超时必须中止，不得继续调下一环。
 
 ## Dashboard
 

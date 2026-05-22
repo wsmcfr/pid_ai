@@ -500,6 +500,83 @@ static int test_protocol_set_pidx_rejects_unknown_loop(void)
 
 /*
  * 函数作用：
+ *   测试多环命令入口会把无效 loop table 视为板端集成错误，而不是误报为未知 loop。
+ *
+ * 主要流程：
+ *   1. 构造三类无效表：table 指针为空、loops 指针为空、count 为 0。
+ *   2. 分别发送只读 GET_ALL_CFG 或分环 SET_PIDX 命令。
+ *   3. 校验全部返回 INTERNAL_ERROR/NO_VALID_LOOP_TABLE，防止上位机误判为普通参数错误。
+ *
+ * 返回值：
+ *   返回 1 表示无效 loop table 被统一拒绝；否则返回 0。
+ */
+static int test_protocol_x_rejects_invalid_loop_table(void)
+{
+    PIDAI_LoopTable null_routes;
+    PIDAI_LoopRoute dummy_route;
+    PIDAI_LoopTable zero_count;
+    PIDAI_CommandResult result;
+
+    null_routes.loops = 0;
+    null_routes.count = 1U;
+    zero_count.loops = &dummy_route;
+    zero_count.count = 0U;
+
+    result = PIDAI_ProtocolHandleCommandX(0, "{CMD}GET_ALL_CFG");
+    if (result.status != PIDAI_CMD_INTERNAL_ERROR) return 0;
+    if (strcmp(result.detail, "NO_VALID_LOOP_TABLE") != 0) return 0;
+
+    result = PIDAI_ProtocolHandleCommandX(&null_routes, "{CMD}GET_ALL_CFG");
+    if (result.status != PIDAI_CMD_INTERNAL_ERROR) return 0;
+    if (strcmp(result.detail, "NO_VALID_LOOP_TABLE") != 0) return 0;
+
+    result = PIDAI_ProtocolHandleCommandX(&zero_count, "{CMD}SET_PIDX,speed_l,1.000,0.100,0.010");
+    if (result.status != PIDAI_CMD_INTERNAL_ERROR) return 0;
+    if (strcmp(result.detail, "NO_VALID_LOOP_TABLE") != 0) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   测试分环命令必须先验证 loop_id，再解析后续数值参数。
+ *
+ * 主要流程：
+ *   1. 构造只包含 speed_l/speed_r 的 loop 表。
+ *   2. 对未知 loop_id 发送带坏数字的 SET_PIDX 和 SET_KFX。
+ *   3. 校验错误原因仍为 LOOP_NOT_FOUND，且任何 PID 参数都不被修改。
+ *
+ * 返回值：
+ *   返回 1 表示 loop 路由错误优先级符合协议；否则返回 0。
+ */
+static int test_protocol_x_unknown_loop_wins_over_bad_args(void)
+{
+    PIDAI_Handle left;
+    PIDAI_Handle right;
+    PIDAI_LoopRoute routes[2];
+    PIDAI_LoopTable table;
+    PIDAI_CommandResult result;
+
+    setup_two_loop_routes(&left, &right, routes);
+    table.loops = routes;
+    table.count = 2U;
+
+    result = PIDAI_ProtocolHandleCommandX(&table, "{CMD}SET_PIDX,missing,nope,0.100,0.010");
+    if (result.status != PIDAI_CMD_ARG_INVALID) return 0;
+    if (strcmp(result.detail, "LOOP_NOT_FOUND") != 0) return 0;
+
+    result = PIDAI_ProtocolHandleCommandX(&table, "{CMD}SET_KFX,missing,nope");
+    if (result.status != PIDAI_CMD_ARG_INVALID) return 0;
+    if (strcmp(result.detail, "LOOP_NOT_FOUND") != 0) return 0;
+
+    if (!float_close(left.kp, 0.0f) || !float_close(right.kp, 0.0f)) return 0;
+    if (!float_close(left.kf, 0.0f) || !float_close(right.kf, 0.0f)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
  *   测试 SET_PIDX 对缺参、坏数字、多余参数和尾随逗号都执行精确拒绝。
  *
  * 主要流程：
@@ -642,6 +719,14 @@ int main(void)
     }
     if (!test_protocol_set_pidx_rejects_unknown_loop()) {
         printf("FAIL: test_protocol_set_pidx_rejects_unknown_loop\n");
+        return 1;
+    }
+    if (!test_protocol_x_rejects_invalid_loop_table()) {
+        printf("FAIL: test_protocol_x_rejects_invalid_loop_table\n");
+        return 1;
+    }
+    if (!test_protocol_x_unknown_loop_wins_over_bad_args()) {
+        printf("FAIL: test_protocol_x_unknown_loop_wins_over_bad_args\n");
         return 1;
     }
     if (!test_protocol_set_pidx_rejects_malformed_commands()) {

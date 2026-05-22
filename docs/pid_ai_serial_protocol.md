@@ -12,7 +12,7 @@
 | 分隔符 | 英文逗号 `,` |
 | 数值格式 | 十进制文本，浮点数推荐保留 3 到 6 位小数 |
 | 字段顺序 | 固定顺序，上位机必须按字段表解析 |
-| 板端上传前缀 | `{PID}`、`{CFG}`、`{STAT}`、`{EVT}`、`{ACK}`、`{ERR}` |
+| 板端上传前缀 | `{PID}`、`{PIDX}`、`{CFG}`、`{CFGX}`、`{SENS}`、`{STAT}`、`{EVT}`、`{ACK}`、`{ERR}` |
 | 上位机命令前缀 | `{CMD}` |
 
 注意：文本协议牺牲了一部分带宽，但换来了可读性和调试便利。第一版推荐先用文本协议跑通 AI 诊断闭环，后续再按相同字段设计二进制协议。
@@ -250,7 +250,7 @@
 {ERR}SET_PIDX,ARG_INVALID,LOOP_NOT_FOUND
 ```
 
-所有 `*X` 命令仍然遵守精确字段数量规则。参数不足返回 `ARG_MISSING`，多余字段或尾随逗号返回 `ARG_INVALID,UNEXPECTED_ARG`，坏数字返回 `ARG_INVALID,FLOAT_PARSE_FAIL`。
+所有 `*X` 命令仍然遵守精确字段数量规则。参数不足返回 `ARG_MISSING`，多余字段或尾随逗号返回 `ARG_INVALID,UNEXPECTED_ARG`，坏数字返回 `ARG_INVALID,FLOAT_PARSE_FAIL`。分环命令必须先精确查找 `loop_id`，再解析后续数值；因此 `{CMD}SET_PIDX,missing,nope,0,0` 仍应返回 `ARG_INVALID,LOOP_NOT_FOUND`，且不修改任何环路。若板端集成层没有提供有效 loop 表，应返回 `INTERNAL_ERROR,NO_VALID_LOOP_TABLE`。
 
 示例：
 
@@ -264,7 +264,7 @@
 
 ## 7. 确认帧 `{ACK}` 与错误帧 `{ERR}`
 
-命令成功时，板端回复：
+命令成功时，板端回复旧兼容格式：
 
 ```text
 {ACK}command,detail
@@ -276,7 +276,19 @@
 {ACK}SET_PID,OK
 ```
 
-命令失败时，板端回复：
+分环命令推荐回复带 `loop_id` 的扩展格式，便于上位机精确匹配 pending 命令：
+
+```text
+{ACK}command,loop_id,detail
+```
+
+示例：
+
+```text
+{ACK}SET_PIDX,speed_l,OK
+```
+
+命令失败时，板端回复旧兼容格式：
 
 ```text
 {ERR}command,status,detail
@@ -289,6 +301,14 @@
 {ERR}SET_OUT_LIMIT,PARAM_RANGE,OUT_LIMIT_INVALID
 {ERR}UNKNOWN,BAD_PREFIX,EXPECTED_CMD_PREFIX
 ```
+
+分环错误也推荐带 `loop_id`：
+
+```text
+{ERR}SET_PIDX,speed_l,ARG_INVALID,FLOAT_PARSE_FAIL
+```
+
+为兼容旧固件，上位机仍可接受不带 `loop_id` 的 `{ACK}SET_PIDX,OK` 和 `{ERR}SET_PIDX,ARG_INVALID,LOOP_NOT_FOUND`。在旧格式下，上位机必须禁止同名分环命令并发 pending，否则无法判断 ACK/ERR 对应哪个 `loop_id`。
 
 错误状态说明：
 
@@ -313,7 +333,7 @@
 | 6 | 板端回复 `{ACK}` | 没有 ACK 不认为生效 |
 | 7 | 继续观察 `{PID}` | 对比超调、稳定时间和稳态误差 |
 
-串级小车 profile 的默认顺序为 `speed_l`、`speed_r`、`yaw_rate`、`line_outer`。内环没有完成前不要调外环；每次只修改一个 loop 的一组 `kp/ki/kd`，默认最大变化幅度不超过 10%。自动写参必须等待 `{ACK}` 后进入观察窗口，若评分变差则发送旧参数的 `SET_PIDX` 回滚命令；出现 `fault != 0`、`sensor_ok = 0`、`line_lost = 1`、`{ERR}`、ACK 超时或蓝牙断流时进入停止状态。
+串级小车 profile 的默认顺序为 `speed_l`、`speed_r`、`yaw_rate`、`line_outer`。内环没有完成前不要调外环；每次只修改一个 loop 的一组 `kp/ki/kd`，默认最大变化幅度不超过 10%。自动写参必须等待 `{ACK}` 后进入观察窗口，观察评分应按 `window_seconds` 使用本机接收时间或板端 `ms` 裁剪窗口，不能固定取任意样本数。若评分变差则发送旧参数的 `SET_PIDX` 回滚命令；回滚本身也是独立 pending 命令，必须收到匹配 `{ACK}` 后才允许把该 loop 标记完成，回滚 `{ERR}` 或回滚 ACK 超时必须进入停止状态。出现 `fault != 0`、`sensor_ok = 0`、`line_lost = 1`、`{ERR}`、ACK 超时或蓝牙断流时进入停止状态。
 
 ## 9. 上位机字段配置模板
 

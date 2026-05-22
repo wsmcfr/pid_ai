@@ -116,10 +116,10 @@ AI diagnosis code.
 | `{PID}` | Prefix, exact field count `23`, numeric parsing, enum ranges for `sat`, `mode`, booleans. |
 | `{PIDX}` | Prefix, exact field count `25`, non-empty safe `loop_id`/`loop_name`, then all `{PID}` numeric and enum checks. |
 | `{CFG}` | Prefix, exact field count `14`, numeric parsing, mode range, version number. |
-| `{CFGX}` | Prefix, exact field count `16`, non-empty safe `loop_id`/`loop_name`, then all `{CFG}` numeric and enum checks. |
+| `{CFGX}` | Prefix, exact field count `15`, non-empty safe `loop_id`/`loop_name`, then all `{CFG}` numeric and enum checks. |
 | `{SENS}` | Prefix, exact field count `19`, finite numeric parsing, eight `lineN` booleans, `line_lost` boolean. |
-| `{ACK}` | Prefix, command string, detail string. |
-| `{ERR}` | Prefix, command string, known status text, detail string. |
+| `{ACK}` | Prefix, command string, detail string; loop-aware commands may use `{ACK}command,loop_id,detail`. |
+| `{ERR}` | Prefix, command string, known status text, detail string; loop-aware commands may use `{ERR}command,loop_id,status,detail`. |
 
 Reject partial/truncated frames instead of filling missing fields with defaults.
 For UI display, keep a parse error counter and optionally show the last bad line
@@ -254,6 +254,19 @@ Host code should treat unknown statuses as parse/compatibility warnings.
 `LOOP_NOT_FOUND` is an ERR detail, not a status enum. Host code should surface it
 on `*X` commands and leave every loop's confirmed config unchanged.
 
+Loop-aware ACK/ERR parsing must preserve compatibility with old firmware:
+
+| Frame | Parsed command | Parsed loop_id | Parsed status/detail |
+|---|---|---|---|
+| `{ACK}SET_PIDX,OK` | `SET_PIDX` | `null` | `detail=OK` |
+| `{ACK}SET_PIDX,speed_l,OK` | `SET_PIDX` | `speed_l` | `detail=OK` |
+| `{ERR}SET_PIDX,ARG_INVALID,LOOP_NOT_FOUND` | `SET_PIDX` | `null` | `status=ARG_INVALID`, `detail=LOOP_NOT_FOUND` |
+| `{ERR}SET_PIDX,speed_l,ARG_INVALID,FLOAT_PARSE_FAIL` | `SET_PIDX` | `speed_l` | `status=ARG_INVALID`, `detail=FLOAT_PARSE_FAIL` |
+
+When ACK/ERR lacks `loop_id`, host transaction state must prevent multiple
+pending commands with the same loop-aware command name, because command-only
+matching cannot distinguish `speed_l` from `speed_r`.
+
 ### Command Builders
 
 Build commands from typed values and format them with the protocol prefix:
@@ -295,7 +308,7 @@ stay deterministic.
 | Mistake | Prevention |
 |---|---|
 | Forgetting that `{PID}` has 23 fields. | Keep a parser test with the exact sample from `docs/pid_ai_serial_protocol.md`. |
-| Forgetting that `{PIDX}` and `{CFGX}` prepend `loop_id,loop_name`. | Test exact field counts `25` and `16` using protocol samples. |
+| Forgetting that `{PIDX}` and `{CFGX}` prepend `loop_id,loop_name`. | Test exact field counts `25` and `15` using protocol samples. |
 | Treating `{SENS}.line_lost` as informational only. | Gate or abort line-car auto-tune when `line_lost == 1`. |
 | Accepting Python `float("nan")` or `float("inf")` as valid telemetry. | Add parser tests that set a `{PID}` float field to `nan` and a `{CFG}` float field to `inf`; both must return `valid=False`. |
 | Mixing `feedback` and `actuator`. | Use typed field names and UI labels from protocol docs. |

@@ -112,7 +112,7 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port C
 | 实时波形 | Canvas 显示 `target`、`feedback`、`error`、`p_out`、`i_out`、`d_out`、`out_limited`、`actuator` |
 | 安全状态 | 显示 `sensor_ok`、`fault`、`sat`、`anti_windup`、`mode`、`enable` |
 | 多环状态 | 显示 `{PIDX}` / `{CFGX}` 中每个 `loop_id` 的最新误差、参数、饱和和故障 |
-| 自动调参 | 支持 `observe`、`suggest`、`auto-tune`，按串级顺序生成小步 `SET_PIDX`，ACK 后观察，变差时回滚 |
+| 自动调参 | 支持 `observe`、`suggest`、`auto-tune`，按串级顺序生成小步 `SET_PIDX`，ACK 后观察，变差时回滚并等待 rollback ACK |
 | 参数设置 | 生成并发送 `SET_PID`、`SET_KF`、`SET_TARGET`、`SET_OUT_LIMIT`、`SET_I_LIMIT`、`SET_MODE`、`SET_MANUAL_OUT`、`ENABLE`、`SET_REVERSE`、`SET_SENSOR_OK`、`RESET_I`、`CLEAR_FAULT`、`GET_CFG` |
 | 命令历史 | 记录 pending 命令、`loop_id` 和调参原因，并只在收到 `{ACK}` 后标记为确认；收到 `{ERR}` 或本地串口错误时显示失败 |
 
@@ -122,9 +122,10 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port C
 |---|---|
 | 自动识别和打开页面是只读操作 | 启动上位机不会主动修改板端参数 |
 | 所有 `{CMD}` 必须由用户点击按钮或显式 API 请求触发 | 避免 AI 或脚本在无人确认时改变真实硬件状态 |
-| `auto-tune` 必须显式启用 | 启用后允许全自动发送 `SET_PIDX` 和回滚命令 |
+| `auto-tune` 必须显式启用 | 启用后允许全自动发送 `SET_PIDX` 和回滚命令，但 step/rollback 都必须进入 ACK 闭环 |
 | 每次只改一个 loop 的一组 PID 参数 | 降低串级系统耦合风险，便于判断效果 |
 | 没有 `{ACK}` 不认为命令生效 | 串口写入成功不等于板端应用成功 |
+| 同名分环命令不并发 pending | 兼容旧 `{ACK}SET_PIDX,OK` 格式时，避免左右轮等同名命令 ACK 错配 |
 | `ENABLE,1`、`SET_MODE,2`、`SET_OUT_LIMIT` 会二次确认 | 这些命令可能直接影响执行器输出 |
 
 ## 板端上传什么数据
@@ -232,10 +233,10 @@ seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out
 ```powershell
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode observe
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode suggest
-python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode auto-tune --max-step 0.10 --rollback-on-regression
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode auto-tune --max-step 0.10 --window-seconds 3.0 --ack-timeout-seconds 2.0 --rollback-on-regression
 ```
 
-自动调参状态机按 `DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP -> SEND_STEP -> OBSERVE_RESULT -> KEEP_OR_ROLLBACK -> NEXT_LOOP` 推进。写参前会检查 `sensor_ok`、`fault` 和 `{SENS}.line_lost`；发送后必须等 `{ACK}`，若 post-ACK 窗口评分变差则发送旧参数 `SET_PIDX` 回滚。
+自动调参状态机按 `DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP -> SEND_STEP -> OBSERVE_RESULT -> KEEP_OR_ROLLBACK -> NEXT_LOOP` 推进。写参前会检查 `sensor_ok`、`fault` 和 `{SENS}.line_lost`；发送后必须等 `{ACK}`，评分窗口按 `--window-seconds` 使用接收时间或板端 `ms` 裁剪。若 post-ACK 窗口评分变差则发送旧参数 `SET_PIDX` 回滚；回滚命令必须等匹配 `{ACK}` 后才算完成，收到 `{ERR}` 或超过 `--ack-timeout-seconds` 会中止自动调参。
 
 ## 当前阶段和下一步
 

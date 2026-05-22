@@ -309,8 +309,10 @@ class DashboardState:
                 return json_safe_copy(record)
 
             if parsed.get("kind") in ("ack", "err") and parsed.get("valid"):
-                self._update_autotune_locked(parsed, now)
+                # ACK/ERR 先更新命令历史，再推进 auto-tune；否则状态机可能在同一帧中生成
+                # rollback 命令，随后命令历史把当前 ACK 错配到刚记录的 rollback pending。
                 self._attach_command_response_locked(parsed, now)
+                self._update_autotune_locked(parsed, now)
                 return json_safe_copy(parsed)
 
             # 这里不填默认值，因为坏帧可能来自截断或波特率错误，伪造成 0 会误导调参。
@@ -341,6 +343,10 @@ class DashboardState:
         loop_id = metadata.get("loop_id")
 
         with self._lock:
+            if self._has_conflicting_pending_command_locked(command_name):
+                raise ValueError(
+                    f"{command_name} already has a pending loop command; wait for ACK/ERR before sending another."
+                )
             entry = {
                 "id": self._next_command_id,
                 "created_at": time.time(),
@@ -356,6 +362,31 @@ class DashboardState:
             self._next_command_id += 1
             self._command_history.append(entry)
             return json_safe_copy(entry)
+
+    def _has_conflicting_pending_command_locked(self, command_name: str) -> bool:
+        """
+        函数作用：
+            检查是否已有同名分环命令处于 pending 状态。
+
+        主要流程：
+            当前板端兼容 ACK/ERR 可能不携带 loop_id，因此 SET_PIDX,speed_l 和
+            SET_PIDX,speed_r 若同时 pending，会无法可靠判断 ACK 属于哪一条。
+            这里在命令入队前拒绝同名分环命令并发，直到上一条收到 ACK/ERR 或本地错误。
+
+        参数说明：
+            command_name 为 extract_command_metadata 得到的大写命令名。
+
+        返回值：
+            返回 True 表示存在冲突 pending；否则返回 False。
+        """
+        if command_name not in serial_tool.LOOP_COMMANDS:
+            return False
+        for entry in self._command_history:
+            if entry.get("status") != "pending":
+                continue
+            if str(entry.get("command_name", "")).upper() == command_name:
+                return True
+        return False
 
     def mark_command_local_error(self, command_id: int, detail: str) -> dict[str, Any] | None:
         """
@@ -489,6 +520,7 @@ class DashboardState:
         profile: str = "line-car-cascade",
         max_step: float = 0.10,
         window_seconds: float = 3.0,
+        ack_timeout_seconds: float = 2.0,
         rollback_on_regression: bool = True,
     ) -> dict[str, Any]:
         """
@@ -506,6 +538,7 @@ class DashboardState:
             profile 为串级 profile，目前支持 line-car-cascade。
             max_step 为单次参数最大变化比例。
             window_seconds 为评分窗口秒数。
+            ack_timeout_seconds 为等待板端 ACK 的最长秒数。
             rollback_on_regression 表示评分变差时是否生成回滚命令。
 
         返回值：
@@ -519,6 +552,8 @@ class DashboardState:
             raise ValueError("max_step must be within 0.0 and 0.5")
         if window_seconds <= 0.0:
             raise ValueError("window_seconds must be positive")
+        if ack_timeout_seconds <= 0.0:
+            raise ValueError("ack_timeout_seconds must be positive")
 
         config = serial_tool.AutoTuneConfig(
             auto=bool(enabled and mode == "auto-tune"),
@@ -526,6 +561,7 @@ class DashboardState:
             mode=mode,
             max_step=max_step,
             window_seconds=window_seconds,
+            ack_timeout_seconds=ack_timeout_seconds,
             rollback_on_regression=rollback_on_regression,
         )
         with self._lock:
@@ -541,6 +577,7 @@ class DashboardState:
                 "last_action": None,
                 "max_step": max_step,
                 "window_seconds": window_seconds,
+                "ack_timeout_seconds": ack_timeout_seconds,
                 "rollback_on_regression": bool(rollback_on_regression),
             }
         return self.snapshot()
@@ -567,11 +604,11 @@ class DashboardState:
             return
 
         if parsed.get("kind") in ("ack", "err"):
-            self._autotune_controller.handle_response(parsed)
+            self._autotune_controller.handle_response(parsed, now=now)
         else:
             self._autotune_controller.ingest_frame(parsed)
 
-        action = self._autotune_controller.plan_next_action()
+        action = self._autotune_controller.plan_next_action(now=now)
         self.scores = json_safe_copy(self._autotune_controller.scores)
         self.rollback_history = json_safe_copy(self._autotune_controller.rollback_history)
         self.autotune["state"] = self._autotune_controller.state
@@ -586,6 +623,8 @@ class DashboardState:
 
         entry = self.send_command(str(action["command"]), reason=str(action.get("reason") or "auto-tune"))
         self.autotune["last_sent_command_id"] = entry.get("id")
+        if entry.get("status") == "error":
+            self._abort_autotune_locked(str(entry.get("response", {}).get("detail") or "local send error"), now)
 
     def connect(
         self,
@@ -714,8 +753,37 @@ class DashboardState:
             self.connected = False
             self.connecting = False
             self.connected_at = None
+            if self.autotune.get("enabled"):
+                self._abort_autotune_locked("serial disconnected", time.time())
 
         return self.snapshot()
+
+    def _abort_autotune_locked(self, reason: str, now: float) -> None:
+        """
+        函数作用：
+            在已持锁状态下中止 dashboard 自动调参会话。
+
+        主要流程：
+            1. 调用 AutoTuneController.abort 让纯状态机清理 pending 命令并进入 ABORT。
+            2. 读取 abort 动作并同步到 dashboard 的 autotune/scores/rollback_history 快照。
+            3. 将 enabled 置为 False，避免串口断开或本地发送失败后继续自动写参。
+
+        参数说明：
+            reason 为外部中止原因，例如 serial disconnected。
+            now 为 dashboard 状态更新时间戳。
+
+        返回值：
+            无返回值，直接修改 self.autotune 等字段。
+        """
+        self._autotune_controller.abort(reason)
+        action = self._autotune_controller.plan_next_action(now=now)
+        self.scores = json_safe_copy(self._autotune_controller.scores)
+        self.rollback_history = json_safe_copy(self._autotune_controller.rollback_history)
+        self.autotune["enabled"] = False
+        self.autotune["state"] = self._autotune_controller.state
+        self.autotune["current_loop"] = action.get("loop_id")
+        self.autotune["last_action"] = json_safe_copy(action)
+        self.autotune["updated_at"] = now
 
     def _reader_loop(self) -> None:
         """
@@ -1248,6 +1316,9 @@ INDEX_HTML = r"""<!doctype html>
               <label>window_s
                 <input id="autotuneWindow" type="number" value="3.0" min="0.1" step="0.1" />
               </label>
+              <label>ack_timeout_s
+                <input id="autotuneAckTimeout" type="number" value="2.0" min="0.1" step="0.1" />
+              </label>
             </div>
             <div class="command-preview" id="autotunePreview">IDLE</div>
             <div class="actions">
@@ -1776,6 +1847,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function configureAutotune(enabled, mode) {
+      // 自动调参配置必须把 ACK 超时传给后端状态机，避免丢包时 UI 只停留在等待状态。
       await api("/api/autotune", {
         method: "POST",
         body: JSON.stringify({
@@ -1784,6 +1856,7 @@ INDEX_HTML = r"""<!doctype html>
           profile: "line-car-cascade",
           max_step: Number(value("autotuneMaxStep")) || 0.10,
           window_seconds: Number(value("autotuneWindow")) || 3.0,
+          ack_timeout_seconds: Number(value("autotuneAckTimeout")) || 2.0,
           rollback_on_regression: true
         })
       });
@@ -2029,8 +2102,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             配置 dashboard 内置自动调参状态机。
 
         主要流程：
-            读取 enabled、mode、profile、max_step、window_seconds 和 rollback_on_regression，
-            调用 DashboardState.configure_autotune 后返回最新状态快照。
+            读取 enabled、mode、profile、max_step、window_seconds、ack_timeout_seconds
+            和 rollback_on_regression，调用 DashboardState.configure_autotune 后返回最新状态快照。
 
         参数说明：
             payload 为 JSON body，字段均可选；未传时使用安全默认值并保持自动写参关闭。
@@ -2044,6 +2117,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             profile=str(payload.get("profile") or "line-car-cascade"),
             max_step=float(payload.get("max_step") or 0.10),
             window_seconds=float(payload.get("window_seconds") or 3.0),
+            ack_timeout_seconds=float(payload.get("ack_timeout_seconds") or 2.0),
             rollback_on_regression=bool(payload.get("rollback_on_regression", True)),
         )
         self.write_json(status)

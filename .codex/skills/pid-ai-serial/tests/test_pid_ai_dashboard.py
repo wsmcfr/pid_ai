@@ -7,7 +7,7 @@ import unittest
 SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from pid_ai_dashboard import DashboardState, extract_command_name
+from pid_ai_dashboard import DashboardRequestHandler, DashboardState, extract_command_name
 
 
 def make_pid_line(seq: int, feedback: float) -> str:
@@ -223,6 +223,53 @@ class DashboardStateTest(unittest.TestCase):
         self.assertEqual(history[-1]["reason"], "auto-tune step")
         self.assertEqual(history[-1]["status"], "ack")
 
+    def test_same_loop_command_name_pending_is_rejected(self) -> None:
+        """
+        函数作用：
+            验证 dashboard 会拒绝同名分环命令并发 pending，避免 ACK/ERR 不带 loop_id 时错配。
+
+        主要流程：
+            1. 先记录 speed_l 的 SET_PIDX pending 命令。
+            2. 在 ACK 前尝试记录 speed_r 的 SET_PIDX。
+            3. 校验第二条命令被拒绝；收到第一条 ACK 后可再次记录 SET_PIDX。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        state = DashboardState(max_samples=4)
+
+        state.record_command("{CMD}SET_PIDX,speed_l,1.200,0.030,0.080", reason="auto-tune step")
+        with self.assertRaises(ValueError):
+            state.record_command("{CMD}SET_PIDX,speed_r,1.200,0.030,0.080", reason="auto-tune step")
+
+        state.ingest_line("{ACK}SET_PIDX,OK")
+        entry = state.record_command("{CMD}SET_PIDX,speed_r,1.200,0.030,0.080", reason="auto-tune step")
+
+        self.assertEqual(entry["loop_id"], "speed_r")
+        self.assertEqual(entry["status"], "pending")
+
+    def test_disconnect_aborts_enabled_autotune(self) -> None:
+        """
+        函数作用：
+            验证串口断开时 dashboard 会同步中止已启用的自动调参状态。
+
+        主要流程：
+            1. 启用 auto-tune。
+            2. 调用 disconnect 模拟用户断开或读线程结束后的清理。
+            3. 校验状态机进入 ABORT，且 UI 状态关闭自动调参。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        state = DashboardState(max_samples=4)
+        state.configure_autotune(enabled=True, mode="auto-tune")
+
+        snapshot = state.disconnect()
+
+        self.assertFalse(snapshot["autotune"]["enabled"])
+        self.assertEqual(snapshot["autotune"]["state"], "ABORT")
+        self.assertIn("serial disconnected", snapshot["autotune"]["last_action"]["reason"])
+
     def test_bad_pidx_frame_does_not_poison_loop_state(self) -> None:
         """
         函数作用：
@@ -261,6 +308,63 @@ class DashboardStateTest(unittest.TestCase):
         self.assertFalse(snapshot["autotune"]["enabled"])
         self.assertEqual(snapshot["scores"], {})
         self.assertEqual(snapshot["rollback_history"], [])
+
+    def test_autotune_http_payload_preserves_ack_timeout(self) -> None:
+        """
+        函数作用：
+            验证 POST /api/autotune 的业务处理会把 ack_timeout_seconds 传入状态机配置。
+
+        主要流程：
+            1. 构造只包含 state 和 write_json 的轻量 handler 对象。
+            2. 调用 DashboardRequestHandler.handle_autotune 的未绑定方法。
+            3. 校验响应快照中的 ack_timeout_seconds 使用请求值，而不是默认值。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+
+        class FakeHandler:
+            """
+            类作用：
+                为 handler 单元测试提供最小替身，避免启动真实 HTTPServer。
+
+            字段说明：
+                state 保存 DashboardState 实例。
+                payload 保存 write_json 收到的响应对象。
+            """
+
+            def __init__(self) -> None:
+                """初始化 fake handler 的状态容器。"""
+                self.state = DashboardState(max_samples=4)
+                self.payload = None
+
+            def write_json(self, payload: dict, status=None) -> None:
+                """
+                函数作用：
+                    捕获 handler 准备写出的 JSON 响应。
+
+                参数说明：
+                    payload 为业务方法生成的响应快照。
+                    status 为可选 HTTP 状态码，本测试不使用。
+
+                返回值：
+                    无返回值，只把 payload 存到对象字段中。
+                """
+                self.payload = payload
+
+        handler = FakeHandler()
+
+        DashboardRequestHandler.handle_autotune(
+            handler,
+            {
+                "enabled": True,
+                "mode": "auto-tune",
+                "ack_timeout_seconds": 4.5,
+            },
+        )
+
+        self.assertIsNotNone(handler.payload)
+        self.assertEqual(handler.payload["autotune"]["ack_timeout_seconds"], 4.5)
 
 
 if __name__ == "__main__":

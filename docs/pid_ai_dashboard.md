@@ -170,6 +170,7 @@ DashboardState typed state
 | `profile` | string | 否 | 当前支持 `line-car-cascade` |
 | `max_step` | number | 否 | 单次 `kp/ki/kd` 最大变化比例，默认 `0.10` |
 | `window_seconds` | number | 否 | 评分窗口秒数，默认 `3.0` |
+| `ack_timeout_seconds` | number | 否 | 等待 step 或 rollback ACK 的最长秒数，默认 `2.0` |
 | `rollback_on_regression` | boolean | 否 | 评分变差时是否回滚，默认 `true` |
 
 响应为完整 `/api/status` 快照。
@@ -187,8 +188,13 @@ DashboardState typed state
 | 板端回复 `{ACK}` | 更新匹配的 pending 命令 | 命令历史为 `status=ack` |
 | 板端回复 `{ERR}` | 更新匹配的 pending 命令 | 命令历史为 `status=err` 并保留错误详情 |
 | 收到无法匹配的 `{ACK}` / `{ERR}` | 保留为 unsolicited 历史 | 命令历史 `unsolicited=true` |
+| 旧 ACK/ERR 不带 `loop_id` 且已有同名分环命令 pending | 拒绝记录第二条同名分环 pending 命令 | `POST /api/command` 返回错误，避免 ACK 错配 |
 | `auto-tune` 模式收到 ACK 后尚无新遥测 | 等待 post-ACK 窗口 | 不提前 keep/rollback |
+| step 或 rollback 超过 `ack_timeout_seconds` 未收到 ACK/ERR | 中止自动调参 | `autotune.state=ABORT`，`last_action.reason` 包含 ACK timeout |
+| 串口断开或蓝牙 SPP 断流 | 中止自动调参并关闭自动写参 | `autotune.enabled=false`，保留 ABORT 原因 |
 | post-ACK 评分变差 | 生成旧参数 `SET_PIDX` | `rollback_history` 增加，并记录回滚命令 |
+| rollback 命令收到 ACK | 才把当前 loop 标记完成 | `rollback_history[].status=ack` 后继续下一个 loop |
+| rollback 命令收到 ERR 或 ACK 超时 | 中止自动调参 | 不进入下一个 loop |
 
 ## 5. Good / Base / Bad 用例
 
@@ -197,11 +203,13 @@ DashboardState typed state
 | Good | 板端持续发送合法 `{PID}`，页面打开后自动连接 | 曲线持续刷新，`latest_sample_id` 递增 |
 | Good | 板端发送 `{PIDX}` 和 `{CFGX}` | `loops[loop_id]` 显示对应最新遥测和配置 |
 | Good | 启用 `suggest` 自动调参 | 只更新 `autotune.last_action.command`，不发送命令 |
-| Good | 启用 `auto-tune` 且评分变差 | ACK 后等待新遥测，再发送旧参数回滚命令 |
+| Good | 启用 `auto-tune` 且评分变差 | ACK 后等待新遥测，再发送旧参数回滚命令，并等待 rollback ACK |
+| Base | POST `/api/autotune` 传 `ack_timeout_seconds=4.5` | `/api/status.autotune.ack_timeout_seconds` 为 `4.5` |
 | Base | 没有插入板端，启动 `--auto --open` | 页面正常打开，显示连接失败原因，不崩溃 |
 | Bad | 发送 `{PID}1,2,3` 截断帧 | 样本缓冲不增加，`parse_errors` 增加 |
 | Bad | 发送 `{PIDX}speed_l,left_speed,1,2,3` 截断帧 | `loops.speed_l.latest_pid` 保持上一条有效值 |
 | Bad | 未连接时 POST `{CMD}GET_CFG` | 命令历史为 `error/local_error`，不显示为 ACK |
+| Bad | 在 `{ACK}SET_PIDX,OK` 前连续发送 `SET_PIDX,speed_l` 和 `SET_PIDX,speed_r` | 第二条被拒绝，避免旧 ACK 格式错配 |
 
 ## 6. 验证命令
 

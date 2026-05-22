@@ -204,6 +204,15 @@ LOOP_COMMANDS = {
     "ENABLEX",
     "GET_CFGX",
 }
+COMMAND_STATUS_TEXTS = {
+    "OK",
+    "BAD_PREFIX",
+    "UNKNOWN",
+    "ARG_MISSING",
+    "ARG_INVALID",
+    "PARAM_RANGE",
+    "INTERNAL_ERROR",
+}
 
 
 @dataclass
@@ -534,23 +543,41 @@ def parse_frame(line: str) -> dict:
     if line.startswith("{SENS}"):
         return parse_named_numeric_frame("sens", "{SENS}", SENS_FIELDS, line)
     if line.startswith("{ACK}"):
-        parts = line[len("{ACK}") :].split(",")
+        parts = [part.strip() for part in line[len("{ACK}") :].split(",")]
+        command = parts[0] if len(parts) > 0 else ""
+        loop_id = None
+        detail = parts[1] if len(parts) > 1 else ""
+        # 兼容旧 `{ACK}SET_PIDX,OK`，同时支持未来 `{ACK}SET_PIDX,speed_l,OK`。
+        if command.strip().upper() in LOOP_COMMANDS and len(parts) >= 3 and parts[2].strip().upper() in COMMAND_STATUS_TEXTS:
+            loop_id = parts[1]
+            detail = parts[2]
         return {
             "kind": "ack",
-            "valid": len(parts) >= 2,
+            "valid": bool(command) and bool(detail),
             "raw": line,
-            "command": parts[0] if len(parts) > 0 else "",
-            "detail": parts[1] if len(parts) > 1 else "",
+            "command": command,
+            "loop_id": loop_id,
+            "detail": detail,
         }
     if line.startswith("{ERR}"):
-        parts = line[len("{ERR}") :].split(",")
+        parts = [part.strip() for part in line[len("{ERR}") :].split(",")]
+        command = parts[0] if len(parts) > 0 else ""
+        loop_id = None
+        status = parts[1] if len(parts) > 1 else ""
+        detail = parts[2] if len(parts) > 2 else ""
+        # 兼容旧 `{ERR}SET_PIDX,ARG_INVALID,LOOP_NOT_FOUND`，并预留带 loop_id 的新格式。
+        if command.strip().upper() in LOOP_COMMANDS and len(parts) >= 4 and parts[2].strip().upper() in COMMAND_STATUS_TEXTS:
+            loop_id = parts[1]
+            status = parts[2]
+            detail = parts[3]
         return {
             "kind": "err",
-            "valid": len(parts) >= 3,
+            "valid": bool(command) and bool(status) and bool(detail),
             "raw": line,
-            "command": parts[0] if len(parts) > 0 else "",
-            "status": parts[1] if len(parts) > 1 else "",
-            "detail": parts[2] if len(parts) > 2 else "",
+            "command": command,
+            "loop_id": loop_id,
+            "status": status,
+            "detail": detail,
         }
     for prefix in ("{STAT}", "{EVT}"):
         if line.startswith(prefix):
@@ -1067,7 +1094,8 @@ def response_matches_pending_command(metadata: dict[str, Any], response: dict[st
     主要流程：
         1. 只接受 valid 的 `{ACK}` 或 `{ERR}`。
         2. 比较响应 command 与 pending command_name。
-        3. 当前板端 ACK/ERR 不携带 loop_id，因此分环命令按命令名匹配，由 dashboard 保留 loop_id。
+        3. 如果响应携带 loop_id，则必须和 pending loop_id 精确一致；旧 ACK/ERR 不带
+           loop_id 时退回到 command 名匹配，并由上层禁止同名分环命令并发 pending。
 
     参数说明：
         metadata 为 extract_command_metadata 或 dashboard 命令历史中的命令元数据。
@@ -1079,7 +1107,13 @@ def response_matches_pending_command(metadata: dict[str, Any], response: dict[st
     if response.get("kind") not in ("ack", "err") or not response.get("valid"):
         return False
     response_command = str(response.get("command", "")).strip().upper()
-    return response_command == str(metadata.get("command_name", "")).strip().upper()
+    if response_command != str(metadata.get("command_name", "")).strip().upper():
+        return False
+
+    response_loop_id = response.get("loop_id")
+    if response_loop_id:
+        return str(response_loop_id).strip() == str(metadata.get("loop_id", "")).strip()
+    return True
 
 
 @dataclass
@@ -1091,6 +1125,7 @@ class AutoTuneConfig:
     mode: str = "observe"
     max_step: float = 0.10
     window_seconds: float = 3.0
+    ack_timeout_seconds: float = 2.0
     rollback_on_regression: bool = True
 
 
@@ -1161,7 +1196,11 @@ class AutoTuneController:
 
         if kind == "pidx":
             loop_id = str(data["loop_id"])
-            self.samples_by_loop.setdefault(loop_id, []).append(dict(data))
+            sample = dict(data)
+            # dashboard 会在帧字典上附加 received_at；纯 parser 测试没有该字段时使用板端 ms 裁剪窗口。
+            if "received_at" in frame:
+                sample["received_at"] = frame["received_at"]
+            self.samples_by_loop.setdefault(loop_id, []).append(sample)
             self.samples_by_loop[loop_id] = self.samples_by_loop[loop_id][-200:]
             if int(data.get("fault", 0)) != 0:
                 self._abort(f"fault on {loop_id}")
@@ -1174,16 +1213,18 @@ class AutoTuneController:
             if int(data.get("line_lost", 0)) != 0:
                 self._abort("line lost")
 
-    def handle_response(self, response: dict[str, Any]) -> None:
+    def handle_response(self, response: dict[str, Any], now: float | None = None) -> None:
         """
         函数作用：
             处理自动调参 pending 命令对应的 ACK/ERR。
 
         主要流程：
-            ACK 让状态机从 SEND_STEP 进入 OBSERVE_RESULT；ERR 说明板端拒绝参数，立即 ABORT。
+            step 命令 ACK 后进入结果观察；rollback 命令 ACK 后才标记 loop 完成；
+            任意 ERR 都说明板端拒绝当前事务，必须立即 ABORT。
 
         参数说明：
             response 为 parse_frame 返回的 ACK/ERR 字典。
+            now 为本机单调时间戳，允许测试注入；None 时使用 time.monotonic()。
 
         返回值：
             无返回值。
@@ -1193,37 +1234,77 @@ class AutoTuneController:
         if not response_matches_pending_command(self.pending_step, response):
             return
         if response.get("kind") == "ack":
+            current_time = time.monotonic() if now is None else float(now)
+            phase = str(self.pending_step.get("phase", "step"))
+            loop_id = str(self.pending_step.get("loop_id", ""))
+            if phase == "rollback":
+                self._mark_rollback_status("ack")
+                self.completed_loops.add(loop_id)
+                self.pending_step = None
+                self.state = "NEXT_LOOP"
+                return
+
             self.pending_step["ack_received"] = True
-            self.pending_step["ack_sample_count"] = len(
-                self.samples_by_loop.get(str(self.pending_step.get("loop_id", "")), [])
-            )
+            self.pending_step["ack_at"] = current_time
+            self.pending_step["ack_sample_count"] = len(self.samples_by_loop.get(loop_id, []))
             self.state = "OBSERVE_RESULT"
             return
         if response.get("kind") == "err":
-            self._abort(f"board rejected {self.pending_step.get('command_name')}")
+            if str(self.pending_step.get("phase", "step")) == "rollback":
+                self._mark_rollback_status("err")
+            self._abort(
+                f"board rejected {self.pending_step.get('command_name')} "
+                f"{self.pending_step.get('phase', 'step')}"
+            )
 
-    def plan_next_action(self) -> dict[str, Any]:
+    def plan_next_action(self, now: float | None = None) -> dict[str, Any]:
         """
         函数作用：
             根据当前状态生成下一步自动调参动作。
 
         主要流程：
             1. ABORT 状态只返回 abort。
-            2. 存在已 ACK 的 pending_step 时，对比当前窗口评分，决定保留或回滚。
+            2. 存在 pending_step 时先检查 ACK 超时，再按 step/rollback 阶段推进。
             3. 没有 pending_step 时按 speed_l、speed_r、yaw_rate、line_outer 顺序选第一个可调 loop。
             4. observe 模式只返回诊断，suggest 模式只返回建议，auto-tune 模式且 auto=True 才返回 send。
 
         参数说明：
-            无参数。
+            now 为本机单调时间戳，允许测试注入；None 时使用 time.monotonic()。
 
         返回值：
             返回动作字典，type 可为 wait、observe、suggest、send、rollback、abort。
         """
+        current_time = time.monotonic() if now is None else float(now)
+
         if self.state == "ABORT":
             return {"type": "abort", "reason": self.abort_reason}
 
-        if self.pending_step is not None and self.pending_step.get("ack_received"):
+        if self.pending_step is not None:
             loop_id = str(self.pending_step.get("loop_id", ""))
+            phase = str(self.pending_step.get("phase", "step"))
+            if not self.pending_step.get("ack_received"):
+                if self._pending_timed_out(current_time):
+                    if phase == "rollback":
+                        self._mark_rollback_status("timeout")
+                    self._abort(f"ACK timeout for {phase} {self.pending_step.get('command_name')} {loop_id}")
+                    return {"type": "abort", "reason": self.abort_reason}
+                return {
+                    "type": "wait",
+                    "state": self.state,
+                    "loop_id": loop_id,
+                    "reason": "waiting for rollback ACK" if phase == "rollback" else "waiting for ACK",
+                    "command": self.pending_step["command"],
+                }
+
+            if phase == "rollback":
+                return {
+                    "type": "wait",
+                    "state": self.state,
+                    "loop_id": loop_id,
+                    "reason": "waiting for rollback ACK",
+                    "command": self.pending_step["command"],
+                }
+
             ack_sample_count = int(self.pending_step.get("ack_sample_count", 0))
             if len(self.samples_by_loop.get(loop_id, [])) <= ack_sample_count:
                 return {
@@ -1233,15 +1314,7 @@ class AutoTuneController:
                     "reason": "waiting for post-ACK telemetry",
                     "command": self.pending_step["command"],
                 }
-            return self._evaluate_pending_step()
-
-        if self.pending_step is not None:
-            return {
-                "type": "wait",
-                "state": self.state,
-                "reason": "waiting for ACK",
-                "command": self.pending_step["command"],
-            }
+            return self._evaluate_pending_step(current_time)
 
         loop_id = self._select_next_loop()
         if loop_id is None:
@@ -1260,6 +1333,7 @@ class AutoTuneController:
             return {"type": "suggest", "loop_id": loop_id, "score": score, "command": proposal["command"]}
 
         self.pending_step = proposal
+        self.pending_step["sent_at"] = current_time
         self.state = "SEND_STEP"
         return {
             "type": "send",
@@ -1283,7 +1357,7 @@ class AutoTuneController:
         返回值：
             返回指标字典；score 越低表示效果越好。
         """
-        samples = self.samples_by_loop.get(loop_id, [])[-50:]
+        samples = self._window_samples(loop_id)
         if not samples:
             return {
                 "mean_abs_error": float("inf"),
@@ -1382,14 +1456,16 @@ class AutoTuneController:
         return {
             **metadata,
             "loop_id": loop_id,
+            "phase": "step",
             "old": {"kp": old_kp, "ki": old_ki, "kd": old_kd},
             "new": {"kp": new_kp, "ki": old_ki, "kd": old_kd},
             "baseline_score": score,
             "reason": reason,
             "ack_received": False,
+            "sent_at": None,
         }
 
-    def _evaluate_pending_step(self) -> dict[str, Any]:
+    def _evaluate_pending_step(self, now: float) -> dict[str, Any]:
         """
         函数作用：
             对已 ACK 的参数修改观察结果并决定保留或回滚。
@@ -1417,11 +1493,24 @@ class AutoTuneController:
                 "baseline_score": self.pending_step["baseline_score"],
                 "current_score": current_score,
                 "reason": "score regression",
+                "status": "pending",
             }
             self.rollback_history.append(record)
-            self.completed_loops.add(loop_id)
-            self.pending_step = None
-            self.state = "KEEP_OR_ROLLBACK"
+            rollback = {
+                **extract_command_metadata(command),
+                "loop_id": loop_id,
+                "phase": "rollback",
+                "old": old,
+                "new": old,
+                "baseline_score": self.pending_step["baseline_score"],
+                "current_score": current_score,
+                "reason": "score regression",
+                "ack_received": False,
+                "sent_at": now,
+                "rollback_index": len(self.rollback_history) - 1,
+            }
+            self.pending_step = rollback
+            self.state = "WAIT_ROLLBACK_ACK"
             return {"type": "rollback", **record}
 
         self.completed_loops.add(loop_id)
@@ -1433,6 +1522,98 @@ class AutoTuneController:
             "baseline_score": baseline,
             "current_score": current,
         }
+
+    def _window_samples(self, loop_id: str) -> list[dict[str, Any]]:
+        """
+        函数作用：
+            按 window_seconds 截取指定 loop 的评分样本窗口。
+
+        主要流程：
+            优先使用 dashboard 注入的 received_at；没有本机接收时间时退回板端 ms；
+            若样本缺少任何时间字段，则保留旧行为使用最近 50 条，避免无时间模拟数据无法评分。
+
+        参数说明：
+            loop_id 为目标 PID 环路 ID。
+
+        返回值：
+            返回参与评分的样本列表，至少保留最新一条样本。
+        """
+        samples = self.samples_by_loop.get(loop_id, [])
+        if not samples:
+            return []
+
+        window_seconds = max(float(self.config.window_seconds), 0.001)
+        latest = samples[-1]
+        if isinstance(latest.get("received_at"), (int, float)):
+            cutoff = float(latest["received_at"]) - window_seconds
+            window = [sample for sample in samples if float(sample.get("received_at", cutoff - 1.0)) >= cutoff]
+            return window or [latest]
+
+        if isinstance(latest.get("ms"), (int, float)):
+            cutoff_ms = float(latest["ms"]) - window_seconds * 1000.0
+            window = [sample for sample in samples if float(sample.get("ms", cutoff_ms - 1.0)) >= cutoff_ms]
+            return window or [latest]
+
+        return samples[-50:]
+
+    def _pending_timed_out(self, now: float) -> bool:
+        """
+        函数作用：
+            判断当前 pending 命令是否超过 ACK 等待时间。
+
+        主要流程：
+            读取 pending_step.sent_at；如果尚未记录发送时间，则不触发超时；
+            否则用 now - sent_at 和 ack_timeout_seconds 比较。
+
+        参数说明：
+            now 为当前单调时间戳或同一时间基准的测试时间。
+
+        返回值：
+            返回 True 表示必须 ABORT；否则返回 False。
+        """
+        if self.pending_step is None:
+            return False
+        sent_at = self.pending_step.get("sent_at")
+        if sent_at is None:
+            return False
+        return now - float(sent_at) > max(float(self.config.ack_timeout_seconds), 0.001)
+
+    def _mark_rollback_status(self, status: str) -> None:
+        """
+        函数作用：
+            更新 rollback_history 中当前回滚事务的状态。
+
+        主要流程：
+            从 pending_step.rollback_index 找到历史记录，写入 ack/err/timeout 等状态，
+            便于 dashboard 展示回滚是否真正被板端确认。
+
+        参数说明：
+            status 为回滚状态文本。
+
+        返回值：
+            无返回值。
+        """
+        if self.pending_step is None:
+            return
+        index = self.pending_step.get("rollback_index")
+        if isinstance(index, int) and 0 <= index < len(self.rollback_history):
+            self.rollback_history[index]["status"] = status
+
+    def abort(self, reason: str) -> None:
+        """
+        函数作用：
+            供 CLI/dashboard 在串口断开、本地发送失败等外部故障时主动中止自动调参。
+
+        主要流程：
+            转发到内部 _abort，保留首个中止原因并清理 pending 命令。
+
+        参数说明：
+            reason 为外部故障原因。
+
+        返回值：
+            无返回值。
+        """
+        self._abort(reason)
 
     def _abort(self, reason: str) -> None:
         """
@@ -1560,6 +1741,7 @@ def cmd_autotune(args: argparse.Namespace) -> int:
         mode=args.mode,
         max_step=args.max_step,
         window_seconds=args.window_seconds,
+        ack_timeout_seconds=args.ack_timeout_seconds,
         rollback_on_regression=args.rollback_on_regression,
     )
     controller = AutoTuneController(config)
@@ -1582,6 +1764,11 @@ def cmd_autotune(args: argparse.Namespace) -> int:
 
                 raw = ser.readline()
                 if not raw:
+                    # 串口暂时无新帧时仍推进状态机，确保丢 ACK 会按超时进入 ABORT。
+                    action = controller.plan_next_action(now=time.monotonic())
+                    if action.get("type") == "abort":
+                        print_autotune_action(action, args.jsonl)
+                        return 1
                     continue
                 line = decode_line(raw)
                 if not line:
@@ -1590,11 +1777,11 @@ def cmd_autotune(args: argparse.Namespace) -> int:
                 frame_count += 1
 
                 if parsed.get("kind") in ("ack", "err"):
-                    controller.handle_response(parsed)
+                    controller.handle_response(parsed, now=time.monotonic())
                 else:
                     controller.ingest_frame(parsed)
 
-                action = controller.plan_next_action()
+                action = controller.plan_next_action(now=time.monotonic())
                 signature = json.dumps(action, sort_keys=True, default=str)
                 if action.get("type") != "wait" and signature != last_printed_action:
                     print_autotune_action(action, args.jsonl)
@@ -1698,6 +1885,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     autotune_parser.add_argument("--max-step", type=float, default=0.10, help="Maximum one-step kp/ki/kd ratio change.")
     autotune_parser.add_argument("--window-seconds", type=float, default=3.0, help="Scoring window length in seconds.")
+    autotune_parser.add_argument("--ack-timeout-seconds", type=float, default=2.0, help="Seconds to wait for ACK before aborting auto-tune.")
     autotune_parser.add_argument(
         "--rollback-on-regression",
         dest="rollback_on_regression",

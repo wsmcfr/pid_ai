@@ -228,9 +228,9 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommandX(const PIDAI_LoopTable *table, c
 
 | Input shape | Contract |
 |---|---|
-| `table == NULL`, `routes == NULL`, or `count == 0` | Return `PIDAI_CMD_INTERNAL_ERROR`; do not touch PID handles. |
+| `table == NULL`, `loops == NULL`, or `count == 0` | Return `PIDAI_CMD_INTERNAL_ERROR` with `detail="NO_VALID_LOOP_TABLE"`; do not touch PID handles. |
 | Missing `loop_id` | Return `PIDAI_CMD_ARG_MISSING`; do not call any core setter. |
-| Unknown `loop_id` | Return `PIDAI_CMD_ARG_INVALID` with `detail="LOOP_NOT_FOUND"`. |
+| Unknown `loop_id` | Return `PIDAI_CMD_ARG_INVALID` with `detail="LOOP_NOT_FOUND"` before parsing later numeric fields. |
 | Bad numeric argument after valid `loop_id` | Return `PIDAI_CMD_ARG_INVALID`; do not update the matched loop. |
 | Extra field, including trailing comma | Return `PIDAI_CMD_ARG_INVALID` with `detail="UNEXPECTED_ARG"`. |
 | Exact valid `*X` command | Apply only the matched loop handle and return `PIDAI_CMD_OK`. |
@@ -240,7 +240,7 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommandX(const PIDAI_LoopTable *table, c
 
 | Command | Minimum failure coverage |
 |---|---|
-| `SET_PIDX` | Success, unknown loop, missing PID field, bad float, extra argument, trailing comma. |
+| `SET_PIDX` | Success, invalid loop table, unknown loop, unknown loop plus bad float, missing PID field, bad float, extra argument, trailing comma. |
 | `SET_KFX` / `SET_TARGETX` | Bad float and unknown loop. |
 | `SET_OUT_LIMITX` / `SET_I_LIMITX` | Bad limit order maps through core setter as `PARAM_RANGE`. |
 | `RESET_IX` / `ENABLEX` | Unknown loop and extra argument. |
@@ -252,6 +252,7 @@ PIDAI_CommandResult PIDAI_ProtocolHandleCommandX(const PIDAI_LoopTable *table, c
 |---|---|---|
 | Good | `{CMD}SET_PIDX,speed_l,1.0,0.1,0.01` | Only `speed_l` changes and ACK names `SET_PIDX`. |
 | Base | `{CMD}SET_PIDX,missing,1.0,0.1,0.01` | ERR `ARG_INVALID/LOOP_NOT_FOUND`; no loop changes. |
+| Base | `{CMD}SET_PIDX,missing,nope,0.1,0.01` | ERR `ARG_INVALID/LOOP_NOT_FOUND`; bad numeric fields must not hide the routing error. |
 | Bad | `{CMD}SET_PIDX,speed_l,1.0,0.1,0.01,9` | ERR `ARG_INVALID/UNEXPECTED_ARG`; matched loop remains unchanged. |
 
 ---
@@ -285,3 +286,4 @@ capacity failures, as implemented by `PIDAI_CheckFormatResult()`.
 | Ignoring frame builder return values in board code. | UART may transmit stale or truncated data. | Send only when `written > 0`, as in `examples/pid_ai_board_example.c`. |
 | Ignoring extra command fields. | Host command builders can be wrong while the board still applies a partial command. | Reject the command with `ARG_INVALID/UNEXPECTED_ARG` before calling the core setter. |
 | Falling back to the first loop when `loop_id` is unknown. | A typo from the host could retune the wrong controller. | Return `ARG_INVALID/LOOP_NOT_FOUND` and keep every loop unchanged. |
+| Parsing `kp/ki/kd` before verifying `loop_id` in `*X` commands. | Unknown loops with malformed values look like host formatting bugs instead of routing mistakes. | Extract `arg_loop`, call `PIDAI_ProtocolFindLoop()`, then parse numeric fields only for a valid route. |
