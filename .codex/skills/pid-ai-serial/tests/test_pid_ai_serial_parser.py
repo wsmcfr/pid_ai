@@ -220,6 +220,30 @@ class PidAiSerialParserTest(unittest.TestCase):
         self.assertAlmostEqual(parsed["data"]["v_avg"], 0.805)
         self.assertAlmostEqual(parsed["data"]["battery"], 7.4)
 
+    def test_sens_sample_without_battery_is_valid(self) -> None:
+        """
+        函数作用：
+            验证没有电池电压字段的 {SENS} 帧仍可作为有效传感器安全帧使用。
+
+        主要流程：
+            1. 构造只包含 ms 到 v_avg 的 {SENS} 帧，模拟多数不采集电池电压的单片机工程。
+            2. 调用 parse_frame。
+            3. 校验 line_lost、yaw_rate 和速度字段仍被解析，battery 以 None 表示未提供。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        line_without_battery = VALID_SENS_LINE.rsplit(",", 1)[0]
+
+        parsed = pid_ai_serial.parse_frame(line_without_battery)
+
+        self.assertTrue(parsed["valid"])
+        self.assertEqual(parsed["kind"], "sens")
+        self.assertEqual(parsed["data"]["line_lost"], 0)
+        self.assertAlmostEqual(parsed["data"]["yaw_rate"], 0.25)
+        self.assertAlmostEqual(parsed["data"]["v_avg"], 0.805)
+        self.assertIsNone(parsed["data"]["battery"])
+
     def test_pidx_rejects_nan_numeric_fields(self) -> None:
         """
         函数作用：
@@ -256,6 +280,22 @@ class PidAiSerialParserTest(unittest.TestCase):
         self.assertEqual(
             pid_ai_serial.build_set_targetx_command("yaw_rate", 2.5),
             "{CMD}SET_TARGETX,yaw_rate,2.500",
+        )
+
+    def test_build_single_loop_pid_command_uses_three_decimal_parameters(self) -> None:
+        """
+        函数作用：
+            验证单环 PID 命令构建器会生成旧协议 SET_PID，并按三位小数稳定格式化。
+
+        主要流程：
+            调用 build_set_pid_command，校验完整 `{CMD}SET_PID,kp,ki,kd` 文本。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        self.assertEqual(
+            pid_ai_serial.build_set_pid_command(1.23456, 0.03, 0.08),
+            "{CMD}SET_PID,1.235,0.030,0.080",
         )
 
     def test_loop_aware_command_metadata_and_ack_matching(self) -> None:
@@ -669,6 +709,29 @@ class PidAiAutoTuneTest(unittest.TestCase):
         )
         return pid_ai_serial.AutoTuneController(config)
 
+    def make_single_loop_controller(self) -> "pid_ai_serial.AutoTuneController":
+        """
+        函数作用：
+            构造单环 PID 自动调参控制器。
+
+        主要流程：
+            使用 single-loop profile、auto-tune 模式和默认安全参数，让测试覆盖旧 `{PID}/{CFG}`
+            协议路径是否能生成 `{CMD}SET_PID`。
+
+        返回值：
+            返回 AutoTuneController 实例。
+        """
+        config = pid_ai_serial.AutoTuneConfig(
+            auto=True,
+            profile="single-loop",
+            mode="auto-tune",
+            max_step=0.10,
+            window_seconds=0.02,
+            ack_timeout_seconds=0.50,
+            rollback_on_regression=True,
+        )
+        return pid_ai_serial.AutoTuneController(config)
+
     def ingest_cfgs(self, controller: "pid_ai_serial.AutoTuneController") -> None:
         """
         函数作用：
@@ -732,6 +795,89 @@ class PidAiAutoTuneTest(unittest.TestCase):
         if line_lost:
             sens_line = VALID_SENS_LINE.replace(",0,1.500", ",1,1.500")
             controller.ingest_frame(pid_ai_serial.parse_frame(sens_line))
+
+    def ingest_single_window(
+        self,
+        controller: "pid_ai_serial.AutoTuneController",
+        errors: list[float],
+        *,
+        start_ms: int = 10,
+        step_ms: int = 10,
+    ) -> None:
+        """
+        函数作用：
+            向单环自动调参控制器注入旧 `{PID}` 遥测窗口。
+
+        主要流程：
+            逐条生成 PID 帧，按 errors 覆盖 error 字段；用于证明 single-loop profile 不依赖 `{PIDX}`。
+
+        参数说明：
+            controller 为被测自动调参控制器。
+            errors 为窗口内误差序列。
+            start_ms 为第一条样本的板端毫秒时间。
+            step_ms 为相邻样本的板端毫秒间隔。
+
+        返回值：
+            无返回值。
+        """
+        for index, error in enumerate(errors, start=1):
+            ms = start_ms + (index - 1) * step_ms
+            line = (
+                f"{{PID}}{index},{ms},10.000,100.000,{100.0 - error:.3f},"
+                f"{error:.3f},0.000,0.000,0.000,0.000,0.000,0.000,"
+                "0.000,0.000,0.000,0.000,1000.000,0,0,1,1,1,0"
+            )
+            controller.ingest_frame(pid_ai_serial.parse_frame(line))
+
+    def test_single_loop_profile_generates_set_pid_from_pid_and_cfg_frames(self) -> None:
+        """
+        函数作用：
+            验证单环自动调参能基于旧 `{CFG}` 和 `{PID}` 帧生成 `{CMD}SET_PID`。
+
+        主要流程：
+            1. 创建 single-loop profile 控制器。
+            2. 注入单环 CFG 配置和 PID 遥测窗口。
+            3. 调用 plan_next_action，校验生成旧协议 SET_PID，而不是等待 PIDX/CFGX。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_single_loop_controller()
+        controller.ingest_frame(pid_ai_serial.parse_frame(VALID_CFG_LINE))
+        self.ingest_single_window(controller, [6.0, 5.8, 5.6, 5.5], start_ms=1000, step_ms=10)
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["type"], "send")
+        self.assertEqual(action["loop_id"], "single")
+        self.assertEqual(action["command"], "{CMD}SET_PID,1.200,0.033,0.080")
+        self.assertEqual(controller.pending_step["command_name"], "SET_PID")
+
+    def test_single_loop_profile_rolls_back_with_set_pid_after_ack_regression(self) -> None:
+        """
+        函数作用：
+            验证单环自动调参在 ACK 后评分变差时使用 SET_PID 回滚旧参数。
+
+        主要流程：
+            1. 生成单环 SET_PID step 并注入 ACK。
+            2. 注入更差的 `{PID}` 遥测窗口。
+            3. 校验 rollback 动作仍是 `{CMD}SET_PID`，不依赖分环命令。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_single_loop_controller()
+        controller.ingest_frame(pid_ai_serial.parse_frame(VALID_CFG_LINE))
+        self.ingest_single_window(controller, [5.0, 4.0, 3.0], start_ms=1000)
+        self.assertEqual(controller.plan_next_action(now=100.0)["type"], "send")
+
+        controller.handle_response(pid_ai_serial.parse_frame("{ACK}SET_PID,OK"), now=100.1)
+        self.ingest_single_window(controller, [20.0, 21.0, 22.0], start_ms=1100)
+        rollback = controller.plan_next_action(now=100.2)
+
+        self.assertEqual(rollback["type"], "rollback")
+        self.assertEqual(rollback["loop_id"], "single")
+        self.assertEqual(rollback["command"], "{CMD}SET_PID,1.200,0.030,0.080")
 
     def test_state_machine_tunes_speed_loop_before_outer_loop(self) -> None:
         """

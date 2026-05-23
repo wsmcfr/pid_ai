@@ -1183,11 +1183,11 @@ class DashboardState:
         参数说明：
             enabled 表示是否启用自动调参状态机。
             mode 为 observe、suggest 或 auto-tune；只有 auto-tune 会自动写命令。
-            profile 为串级 profile，目前支持 line-car-cascade。
+            profile 为自动调参 profile，single-loop 使用 `{PID}/{CFG}`，line-car-cascade 使用 `{PIDX}/{CFGX}`。
             max_step 为单次参数最大变化比例。
             window_seconds 为评分窗口秒数。
             ack_timeout_seconds 为等待板端 ACK 的最长秒数。
-            min_post_ack_samples 为 ACK 后至少等待的新 PIDX 样本数，避免单点噪声决定保留或回滚。
+            min_post_ack_samples 为 ACK 后至少等待的新 PID/PIDX 样本数，避免单点噪声决定保留或回滚。
             rollback_on_regression 表示评分变差时是否生成回滚命令。
 
         返回值：
@@ -1195,8 +1195,8 @@ class DashboardState:
         """
         if mode not in ("observe", "suggest", "auto-tune"):
             raise ValueError("mode must be observe, suggest, or auto-tune")
-        if profile != "line-car-cascade":
-            raise ValueError("profile must be line-car-cascade")
+        if profile not in serial_tool.SUPPORTED_AUTOTUNE_PROFILES:
+            raise ValueError("profile must be single-loop or line-car-cascade")
         if max_step <= 0.0 or max_step > 0.5:
             raise ValueError("max_step must be within 0.0 and 0.5")
         if window_seconds <= 0.0:
@@ -1962,6 +1962,12 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
           </div>
           <div class="autotune-box">
             <div class="autotune-controls">
+              <label>profile
+                <select id="autotuneProfile">
+                  <option value="single-loop">single-loop</option>
+                  <option value="line-car-cascade" selected>line-car-cascade</option>
+                </select>
+              </label>
               <label>mode
                 <select id="autotuneMode">
                   <option value="observe">observe</option>
@@ -2500,7 +2506,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       el("autotuneObserveBtn").addEventListener("click", () => configureAutotune(true, "observe").catch(alert));
       el("autotuneSuggestBtn").addEventListener("click", () => configureAutotune(true, "suggest").catch(alert));
       el("autotuneAutoBtn").addEventListener("click", async () => {
-        const ok = confirm("确认启用 auto-tune？启用后会在收到 ACK 后自动小步下发和回滚 SET_PIDX。");
+        const ok = confirm("确认启用 auto-tune？启用后会在收到 ACK 后自动小步下发和回滚 SET_PID/SET_PIDX。");
         if (!ok) return;
         await configureAutotune(true, "auto-tune");
       });
@@ -2533,7 +2539,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         body: JSON.stringify({
           enabled,
           mode,
-          profile: "line-car-cascade",
+          profile: value("autotuneProfile") || "line-car-cascade",
           max_step: Number(value("autotuneMaxStep")) || 0.10,
           window_seconds: Number(value("autotuneWindow")) || 3.0,
           ack_timeout_seconds: Number(value("autotuneAckTimeout")) || 2.0,

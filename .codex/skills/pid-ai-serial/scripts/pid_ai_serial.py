@@ -120,6 +120,7 @@ SENS_FIELDS = [
     "v_avg",
     "battery",
 ]
+SENS_FIELDS_WITHOUT_BATTERY = SENS_FIELDS[:-1]
 TEXT_FIELDS = {"loop_id", "loop_name"}
 INTEGER_FIELDS = {
     "seq",
@@ -196,6 +197,9 @@ NON_NEGATIVE_INTEGER_FIELDS = {
     "line7",
 }
 CASCADE_PROFILE_ORDER = ("speed_l", "speed_r", "yaw_rate", "line_outer")
+SINGLE_LOOP_PROFILE = "single-loop"
+SINGLE_LOOP_ID = "single"
+SUPPORTED_AUTOTUNE_PROFILES = ("line-car-cascade", SINGLE_LOOP_PROFILE)
 LOOP_COMMANDS = {
     "SET_PIDX",
     "SET_KFX",
@@ -1092,6 +1096,35 @@ def parse_named_numeric_frame(kind: str, prefix: str, fields: list[str], line: s
     return frame
 
 
+def parse_sens_frame(line: str) -> dict:
+    """
+    函数作用：
+        解析小车传感器 `{SENS}` 帧，并兼容没有电池电压字段的板端工程。
+
+    主要流程：
+        1. 先按逗号拆分 `{SENS}` payload。
+        2. 字段数为 19 时按完整协议解析，包含 battery。
+        3. 字段数为 18 时按无电池扩展解析，并把 battery 置为 None，避免缺省电池值被误判为 0V。
+        4. 复用既有数值和枚举校验，确保 line_lost 等安全字段仍严格校验。
+
+    参数说明：
+        line 为完整 `{SENS}` 文本行，不要求包含换行。
+
+    返回值：
+        返回 typed frame 字典；非法字段数或非法数值时 valid=False。
+    """
+    payload = line[len("{SENS}") :]
+    parts = payload.split(",") if payload else []
+    fields = SENS_FIELDS
+    if len(parts) == len(SENS_FIELDS_WITHOUT_BATTERY):
+        fields = SENS_FIELDS_WITHOUT_BATTERY
+    frame = parse_named_numeric_frame("sens", "{SENS}", fields, line)
+    if frame.get("valid") and "battery" not in frame["data"]:
+        # battery 是应用层健康信息，很多板端没有采样通道；缺失时显式保留为 None。
+        frame["data"]["battery"] = None
+    return frame
+
+
 def parse_ack_frame(line: str) -> dict:
     """
     函数作用：
@@ -1248,7 +1281,7 @@ def parse_frame(line: str) -> dict:
     if line.startswith("{CFGX}"):
         return parse_named_numeric_frame("cfgx", "{CFGX}", CFGX_FIELDS, line)
     if line.startswith("{SENS}"):
-        return parse_named_numeric_frame("sens", "{SENS}", SENS_FIELDS, line)
+        return parse_sens_frame(line)
     if line.startswith("{ACK}"):
         return parse_ack_frame(line)
     if line.startswith("{ERR}"):
@@ -1718,6 +1751,23 @@ def build_set_pidx_command(loop_id: str, kp: float, ki: float, kd: float) -> str
     )
 
 
+def build_set_pid_command(kp: float, ki: float, kd: float) -> str:
+    """
+    函数作用：
+        构造旧单环 PID 参数下发命令。
+
+    主要流程：
+        校验三个有限数值，并按自动调参约定的三位小数输出 `{CMD}SET_PID`。
+
+    参数说明：
+        kp、ki、kd 为待下发到单环 PID 控制器的参数，必须是有限数。
+
+    返回值：
+        返回完整 `{CMD}SET_PID,kp,ki,kd` 文本，不包含换行。
+    """
+    return f"{{CMD}}SET_PID,{format_command_float(kp)},{format_command_float(ki)},{format_command_float(kd)}"
+
+
 def build_set_kfx_command(loop_id: str, kf: float) -> str:
     """
     函数作用：
@@ -1834,6 +1884,9 @@ def response_matches_pending_command(metadata: dict[str, Any], response: dict[st
         return False
 
     response_loop_id = response.get("loop_id")
+    # 单环 SET_PID 的 ACK/ERR 按旧协议不携带 loop_id；虚拟 single 环路只用于 host 内部评分。
+    if str(metadata.get("loop_id", "")) == SINGLE_LOOP_ID and not response_loop_id:
+        return True
     if response_loop_id:
         return str(response_loop_id).strip() == str(metadata.get("loop_id", "")).strip()
     return True
@@ -1855,12 +1908,12 @@ class AutoTuneConfig:
 
 class AutoTuneController:
     """
-    串级 PID 自动调参纯状态机。
+    PID 自动调参纯状态机。
 
     类作用：
-        接收已解析的 `{PIDX}`、`{CFGX}`、`{SENS}`、`{ACK}`、`{ERR}` 帧，按固定小车
-        profile 生成观察、建议、自动发送或回滚动作。该类不直接读写串口，便于单元测试和
-        dashboard/CLI 复用。
+        接收已解析的 `{PID}` / `{CFG}` 或 `{PIDX}` / `{CFGX}` / `{SENS}` / `{ACK}` / `{ERR}` 帧，
+        按 single-loop 或 line-car-cascade profile 生成观察、建议、自动发送或回滚动作。
+        该类不直接读写串口，便于单元测试和 dashboard/CLI 复用。
     """
 
     def __init__(self, config: AutoTuneConfig):
@@ -1878,7 +1931,10 @@ class AutoTuneController:
             构造函数无显式返回值。
         """
         self.config = config
-        self.loop_order = list(CASCADE_PROFILE_ORDER if config.profile == "line-car-cascade" else CASCADE_PROFILE_ORDER)
+        if config.profile not in SUPPORTED_AUTOTUNE_PROFILES:
+            raise ValueError(f"profile must be one of: {', '.join(SUPPORTED_AUTOTUNE_PROFILES)}")
+        self.single_loop = config.profile == SINGLE_LOOP_PROFILE
+        self.loop_order = [SINGLE_LOOP_ID] if self.single_loop else list(CASCADE_PROFILE_ORDER)
         self.state = "DISCOVER"
         self.loop_configs: dict[str, dict[str, Any]] = {}
         self.samples_by_loop: dict[str, list[dict[str, Any]]] = {}
@@ -1911,6 +1967,13 @@ class AutoTuneController:
 
         kind = frame.get("kind")
         data = frame.get("data", {})
+        if kind == "cfg" and self.single_loop:
+            # 旧单环协议没有 loop_id；状态机内部使用稳定虚拟 ID 复用多环评分和回滚逻辑。
+            self.loop_configs[SINGLE_LOOP_ID] = dict(data)
+            if self.state == "DISCOVER":
+                self.state = "SYNC_CONFIG"
+            return
+
         if kind == "cfgx":
             loop_id = str(data["loop_id"])
             self.loop_configs[loop_id] = dict(data)
@@ -1918,18 +1981,13 @@ class AutoTuneController:
                 self.state = "SYNC_CONFIG"
             return
 
+        if kind == "pid" and self.single_loop:
+            self._append_pid_sample(SINGLE_LOOP_ID, data, frame)
+            return
+
         if kind == "pidx":
             loop_id = str(data["loop_id"])
-            sample = dict(data)
-            # dashboard 会在帧字典上附加 received_at；纯 parser 测试没有该字段时使用板端 ms 裁剪窗口。
-            if "received_at" in frame:
-                sample["received_at"] = frame["received_at"]
-            self.samples_by_loop.setdefault(loop_id, []).append(sample)
-            self.samples_by_loop[loop_id] = self.samples_by_loop[loop_id][-200:]
-            if int(data.get("fault", 0)) != 0:
-                self._abort(f"fault on {loop_id}")
-            if int(data.get("sensor_ok", 1)) != 1:
-                self._abort(f"sensor bad on {loop_id}")
+            self._append_pid_sample(loop_id, data, frame)
             return
 
         if kind == "sens":
@@ -1989,6 +2047,38 @@ class AutoTuneController:
                 f"board rejected {self.pending_step.get('command_name')} "
                 f"{self.pending_step.get('phase', 'step')}"
             )
+
+    def _append_pid_sample(self, loop_id: str, data: dict[str, Any], frame: dict[str, Any]) -> None:
+        """
+        函数作用：
+            将 PID 或 PIDX 遥测样本追加到指定环路窗口，并执行安全门槛检查。
+
+        主要流程：
+            1. 复制 typed data，避免调用方后续修改影响状态机。
+            2. dashboard 帧带 received_at 时保留该时间戳，用于按秒裁剪窗口。
+            3. 控制每个环路最多保留 200 条样本。
+            4. 发现 fault 或 sensor_ok 异常立即 ABORT，阻止继续自动写参。
+
+        参数说明：
+            loop_id 为状态机内部环路 ID；单环 profile 使用虚拟值 single。
+            data 为 parse_frame 得到的 PID/PIDX data。
+            frame 为完整 parsed frame，可能携带 received_at。
+
+        返回值：
+            无返回值。
+        """
+        sample = dict(data)
+        if self.single_loop and "loop_id" not in sample:
+            sample["loop_id"] = loop_id
+            sample["loop_name"] = loop_id
+        if "received_at" in frame:
+            sample["received_at"] = frame["received_at"]
+        self.samples_by_loop.setdefault(loop_id, []).append(sample)
+        self.samples_by_loop[loop_id] = self.samples_by_loop[loop_id][-200:]
+        if int(data.get("fault", 0)) != 0:
+            self._abort(f"fault on {loop_id}")
+        if int(data.get("sensor_ok", 1)) != 1:
+            self._abort(f"sensor bad on {loop_id}")
 
     def plan_next_action(self, now: float | None = None) -> dict[str, Any]:
         """
@@ -2212,10 +2302,10 @@ class AutoTuneController:
     def _select_next_loop(self) -> str | None:
         """
         函数作用：
-            按串级调参顺序选择下一个可调 loop。
+            按当前 profile 的调参顺序选择下一个可调环路。
 
         主要流程：
-            只选择同时具备 CFGX 配置和 PIDX 样本、且尚未完成的 loop。
+            只选择同时具备配置快照和 PID 样本、且尚未完成的环路；单环 profile 使用虚拟 single 环路。
 
         参数说明：
             无参数。
@@ -2232,6 +2322,26 @@ class AutoTuneController:
                 continue
             return loop_id
         return None
+
+    def _build_pid_command(self, loop_id: str, kp: float, ki: float, kd: float) -> str:
+        """
+        函数作用：
+            按当前 profile 构造 PID 参数下发命令。
+
+        主要流程：
+            single-loop profile 生成旧协议 `{CMD}SET_PID`；串级 profile 生成带 loop_id 的
+            `{CMD}SET_PIDX`。这样状态机可以复用同一套评分/回滚逻辑，但不要求单环固件实现分环命令。
+
+        参数说明：
+            loop_id 为状态机内部环路 ID；单环时应为 single，串级时为真实 loop_id。
+            kp、ki、kd 为待下发 PID 参数。
+
+        返回值：
+            返回完整 `{CMD}` 文本，不包含换行。
+        """
+        if self.single_loop:
+            return build_set_pid_command(kp, ki, kd)
+        return build_set_pidx_command(loop_id, kp, ki, kd)
 
     def _build_step(self, loop_id: str, score: dict[str, float]) -> dict[str, Any]:
         """
@@ -2270,10 +2380,8 @@ class AutoTuneController:
         else:
             new_kd = max(0.0, old_kd * factor)
 
-        command = build_set_pidx_command(loop_id, new_kp, old_ki, old_kd)
-        if changed_param != "kp":
-            command = build_set_pidx_command(loop_id, new_kp, new_ki, new_kd)
-        old_command = build_set_pidx_command(loop_id, old_kp, old_ki, old_kd)
+        command = self._build_pid_command(loop_id, new_kp, new_ki, new_kd)
+        old_command = self._build_pid_command(loop_id, old_kp, old_ki, old_kd)
         if command == old_command:
             # 按板端实际接收的三位小数命令比较；相同则说明本次建议不会改变控制器参数。
             self._abort(
@@ -2376,7 +2484,7 @@ class AutoTuneController:
             对已 ACK 的参数修改观察结果并决定保留或回滚。
 
         主要流程：
-            计算当前窗口评分；若综合分高于基线且允许回滚，则生成旧参数 SET_PIDX 回滚命令。
+            计算当前窗口评分；若综合分高于基线且允许回滚，则生成旧参数 SET_PID 或 SET_PIDX 回滚命令。
 
         参数说明：
             now 为当前时间戳，用于记录 rollback 发送时间。
@@ -2392,7 +2500,7 @@ class AutoTuneController:
         current = float(current_score["score"])
         if self.config.rollback_on_regression and current > baseline:
             old = self.pending_step["old"]
-            command = build_set_pidx_command(loop_id, old["kp"], old["ki"], old["kd"])
+            command = self._build_pid_command(loop_id, old["kp"], old["ki"], old["kd"])
             record = {
                 "loop_id": loop_id,
                 "command": command,
@@ -2638,13 +2746,13 @@ def print_autotune_action(action: dict[str, Any], as_json: bool) -> None:
 def cmd_autotune(args: argparse.Namespace) -> int:
     """
     函数作用：
-        执行串级 PID 自动调参 CLI。
+        执行单环或串级 PID 自动调参 CLI。
 
     主要流程：
         1. 解析串口并创建 AutoTuneController。
-        2. 可选发送 `{CMD}GET_ALL_CFG`，促使板端回传全部 `{CFGX}`。
-        3. 持续读取 `{PIDX}`、`{CFGX}`、`{SENS}`、`{ACK}`、`{ERR}` 帧并推进状态机。
-        4. observe/suggest 模式只输出动作；auto-tune 模式才会自动发送 SET_PIDX 或回滚命令。
+        2. 可选发送 `{CMD}GET_CFG` 或 `{CMD}GET_ALL_CFG`，促使板端回传配置快照。
+        3. 持续读取 PID/CFG/PIDX/CFGX/SENS/ACK/ERR 帧并推进状态机。
+        4. observe/suggest 模式只输出动作；auto-tune 模式才会自动发送 SET_PID/SET_PIDX 或回滚命令。
 
     参数说明：
         args 为 argparse 解析后的参数。
@@ -2675,8 +2783,9 @@ def cmd_autotune(args: argparse.Namespace) -> int:
         with open_serial(port, baud, timeout=0.5) as ser:
             decoder = ProtocolStreamDecoder()
             if args.request_config:
-                # GET_ALL_CFG 是只读同步请求，用于让多环板端立即发送 CFGX 配置快照。
-                ser.write(normalize_command("{CMD}GET_ALL_CFG").encode("ascii"))
+                # 单环板端使用旧 GET_CFG；串级板端使用 GET_ALL_CFG 同步全部 CFGX 配置快照。
+                request_command = "{CMD}GET_CFG" if config.profile == SINGLE_LOOP_PROFILE else "{CMD}GET_ALL_CFG"
+                ser.write(normalize_command(request_command).encode("ascii"))
                 ser.flush()
 
             while True:
@@ -2789,7 +2898,7 @@ def build_parser() -> argparse.ArgumentParser:
     send_parser.add_argument("--jsonl", action="store_true", help="Output parsed JSONL records.")
     send_parser.set_defaults(func=cmd_send)
 
-    autotune_parser = subparsers.add_parser("autotune", help="Run cascade PID observe/suggest/auto-tune workflow.")
+    autotune_parser = subparsers.add_parser("autotune", help="Run PID observe/suggest/auto-tune workflow.")
     autotune_parser.add_argument("--port", help="Serial port, for example COM5.")
     autotune_parser.add_argument("--baud", type=int, default=115200, help="Baud rate when --port is used.")
     autotune_parser.add_argument("--auto", action="store_true", help="Auto-detect port before tuning.")
@@ -2800,8 +2909,8 @@ def build_parser() -> argparse.ArgumentParser:
     autotune_parser.add_argument(
         "--profile",
         default="line-car-cascade",
-        choices=["line-car-cascade"],
-        help="Cascade loop profile; default line-car-cascade.",
+        choices=list(SUPPORTED_AUTOTUNE_PROFILES),
+        help="Auto-tune profile; use single-loop for legacy PID/CFG or line-car-cascade for PIDX/CFGX.",
     )
     autotune_parser.add_argument(
         "--mode",
@@ -2816,7 +2925,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-post-ack-samples",
         type=int,
         default=DEFAULT_MIN_POST_ACK_SAMPLES,
-        help="Minimum new PIDX samples after ACK before keep/rollback decision.",
+        help="Minimum new PID/PIDX samples after ACK before keep/rollback decision.",
     )
     autotune_parser.add_argument(
         "--rollback-on-regression",
@@ -2836,13 +2945,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="request_config",
         action="store_true",
         default=True,
-        help="Send read-only {CMD}GET_ALL_CFG at session start.",
+        help="Send read-only config request at session start: GET_CFG for single-loop, GET_ALL_CFG for cascade.",
     )
     autotune_parser.add_argument(
         "--no-request-config",
         dest="request_config",
         action="store_false",
-        help="Do not send GET_ALL_CFG automatically.",
+        help="Do not send GET_CFG/GET_ALL_CFG automatically.",
     )
     autotune_parser.add_argument("--duration", type=float, default=0.0, help="Session duration in seconds; 0 means until stopped.")
     autotune_parser.add_argument("--count", type=int, default=0, help="Maximum input frames to process; 0 means no count limit.")

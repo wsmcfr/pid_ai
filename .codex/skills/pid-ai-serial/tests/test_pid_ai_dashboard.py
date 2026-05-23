@@ -87,6 +87,26 @@ def make_cfgx_line(loop_id: str, kp: float) -> str:
     )
 
 
+def make_cfg_line(kp: float = 1.2) -> str:
+    """
+    函数作用：
+        构造一条合法的单环 {CFG} 测试帧。
+
+    主要流程：
+        按旧单环配置协议固定字段输出 profile_id、PID 参数、限幅、模式和故障位。
+
+    参数说明：
+        kp 为比例系数，默认 1.2；Ki/Kd 使用能触发小步变化的固定值。
+
+    返回值：
+        返回完整 {CFG} 文本帧。
+    """
+    return (
+        f"{{CFG}}0,{kp:.6f},0.030000,0.080000,0.000000,"
+        "10.000,-5000.000,5000.000,0.000,1000.000,0,1,3,0"
+    )
+
+
 class DashboardStateTest(unittest.TestCase):
     """测试 dashboard 纯状态逻辑，不依赖真实串口或浏览器。"""
 
@@ -475,6 +495,126 @@ class DashboardStateTest(unittest.TestCase):
         self.assertIsNotNone(handler.payload)
         self.assertEqual(handler.payload["autotune"]["ack_timeout_seconds"], 4.5)
         self.assertEqual(handler.payload["autotune"]["min_post_ack_samples"], 5)
+
+    def test_autotune_http_payload_accepts_single_loop_profile(self) -> None:
+        """
+        函数作用：
+            验证 dashboard 自动调参配置允许 single-loop profile。
+
+        主要流程：
+            1. 构造轻量 handler。
+            2. 调用 handle_autotune 并传入 profile=single-loop。
+            3. 校验响应快照保留 single-loop，说明上位机不会强制要求串级 PIDX/CFGX。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+
+        class FakeHandler:
+            """
+            类作用：
+                为 handler 单元测试提供最小替身，避免启动真实 HTTPServer。
+            """
+
+            def __init__(self) -> None:
+                """初始化 fake handler 的状态容器。"""
+                self.state = DashboardState(max_samples=4)
+                self.payload = None
+
+            def write_json(self, payload: dict, status=None) -> None:
+                """
+                函数作用：
+                    捕获 handler 准备写出的 JSON 响应。
+
+                参数说明：
+                    payload 为业务方法生成的响应快照。
+                    status 为可选 HTTP 状态码，本测试不使用。
+
+                返回值：
+                    无返回值，只把 payload 存到对象字段中。
+                """
+                self.payload = payload
+
+        handler = FakeHandler()
+
+        DashboardRequestHandler.handle_autotune(
+            handler,
+            {
+                "enabled": True,
+                "mode": "suggest",
+                "profile": "single-loop",
+            },
+        )
+
+        self.assertIsNotNone(handler.payload)
+        self.assertEqual(handler.payload["autotune"]["profile"], "single-loop")
+        self.assertEqual(handler.payload["autotune"]["mode"], "suggest")
+
+    def test_dashboard_single_loop_autotune_sends_set_pid_from_cfg_and_pid(self) -> None:
+        """
+        函数作用：
+            验证 dashboard 的 single-loop 自动调参路径会基于 `{CFG}` / `{PID}` 发送 `SET_PID`。
+
+        主要流程：
+            1. 使用 fake serial 模拟已连接串口，避免依赖真实硬件。
+            2. 启用 single-loop + auto-tune，并注入单环配置和遥测窗口。
+            3. 校验最终写入串口和命令历史的是 `{CMD}SET_PID`，不是分环 `SET_PIDX`。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+
+        class FakeSerial:
+            """
+            类作用：
+                捕获 dashboard 自动调参写出的串口字节，供测试断言命令文本。
+            """
+
+            def __init__(self) -> None:
+                """初始化写入缓冲区。"""
+                self.writes: list[bytes] = []
+
+            def write(self, data: bytes) -> int:
+                """
+                函数作用：
+                    模拟 pyserial.write 成功并保存写入内容。
+
+                参数说明：
+                    data 为 dashboard 准备发送到板端的 ASCII 命令字节。
+
+                返回值：
+                    返回写入字节数，模拟 pyserial 的成功返回。
+                """
+                self.writes.append(data)
+                return len(data)
+
+            def flush(self) -> None:
+                """模拟 pyserial.flush，无返回值。"""
+                return None
+
+        state = DashboardState(max_samples=8)
+        fake_serial = FakeSerial()
+        with state._lock:
+            state._serial_handle = fake_serial
+            state.connected = True
+
+        state.configure_autotune(
+            enabled=True,
+            mode="auto-tune",
+            profile="single-loop",
+            window_seconds=0.1,
+        )
+        state.ingest_line(make_cfg_line())
+        state.ingest_line(make_pid_line(1, 94.0))
+        state.ingest_line(make_pid_line(2, 94.2))
+        snapshot = state.ingest_line(make_pid_line(3, 94.4))
+
+        self.assertTrue(fake_serial.writes)
+        self.assertEqual(fake_serial.writes[-1], b"{CMD}SET_PID,1.200,0.033,0.080\r\n")
+        history = state.snapshot()["command_history"]
+        self.assertEqual(history[-1]["command_name"], "SET_PID")
+        self.assertEqual(history[-1]["loop_id"], None)
+        self.assertEqual(snapshot["kind"], "pid")
 
     def test_dashboard_autotune_tick_aborts_when_ack_timeout_elapses_without_frames(self) -> None:
         """

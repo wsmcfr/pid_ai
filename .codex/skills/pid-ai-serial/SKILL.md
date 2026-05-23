@@ -51,17 +51,19 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port C
 | 模式 | 是否写参 | 使用场景 | 行为 |
 |---|---:|---|---|
 | `observe` | 否 | 初次接车、排查串口、确认传感器有效 | 只读取 `{PID}` / `{PIDX}` / `{CFG}` / `{CFGX}` / `{SENS}`，计算评分和安全状态 |
-| `suggest` | 否 | 需要 AI 给出建议但不希望自动改车 | 按当前窗口生成建议 `{CMD}SET_PIDX,...`，只打印或展示，不写串口 |
+| `suggest` | 否 | 需要 AI 给出建议但不希望自动改车 | 单环生成 `{CMD}SET_PID,...`，串级生成 `{CMD}SET_PIDX,...`，只打印或展示，不写串口 |
 | `auto-tune` | 是 | 用户明确允许全自动小步调参 | 每次只改一个 loop，必须等待 `{ACK}`，观察变差时回滚 |
 | `emergency-stop` | 是 | 失控、丢线、故障、蓝牙断流、用户要求停止 | 停止自动调参，优先发送禁用/停机命令并保留原始串口证据 |
 
-`observe` 和 `suggest` 是默认安全模式；只有用户显式启用 `auto-tune` 后，脚本或 dashboard 才允许自动发送 `SET_PIDX` 或回滚命令。
+`observe` 和 `suggest` 是默认安全模式；只有用户显式启用 `auto-tune` 后，脚本或 dashboard 才允许自动发送 `SET_PID` / `SET_PIDX` 或回滚命令。
 
 ## 自动调参 CLI
 
-串级小车默认 profile：
+单环普通 PID 使用 `single-loop` profile；串级小车使用 `line-car-cascade` profile：
 
 ```powershell
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --profile single-loop --mode observe
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --profile single-loop --mode suggest
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode observe
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode suggest
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode auto-tune --max-step 0.10 --window-seconds 2.0 --ack-timeout-seconds 2.0 --min-post-ack-samples 3 --rollback-on-regression
@@ -74,7 +76,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 -> SEND_STEP -> OBSERVE_RESULT -> KEEP_OR_ROLLBACK -> NEXT_LOOP
 ```
 
-任一安全门槛失败、收到 `{ERR}`、ACK 超时、蓝牙断流或用户停止时进入 `ABORT`。`window_seconds` 必须按接收时间或板端 `ms` 裁剪评分窗口；ACK 后至少等待 `--min-post-ack-samples` 条新 `{PIDX}` 样本后才允许 keep/rollback，不能用单个偶然样本决定是否回滚，也不能把固定样本数伪装成秒级窗口。
+任一安全门槛失败、收到 `{ERR}`、ACK 超时、蓝牙断流或用户停止时进入 `ABORT`。`window_seconds` 必须按接收时间或板端 `ms` 裁剪评分窗口；ACK 后至少等待 `--min-post-ack-samples` 条新 `{PID}` 或 `{PIDX}` 样本后才允许 keep/rollback，不能用单个偶然样本决定是否回滚，也不能把固定样本数伪装成秒级窗口。
 
 ## 串级 PID 顺序
 
@@ -87,7 +89,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | 3 | `yaw_rate` | 角速度中环 | 依赖左右轮速度环响应 |
 | 4 | `line_outer` | 8 路循迹外环 | 依赖中环和内环已可控 |
 
-自动调参每次只改一个 loop 的 `kp/ki/kd`，默认单步变化不超过 `--max-step 0.10`，下发参数保留三位小数。策略会在稳态偏差时小步增加 `ki`，震荡时优先增加 `kd`，输出饱和且 `anti_windup` 频繁触发时降低 `ki`，`line_outer` 外环慢响应时用半步 `kp`。如果新旧 `SET_PIDX` 按三位小数格式化后完全相同（例如参数全为 0 或过小），必须中止并要求人工先给非零 seed 参数；不要自动猜测硬件种子。不要自动放大输出限幅、自动反转方向或自动启用危险手动输出；这些只能作为人工确认项或紧急停机项处理。
+自动调参每次只改一个 `kp/ki/kd` 组，默认单步变化不超过 `--max-step 0.10`，下发参数保留三位小数。`single-loop` 使用 `{PID}` / `{CFG}` 和 `SET_PID`；`line-car-cascade` 使用 `{PIDX}` / `{CFGX}` 和 `SET_PIDX`。策略会在稳态偏差时小步增加 `ki`，震荡时优先增加 `kd`，输出饱和且 `anti_windup` 频繁触发时降低 `ki`，`line_outer` 外环慢响应时用半步 `kp`。如果新旧 `SET_PID` / `SET_PIDX` 按三位小数格式化后完全相同（例如参数全为 0 或过小），必须中止并要求人工先给非零 seed 参数；不要自动猜测硬件种子。不要自动放大输出限幅、自动反转方向或自动启用危险手动输出；这些只能作为人工确认项或紧急停机项处理。
 
 ## 协议帧
 
@@ -104,14 +106,14 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 ```text
 {PIDX}loop_id,loop_name,seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out_raw,out_limited,actuator,out_min,out_max,sat,anti_windup,mode,enable,sensor_ok,fault
 {CFGX}loop_id,loop_name,kp,ki,kd,kf,sample_ms,integral_min,integral_max,out_min,out_max,reverse,mode,version,fault
-{SENS}ms,line0,line1,line2,line3,line4,line5,line6,line7,line_pos,line_lost,yaw,yaw_rate,enc_l,enc_r,v_l,v_r,v_avg,battery
+{SENS}ms,line0,line1,line2,line3,line4,line5,line6,line7,line_pos,line_lost,yaw,yaw_rate,enc_l,enc_r,v_l,v_r,v_avg[,battery]
 ```
 
 解析规则：
 
 | 规则 | 要求 |
 |---|---|
-| 字段数量 | 必须精确匹配协议文档，缺字段、多字段、尾随逗号都视为坏帧 |
+| 字段数量 | 必须精确匹配协议文档；`{SENS}` 允许省略末尾可选 battery，其余缺字段、多字段、尾随逗号都视为坏帧 |
 | 数值字段 | 必须能解析且为有限数，拒绝 `nan`、`inf`、`-inf` |
 | 枚举字段 | `sat`、`mode`、`enable`、`sensor_ok`、`line_lost` 等必须在合法范围 |
 | 文本字段 | `loop_id` 和 `loop_name` 只允许 `A-Za-z0-9_.:-`，不能为空 |
@@ -150,9 +152,9 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | Pending 匹配 | host 侧按命令名和 `loop_id` 匹配 pending 命令；旧 ACK/ERR 不带 `loop_id` 时禁止同名分环命令并发 pending |
 | ERR 处理 | 收到 `{ERR}` 后命令失败，自动调参进入停止状态 |
 | ACK 后观察 | `auto-tune` 必须等 ACK 后再开始 post-ACK 观察窗口 |
-| ACK 后样本数 | post-ACK 窗口默认至少需要 `--min-post-ack-samples 3` 条新 `{PIDX}`，样本不足时继续等待 |
+| ACK 后样本数 | post-ACK 窗口默认至少需要 `--min-post-ack-samples 3` 条新 `{PID}` 或 `{PIDX}`，样本不足时继续等待 |
 | ACK 超时 | step 和 rollback 都要记录发送时间，超过 `--ack-timeout-seconds` 未收到 ACK/ERR 必须 `ABORT` |
-| 回滚条件 | post-ACK 窗口评分变差且启用 `--rollback-on-regression` 时，发送旧参数 `SET_PIDX`；rollback 是独立 pending 命令，收到匹配 ACK 后才算当前 loop 完成 |
+| 回滚条件 | post-ACK 窗口评分变差且启用 `--rollback-on-regression` 时，单环发送旧参数 `SET_PID`，串级发送旧参数 `SET_PIDX`；rollback 是独立 pending 命令，收到匹配 ACK 后才算当前 loop 完成 |
 
 ## 安全门槛
 
