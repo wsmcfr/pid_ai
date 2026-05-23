@@ -111,6 +111,8 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 {SENS}ms,line0,line1,line2,line3,line4,line5,line6,line7,line_pos,line_lost,yaw,yaw_rate,enc_l,enc_r,v_l,v_r,v_avg[,battery]
 ```
 
+> **注意**：`{CFGX}` 中的 `sample_ms` 与 C 结构体 `PIDAI_Handle.dt_ms` 含义相同（控制周期，单位 ms），仅命名不同。Python 解析器和 SKILL 文档统一使用 `sample_ms`，C 库内部使用 `dt_ms`。
+
 解析规则：
 
 | 规则 | 要求 |
@@ -138,6 +140,10 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | `ENABLEX` | `{CMD}ENABLEX,speed_l,1` | 使能/禁用指定 loop |
 | `GET_CFGX` | `{CMD}GET_CFGX,speed_l` | 请求单个 `{CFGX}` |
 | `GET_ALL_CFG` | `{CMD}GET_ALL_CFG` | 请求全部 `{CFGX}` |
+| `GET_STAT` | `{CMD}GET_STAT` | 请求 `{STAT}` 状态帧 |
+| `CLEAR_FAULT` | `{CMD}CLEAR_FAULT` | 清除故障位图（单环）；多环需配合 loop_id 扩展 |
+| `SET_SENSOR_OK` | `{CMD}SET_SENSOR_OK,1` | 设置传感器状态（单环），1=正常，0=异常 |
+| `SET_REVERSE` | `{CMD}SET_REVERSE,0` | 设置控制方向（单环），1=反向，0=正向 |
 
 未知 loop 必须视为失败，典型返回：
 

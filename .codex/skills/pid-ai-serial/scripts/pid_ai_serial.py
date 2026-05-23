@@ -819,9 +819,6 @@ def parse_binary_frame(frame: bytes | bytearray | memoryview) -> dict:
             loop_name, offset = _unpack_binary_text(payload, offset, "loop_name")
             data = _binary_unpack_named_fields("cfgx", CFGX_FIELDS[2:], BINARY_CFGX_FIELD_FORMATS, payload[offset:])
             data = {"loop_id": loop_id, "loop_name": loop_name, **data}
-            validation_error = validate_named_numeric_data("cfgx", data)
-            if validation_error is not None:
-                raise ValueError(validation_error)
     except (KeyError, struct.error, ValueError) as exc:
         result["kind"] = kind
         result["transport_seq"] = transport_seq
@@ -2217,15 +2214,6 @@ class AutoTuneController:
                     "command": self.pending_step["command"],
                 }
 
-            if phase == "rollback":
-                return {
-                    "type": "wait",
-                    "state": self.state,
-                    "loop_id": loop_id,
-                    "reason": "waiting for rollback ACK",
-                    "command": self.pending_step["command"],
-                }
-
             ack_sample_count = int(self.pending_step.get("ack_sample_count", 0))
             post_ack_sample_count = max(0, len(self.samples_by_loop.get(loop_id, [])) - ack_sample_count)
             min_post_ack_samples = max(1, int(self.config.min_post_ack_samples))
@@ -2313,15 +2301,6 @@ class AutoTuneController:
                 "command": self.pending_step["command"],
             }
 
-        if phase == "rollback":
-            return {
-                "type": "wait",
-                "state": self.state,
-                "loop_id": loop_id,
-                "reason": "waiting for rollback ACK",
-                "command": self.pending_step["command"],
-            }
-
         ack_sample_count = int(self.pending_step.get("ack_sample_count", 0))
         post_ack_sample_count = max(0, len(self.samples_by_loop.get(loop_id, [])) - ack_sample_count)
         min_post_ack_samples = max(1, int(self.config.min_post_ack_samples))
@@ -2353,7 +2332,7 @@ class AutoTuneController:
             返回指标字典；score 越低表示效果越好。
         """
         line_lost_count = self._line_lost_count_for_score()
-        samples = self._window_samples(loop_id, start_index=start_index)
+        samples, window_fallback = self._window_samples(loop_id, start_index=start_index)
         if not samples:
             return {
                 "mean_abs_error": float("inf"),
@@ -2363,6 +2342,7 @@ class AutoTuneController:
                 "anti_windup_ratio": 1.0,
                 "sensor_bad_ratio": 1.0,
                 "line_lost_count": line_lost_count,
+                "window_fallback": True,
                 "score": float("inf"),
             }
 
@@ -2394,6 +2374,7 @@ class AutoTuneController:
             "anti_windup_ratio": anti_ratio,
             "sensor_bad_ratio": sensor_bad_ratio,
             "line_lost_count": line_lost_count,
+            "window_fallback": window_fallback,
             "score": score,
         }
 
@@ -2656,7 +2637,7 @@ class AutoTuneController:
             "current_score": current,
         }
 
-    def _window_samples(self, loop_id: str, start_index: int = 0) -> list[dict[str, Any]]:
+    def _window_samples(self, loop_id: str, start_index: int = 0) -> tuple[list[dict[str, Any]], bool]:
         """
         函数作用：
             按 window_seconds 截取指定 loop 的评分样本窗口。
@@ -2671,7 +2652,8 @@ class AutoTuneController:
             start_index 为样本起始下标；越界时退回保留最新样本，避免除零。
 
         返回值：
-            返回参与评分的样本列表，至少保留最新一条样本。
+            返回 (samples, window_fallback) 元组；window_fallback=True 表示时间戳缺失，
+            使用了最近 50 条样本作为回退，评分窗口语义与 window_seconds 无关。
         """
         all_samples = self.samples_by_loop.get(loop_id, [])
         if start_index > 0:
@@ -2681,21 +2663,21 @@ class AutoTuneController:
         else:
             samples = all_samples
         if not samples:
-            return []
+            return [], False
 
         window_seconds = max(float(self.config.window_seconds), 0.001)
         latest = samples[-1]
         if isinstance(latest.get("received_at"), (int, float)):
             cutoff = float(latest["received_at"]) - window_seconds
             window = [sample for sample in samples if float(sample.get("received_at", cutoff - 1.0)) >= cutoff]
-            return window or [latest]
+            return window or [latest], False
 
         if isinstance(latest.get("ms"), (int, float)):
             cutoff_ms = float(latest["ms"]) - window_seconds * 1000.0
             window = [sample for sample in samples if float(sample.get("ms", cutoff_ms - 1.0)) >= cutoff_ms]
-            return window or [latest]
+            return window or [latest], False
 
-        return samples[-50:]
+        return samples[-50:], True
 
     def _pending_timed_out(self, now: float) -> bool:
         """

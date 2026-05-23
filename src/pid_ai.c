@@ -428,10 +428,22 @@ float PIDAI_Update(PIDAI_Handle *pid, float feedback, uint32_t ms, float dt_ms)
      * D 项对 feedback 求值，避免 target 阶跃时产生尖峰（Derivative Kick 问题）。
      * 普通方向下 feedback 增大代表误差减小，D 项取负；reverse 下误差定义反转，D 项也要反向。
      * dt_ms / 1000.0f 把变化量归一到秒，使 kd 的物理含义与采样周期无关。
+     *
+     * 首次调用（seq == 1）时 last_feedback 为 0，直接计算会产生与初始 feedback 等幅的 D 项尖峰。
+     * 首帧将 last_feedback 初始化为当前 feedback，d_error 和 d_out 置零，跳过 D 项计算。
      */
-    pid->d_error = pid->feedback - pid->last_feedback;
-    d_sign = pid->reverse ? 1.0f : -1.0f;
-    pid->d_out = d_sign * pid->kd * pid->d_error / (dt_ms / 1000.0f);
+    if (pid->seq == 1U)
+    {
+        pid->last_feedback = pid->feedback;
+        pid->d_error = 0.0f;
+        pid->d_out   = 0.0f;
+    }
+    else
+    {
+        pid->d_error = pid->feedback - pid->last_feedback;
+        d_sign = pid->reverse ? 1.0f : -1.0f;
+        pid->d_out = d_sign * pid->kd * pid->d_error / (dt_ms / 1000.0f);
+    }
 
     /* 积分归一化到物理时间单位（秒），使 ki 的含义与控制周期无关。 */
     next_integral = pid->integral + pid->error * (dt_ms / 1000.0f);

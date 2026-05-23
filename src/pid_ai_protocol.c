@@ -17,10 +17,12 @@
  *
  * 使用说明：
  *   该值不会被解引用，只用于和 cursor 做身份比较。之所以不用空指针表示尾随空字段，
- *   是因为空指针已经表示“字段刚好解析完毕”；两者必须区分，才能把
- *   "{CMD}SET_PID,1,2,3," 识别为多余参数而不是合法命令。
+ *   是因为空指针已经表示”字段刚好解析完毕”；两者必须区分，才能把
+ *   “{CMD}SET_PID,1,2,3,” 识别为多余参数而不是合法命令。
+ *   使用静态字符数组地址作为哨兵，避免整数强转指针触发严格别名警告。
  */
-#define PIDAI_TRAILING_EMPTY_TOKEN ((char *)1)
+static char PIDAI_TRAILING_EMPTY_TOKEN_STORAGE = '\0';
+#define PIDAI_TRAILING_EMPTY_TOKEN (&PIDAI_TRAILING_EMPTY_TOKEN_STORAGE)
 
 /*
  * 函数作用：
