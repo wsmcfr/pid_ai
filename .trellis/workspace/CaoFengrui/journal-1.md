@@ -281,3 +281,51 @@ and pushed the feature branch to GitHub.
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: Session 6 - Experiment recording
+
+**Date**: 2026-05-23
+**Task**: Session 6 - Experiment recording
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| Area | Details |
+|---|---|
+| Dashboard experiment recorder | Added command-scoped JSON experiment recording for parameter/control commands. Records pending command metadata, ACK/ERR or local transport error, before/after PID samples, before/after config snapshots, and basic score summaries. |
+| Runtime controls | Added `--experiment-dir`, `--experiment-window-seconds`, and `--disable-experiment-recording`; `/api/status` now exposes `experiment_recording` summary. |
+| Tests | Added dashboard tests for acknowledged `SET_PIDX` experiment persistence and local send error persistence. Full `pid-ai-serial` test suite passes. |
+| Docs/spec | Updated README, dashboard API docs, `.gitignore`, and frontend state-management spec with the executable experiment-recording contract. |
+
+**Verification**:
+- `gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; if ($LASTEXITCODE -eq 0) { .\tests\test_pid_ai.exe }` -> PASS
+- `python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v` -> 36 tests OK
+- `python -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py` -> PASS
+- `PYTHONUTF8=1 quick_validate.py .codex\skills\pid-ai-serial` -> Skill is valid
+
+**GitHub**:
+- Pushed `feat/pid-ai-autotune` to `origin` at `372db2a`.
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `372db2a` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

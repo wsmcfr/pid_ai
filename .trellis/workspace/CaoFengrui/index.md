@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 5
+- **Total Sessions**: 6
 - **Last Active**: 2026-05-23
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~278 | Active |
+| `journal-1.md` | ~331 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 6 | 2026-05-23 | Session 6 - Experiment recording | `372db2a` | `feat/pid-ai-autotune` |
 | 5 | 2026-05-23 | Session 5 - ACK hardening and post-ACK autotune scoring | `e70d073` | `feat/pid-ai-autotune` |
 | 4 | 2026-05-23 | Harden PID cascade autotune transactions | `f7b8ded` | `feat/pid-ai-autotune` |
 | 3 | 2026-05-22 | PID 全面修复与算法优化 | `9b5ce07` | `main` |
