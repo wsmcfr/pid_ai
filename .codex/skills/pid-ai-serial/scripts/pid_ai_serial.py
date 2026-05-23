@@ -515,6 +515,136 @@ def parse_named_numeric_frame(kind: str, prefix: str, fields: list[str], line: s
     return frame
 
 
+def parse_ack_frame(line: str) -> dict:
+    """
+    函数作用：
+        按 ACK 协议精确解析命令成功响应。
+
+    主要流程：
+        1. 按逗号拆分 ACK payload。
+        2. 普通命令只接受 `{ACK}command,detail` 两个字段。
+        3. 分环命令额外接受 `{ACK}command,loop_id,detail` 三个字段，并校验 loop_id 安全。
+
+    参数说明：
+        line 为完整 ACK 协议行。
+
+    返回值：
+        返回结构化 ACK 字典；字段数量、loop_id 或 detail 非法时 valid=False。
+    """
+    parts = [part.strip() for part in line[len("{ACK}") :].split(",")]
+    command = parts[0] if len(parts) > 0 else ""
+    command_upper = command.upper()
+    frame = {
+        "kind": "ack",
+        "valid": False,
+        "raw": line,
+        "command": command,
+        "loop_id": None,
+        "detail": "",
+        "error": None,
+    }
+
+    if not command:
+        frame["error"] = "command is required"
+        return frame
+
+    if command_upper in LOOP_COMMANDS:
+        if len(parts) == 2:
+            frame["detail"] = parts[1]
+        elif len(parts) == 3:
+            try:
+                frame["loop_id"] = parse_text_field("loop_id", parts[1])
+            except ValueError as exc:
+                frame["error"] = str(exc)
+                return frame
+            frame["detail"] = parts[2]
+        else:
+            frame["error"] = f"unexpected field count: expected 2 or 3, got {len(parts)}"
+            return frame
+    else:
+        if len(parts) != 2:
+            frame["error"] = f"unexpected field count: expected 2, got {len(parts)}"
+            return frame
+        frame["detail"] = parts[1]
+
+    if not frame["detail"]:
+        frame["error"] = "detail is required"
+        return frame
+
+    frame["valid"] = True
+    return frame
+
+
+def parse_err_frame(line: str) -> dict:
+    """
+    函数作用：
+        按 ERR 协议精确解析命令失败响应。
+
+    主要流程：
+        1. 普通命令只接受 `{ERR}command,status,detail` 三个字段。
+        2. 分环命令额外接受 `{ERR}command,loop_id,status,detail` 四个字段。
+        3. 校验 status 必须来自 C API 稳定状态文本，防止坏帧被当成有效拒绝结果。
+
+    参数说明：
+        line 为完整 ERR 协议行。
+
+    返回值：
+        返回结构化 ERR 字典；字段数量、loop_id、status 或 detail 非法时 valid=False。
+    """
+    parts = [part.strip() for part in line[len("{ERR}") :].split(",")]
+    command = parts[0] if len(parts) > 0 else ""
+    command_upper = command.upper()
+    frame = {
+        "kind": "err",
+        "valid": False,
+        "raw": line,
+        "command": command,
+        "loop_id": None,
+        "status": "",
+        "detail": "",
+        "error": None,
+    }
+
+    if not command:
+        frame["error"] = "command is required"
+        return frame
+
+    if command_upper in LOOP_COMMANDS:
+        if len(parts) == 3:
+            frame["status"] = parts[1]
+            frame["detail"] = parts[2]
+        elif len(parts) == 4:
+            try:
+                frame["loop_id"] = parse_text_field("loop_id", parts[1])
+            except ValueError as exc:
+                frame["error"] = str(exc)
+                return frame
+            frame["status"] = parts[2]
+            frame["detail"] = parts[3]
+        else:
+            frame["error"] = f"unexpected field count: expected 3 or 4, got {len(parts)}"
+            return frame
+    else:
+        if len(parts) != 3:
+            frame["error"] = f"unexpected field count: expected 3, got {len(parts)}"
+            return frame
+        frame["status"] = parts[1]
+        frame["detail"] = parts[2]
+
+    if not frame["status"]:
+        frame["error"] = "status is required"
+        return frame
+    if frame["status"].upper() not in COMMAND_STATUS_TEXTS:
+        frame["error"] = f"unknown status: {frame['status']}"
+        return frame
+    if not frame["detail"]:
+        frame["error"] = "detail is required"
+        return frame
+
+    frame["valid"] = True
+    return frame
+
+
 def parse_frame(line: str) -> dict:
     """
     函数作用：
@@ -543,42 +673,9 @@ def parse_frame(line: str) -> dict:
     if line.startswith("{SENS}"):
         return parse_named_numeric_frame("sens", "{SENS}", SENS_FIELDS, line)
     if line.startswith("{ACK}"):
-        parts = [part.strip() for part in line[len("{ACK}") :].split(",")]
-        command = parts[0] if len(parts) > 0 else ""
-        loop_id = None
-        detail = parts[1] if len(parts) > 1 else ""
-        # 兼容旧 `{ACK}SET_PIDX,OK`，同时支持未来 `{ACK}SET_PIDX,speed_l,OK`。
-        if command.strip().upper() in LOOP_COMMANDS and len(parts) >= 3 and parts[2].strip().upper() in COMMAND_STATUS_TEXTS:
-            loop_id = parts[1]
-            detail = parts[2]
-        return {
-            "kind": "ack",
-            "valid": bool(command) and bool(detail),
-            "raw": line,
-            "command": command,
-            "loop_id": loop_id,
-            "detail": detail,
-        }
+        return parse_ack_frame(line)
     if line.startswith("{ERR}"):
-        parts = [part.strip() for part in line[len("{ERR}") :].split(",")]
-        command = parts[0] if len(parts) > 0 else ""
-        loop_id = None
-        status = parts[1] if len(parts) > 1 else ""
-        detail = parts[2] if len(parts) > 2 else ""
-        # 兼容旧 `{ERR}SET_PIDX,ARG_INVALID,LOOP_NOT_FOUND`，并预留带 loop_id 的新格式。
-        if command.strip().upper() in LOOP_COMMANDS and len(parts) >= 4 and parts[2].strip().upper() in COMMAND_STATUS_TEXTS:
-            loop_id = parts[1]
-            status = parts[2]
-            detail = parts[3]
-        return {
-            "kind": "err",
-            "valid": bool(command) and bool(status) and bool(detail),
-            "raw": line,
-            "command": command,
-            "loop_id": loop_id,
-            "status": status,
-            "detail": detail,
-        }
+        return parse_err_frame(line)
     for prefix in ("{STAT}", "{EVT}"):
         if line.startswith(prefix):
             return {"kind": prefix.strip("{}").lower(), "valid": True, "raw": line}
@@ -1232,6 +1329,15 @@ class AutoTuneController:
         if self.pending_step is None:
             return
         if not response_matches_pending_command(self.pending_step, response):
+            if response.get("kind") in ("ack", "err") and response.get("valid"):
+                response_command = str(response.get("command", ""))
+                response_loop = response.get("loop_id")
+                pending_command = str(self.pending_step.get("command_name", ""))
+                pending_loop = str(self.pending_step.get("loop_id", ""))
+                self._abort(
+                    "mismatched response "
+                    f"{response_command}/{response_loop or '-'} while waiting for {pending_command}/{pending_loop}"
+                )
             return
         if response.get("kind") == "ack":
             current_time = time.monotonic() if now is None else float(now)
@@ -1314,7 +1420,7 @@ class AutoTuneController:
                     "reason": "waiting for post-ACK telemetry",
                     "command": self.pending_step["command"],
                 }
-            return self._evaluate_pending_step(current_time)
+            return self._evaluate_pending_step(current_time, ack_sample_count)
 
         loop_id = self._select_next_loop()
         if loop_id is None:
@@ -1343,21 +1449,23 @@ class AutoTuneController:
             "reason": proposal["reason"],
         }
 
-    def score_loop(self, loop_id: str) -> dict[str, float]:
+    def score_loop(self, loop_id: str, start_index: int = 0) -> dict[str, float]:
         """
         函数作用：
             计算某个 loop 最近窗口的调参评分指标。
 
         主要流程：
             从最近样本中统计平均误差、最大误差、过零次数、饱和比例、抗饱和比例、传感器异常比例和综合分。
+            当 start_index 大于 0 时，只统计该索引之后的样本，用于 ACK 后效果评估。
 
         参数说明：
             loop_id 为目标环路。
+            start_index 为样本起始下标；0 表示使用完整可用窗口。
 
         返回值：
             返回指标字典；score 越低表示效果越好。
         """
-        samples = self._window_samples(loop_id)
+        samples = self._window_samples(loop_id, start_index=start_index)
         if not samples:
             return {
                 "mean_abs_error": float("inf"),
@@ -1465,7 +1573,7 @@ class AutoTuneController:
             "sent_at": None,
         }
 
-    def _evaluate_pending_step(self, now: float) -> dict[str, Any]:
+    def _evaluate_pending_step(self, now: float, ack_sample_count: int) -> dict[str, Any]:
         """
         函数作用：
             对已 ACK 的参数修改观察结果并决定保留或回滚。
@@ -1474,14 +1582,15 @@ class AutoTuneController:
             计算当前窗口评分；若综合分高于基线且允许回滚，则生成旧参数 SET_PIDX 回滚命令。
 
         参数说明：
-            无参数，使用 self.pending_step。
+            now 为当前时间戳，用于记录 rollback 发送时间。
+            ack_sample_count 为 ACK 到达时该 loop 已有样本数；评估时只使用之后的新样本。
 
         返回值：
             返回 keep 或 rollback 动作字典。
         """
         assert self.pending_step is not None
         loop_id = str(self.pending_step["loop_id"])
-        current_score = self.score_loop(loop_id)
+        current_score = self.score_loop(loop_id, start_index=ack_sample_count)
         baseline = float(self.pending_step["baseline_score"]["score"])
         current = float(current_score["score"])
         if self.config.rollback_on_regression and current > baseline:
@@ -1523,7 +1632,7 @@ class AutoTuneController:
             "current_score": current,
         }
 
-    def _window_samples(self, loop_id: str) -> list[dict[str, Any]]:
+    def _window_samples(self, loop_id: str, start_index: int = 0) -> list[dict[str, Any]]:
         """
         函数作用：
             按 window_seconds 截取指定 loop 的评分样本窗口。
@@ -1531,14 +1640,22 @@ class AutoTuneController:
         主要流程：
             优先使用 dashboard 注入的 received_at；没有本机接收时间时退回板端 ms；
             若样本缺少任何时间字段，则保留旧行为使用最近 50 条，避免无时间模拟数据无法评分。
+            start_index 用于 ACK 后评估，只保留 ACK 之后进入状态机的新样本。
 
         参数说明：
             loop_id 为目标 PID 环路 ID。
+            start_index 为样本起始下标；越界时退回保留最新样本，避免除零。
 
         返回值：
             返回参与评分的样本列表，至少保留最新一条样本。
         """
-        samples = self.samples_by_loop.get(loop_id, [])
+        all_samples = self.samples_by_loop.get(loop_id, [])
+        if start_index > 0:
+            samples = all_samples[start_index:]
+            if not samples and all_samples:
+                samples = [all_samples[-1]]
+        else:
+            samples = all_samples
         if not samples:
             return []
 

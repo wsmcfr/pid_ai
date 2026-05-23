@@ -146,6 +146,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | Single-loop mutation | Only one loop and one `kp/ki/kd` tuple may be changed per step. |
 | Step size | Default maximum change is `10%`; command builders format PID numbers with three decimals. |
 | ACK gate | `OBSERVE_RESULT` may start only after a matching `{ACK}` for the pending command and `loop_id`. |
+| Post-ACK scoring window | Evaluate keep/rollback using only samples received after the matching ACK; crop that post-ACK slice by `window_seconds`. |
 | ACK timeout | Store `sent_at` for each step and rollback command; if `ack_timeout_seconds` elapses without a matching ACK/ERR, move the controller to `ABORT`. |
 | ERR/timeout gate | `{ERR}`, ACK timeout, serial disconnect, or mismatched pending command moves the controller to `ABORT`. |
 | Regression rollback | If post-ACK score is worse and rollback is enabled, send old parameters using `SET_PIDX`, append `rollback_history`, and keep the loop pending until the rollback command receives a matching `{ACK}`. |
@@ -159,6 +160,12 @@ for applied parameters. When an API exposes `window_seconds`, scoring must crop
 samples by receive time or board `ms`; a fixed sample count is only a fallback
 when no usable timestamp exists.
 
+For an ACK-gated tuning step, record the sample count or timestamp at the
+matching ACK. The post-step score must start after that boundary so pre-change
+baseline telemetry cannot dilute or hide a regression. If a valid ACK/ERR arrives
+for a different command or `loop_id` while a step or rollback is pending, abort
+the auto-tune session and surface the mismatched response.
+
 ---
 
 ## Common Mistakes
@@ -171,5 +178,7 @@ when no usable timestamp exists.
 | Deriving diagnosis from raw strings. | Parser differences create subtle bugs. | Parse first, then derive from typed frames. |
 | Updating every loop when one `{PIDX}` arrives. | A single noisy loop can pollute other controller state. | Mutate only `loops[frame.loop_id]`. |
 | Starting post-step evaluation before ACK. | The score may describe old parameters. | Record the ACK sample boundary and wait for new telemetry. |
+| Scoring rollback decisions with pre-ACK samples. | Old-parameter telemetry can hide a regression or trigger the wrong keep/rollback decision. | Filter the score input to samples after the matching ACK boundary. |
+| Ignoring mismatched ACK/ERR while a command is pending. | Board or host transaction drift can leave auto-tune waiting forever or trusting the wrong result. | Abort and show the mismatched command/loop evidence. |
 | Treating a rollback write as completed immediately. | The dashboard may continue to the next loop while the board still runs bad parameters. | Model rollback as its own pending command and wait for matching ACK. |
 | Clearing auto-tune aborts on the next good frame. | Operators lose the reason the automatic write flow stopped. | Require explicit user action to re-enable after `ABORT`. |

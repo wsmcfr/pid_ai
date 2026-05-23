@@ -2,6 +2,7 @@
 .agents/
 .claude/
 .trellis/
+.spec-workflow/
 
 # 项目内 Codex skill 属于本仓库能力，允许提交；其他 .codex 内容继续忽略。
 .codex/*

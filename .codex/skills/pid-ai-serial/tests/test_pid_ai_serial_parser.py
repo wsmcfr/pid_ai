@@ -274,6 +274,49 @@ class PidAiSerialParserTest(unittest.TestCase):
         self.assertEqual(metadata["loop_id"], "speed_l")
         self.assertTrue(pid_ai_serial.response_matches_pending_command(metadata, ack))
 
+    def test_ack_and_err_reject_unexpected_extra_fields(self) -> None:
+        """
+        函数作用：
+            验证 ACK/ERR 帧必须按协议字段数量精确解析，不能静默忽略多余字段。
+
+        主要流程：
+            1. 构造旧格式 ACK、旧格式 ERR、分环 ACK、分环 ERR 的多余字段版本。
+            2. 调用 parse_frame。
+            3. 校验这些坏响应都不会被标记为 valid，避免污染命令历史和自动调参状态。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        bad_lines = [
+            "{ACK}SET_PID,OK,EXTRA",
+            "{ERR}SET_PID,ARG_INVALID,FLOAT_PARSE_FAIL,EXTRA",
+            "{ACK}SET_PIDX,speed_l,OK,EXTRA",
+            "{ERR}SET_PIDX,speed_l,ARG_INVALID,FLOAT_PARSE_FAIL,EXTRA",
+        ]
+
+        for line in bad_lines:
+            with self.subTest(line=line):
+                parsed = pid_ai_serial.parse_frame(line)
+
+                self.assertFalse(parsed["valid"])
+                self.assertIn("unexpected field count", parsed["error"])
+
+    def test_err_rejects_unknown_status_text(self) -> None:
+        """
+        函数作用：
+            验证 ERR 帧的 status 必须是 PIDAI_ProtocolStatusText 定义的稳定文本。
+
+        主要流程：
+            注入未知 status 的 ERR 帧，并校验 parser 把它标记为无效响应。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        parsed = pid_ai_serial.parse_frame("{ERR}SET_PID,NOT_A_STATUS,FLOAT_PARSE_FAIL")
+
+        self.assertFalse(parsed["valid"])
+        self.assertIn("unknown status", parsed["error"])
+
 
 class PidAiAutoTuneTest(unittest.TestCase):
     """测试自动调参纯状态机，不依赖真实串口。"""
@@ -454,6 +497,68 @@ class PidAiAutoTuneTest(unittest.TestCase):
 
         self.assertEqual(timeout["type"], "abort")
         self.assertIn("ACK timeout", timeout["reason"])
+
+    def test_mismatched_pending_response_aborts_autotune(self) -> None:
+        """
+        函数作用：
+            验证 pending 写参期间收到错配 ACK/ERR 会立即中止自动调参。
+
+        主要流程：
+            1. 生成 speed_l 的 pending SET_PIDX。
+            2. 注入携带 speed_r loop_id 的 ERR 响应。
+            3. 校验状态机进入 ABORT，而不是继续等待 speed_l 的 ACK。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [5.0, 4.0, 3.0])
+        action = controller.plan_next_action(now=100.0)
+        self.assertEqual(action["type"], "send")
+
+        controller.handle_response(
+            pid_ai_serial.parse_frame("{ERR}SET_PIDX,speed_r,ARG_INVALID,FLOAT_PARSE_FAIL"),
+            now=100.1,
+        )
+        abort_action = controller.plan_next_action(now=100.1)
+
+        self.assertEqual(abort_action["type"], "abort")
+        self.assertIn("mismatched response", abort_action["reason"])
+
+    def test_post_ack_score_uses_only_post_ack_samples(self) -> None:
+        """
+        函数作用：
+            验证 ACK 后效果评分只使用 ACK 之后的新遥测样本。
+
+        主要流程：
+            1. 使用很大的 window_seconds，确保旧实现会把 ACK 前基线样本混入当前窗口。
+            2. 生成并 ACK 一个 speed_l 调参 step。
+            3. 注入一条 ACK 后低误差样本，校验 keep 动作的 current_score 只反映该新样本。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        config = pid_ai_serial.AutoTuneConfig(
+            auto=True,
+            profile="line-car-cascade",
+            mode="auto-tune",
+            max_step=0.10,
+            window_seconds=10.0,
+            ack_timeout_seconds=0.50,
+            rollback_on_regression=True,
+        )
+        controller = pid_ai_serial.AutoTuneController(config)
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [10.0, 9.0, 8.0], start_ms=1000)
+        self.assertEqual(controller.plan_next_action(now=100.0)["type"], "send")
+        controller.handle_response(pid_ai_serial.parse_frame("{ACK}SET_PIDX,OK"), now=100.1)
+
+        self.ingest_window(controller, "speed_l", [2.0], start_ms=1010)
+        keep = controller.plan_next_action(now=100.2)
+
+        self.assertEqual(keep["type"], "keep")
+        self.assertAlmostEqual(keep["current_score"], 2.5)
 
     def test_rollback_ack_is_required_before_loop_completed(self) -> None:
         """

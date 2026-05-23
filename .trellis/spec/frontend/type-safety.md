@@ -118,8 +118,8 @@ AI diagnosis code.
 | `{CFG}` | Prefix, exact field count `14`, numeric parsing, mode range, version number. |
 | `{CFGX}` | Prefix, exact field count `15`, non-empty safe `loop_id`/`loop_name`, then all `{CFG}` numeric and enum checks. |
 | `{SENS}` | Prefix, exact field count `19`, finite numeric parsing, eight `lineN` booleans, `line_lost` boolean. |
-| `{ACK}` | Prefix, command string, detail string; loop-aware commands may use `{ACK}command,loop_id,detail`. |
-| `{ERR}` | Prefix, command string, known status text, detail string; loop-aware commands may use `{ERR}command,loop_id,status,detail`. |
+| `{ACK}` | Prefix, exact field count, command string, detail string; loop-aware commands may use `{ACK}command,loop_id,detail`. |
+| `{ERR}` | Prefix, exact field count, command string, known status text, detail string; loop-aware commands may use `{ERR}command,loop_id,status,detail`. |
 
 Reject partial/truncated frames instead of filling missing fields with defaults.
 For UI display, keep a parse error counter and optionally show the last bad line
@@ -262,6 +262,16 @@ Loop-aware ACK/ERR parsing must preserve compatibility with old firmware:
 | `{ACK}SET_PIDX,speed_l,OK` | `SET_PIDX` | `speed_l` | `detail=OK` |
 | `{ERR}SET_PIDX,ARG_INVALID,LOOP_NOT_FOUND` | `SET_PIDX` | `null` | `status=ARG_INVALID`, `detail=LOOP_NOT_FOUND` |
 | `{ERR}SET_PIDX,speed_l,ARG_INVALID,FLOAT_PARSE_FAIL` | `SET_PIDX` | `speed_l` | `status=ARG_INVALID`, `detail=FLOAT_PARSE_FAIL` |
+
+Response parsers must reject extra fields instead of ignoring them:
+
+| Frame | Required parser result |
+|---|---|
+| `{ACK}SET_PID,OK,EXTRA` | `valid=False`, error contains unexpected field count. |
+| `{ERR}SET_PID,ARG_INVALID,FLOAT_PARSE_FAIL,EXTRA` | `valid=False`, error contains unexpected field count. |
+| `{ACK}SET_PIDX,speed_l,OK,EXTRA` | `valid=False`, error contains unexpected field count. |
+| `{ERR}SET_PIDX,speed_l,ARG_INVALID,FLOAT_PARSE_FAIL,EXTRA` | `valid=False`, error contains unexpected field count. |
+| `{ERR}SET_PID,NOT_A_STATUS,FLOAT_PARSE_FAIL` | `valid=False`, error contains unknown status. |
 
 When ACK/ERR lacks `loop_id`, host transaction state must prevent multiple
 pending commands with the same loop-aware command name, because command-only
