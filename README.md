@@ -112,7 +112,7 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port C
 | 实时波形 | Canvas 显示 `target`、`feedback`、`error`、`p_out`、`i_out`、`d_out`、`out_limited`、`actuator` |
 | 安全状态 | 显示 `sensor_ok`、`fault`、`sat`、`anti_windup`、`mode`、`enable` |
 | 多环状态 | 显示 `{PIDX}` / `{CFGX}` 中每个 `loop_id` 的最新误差、参数、饱和和故障 |
-| 自动调参 | 支持 `observe`、`suggest`、`auto-tune`，按串级顺序生成小步 `SET_PIDX`，ACK 后观察，变差时回滚并等待 rollback ACK |
+| 自动调参 | 支持 `observe`、`suggest`、`auto-tune`，按串级顺序生成小步 `SET_PIDX`，根据 `ki/kd`、外环和饱和场景选择策略，ACK 后观察，变差时回滚并等待 rollback ACK |
 | 参数设置 | 生成并发送 `SET_PID`、`SET_KF`、`SET_TARGET`、`SET_OUT_LIMIT`、`SET_I_LIMIT`、`SET_MODE`、`SET_MANUAL_OUT`、`ENABLE`、`SET_REVERSE`、`SET_SENSOR_OK`、`RESET_I`、`CLEAR_FAULT`、`GET_CFG` |
 | 命令历史 | 记录 pending 命令、`loop_id` 和调参原因，并只在收到 `{ACK}` 后标记为确认；收到 `{ERR}` 或本地串口错误时显示失败 |
 | 实验记录 | 默认把每次参数/控制命令的前后曲线、ACK/ERR、配置快照和基础评分保存到 `experiments/*.json` |
@@ -261,7 +261,7 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode auto-tune --max-step 0.10 --window-seconds 3.0 --ack-timeout-seconds 2.0 --rollback-on-regression
 ```
 
-自动调参状态机按 `DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP -> SEND_STEP -> OBSERVE_RESULT -> KEEP_OR_ROLLBACK -> NEXT_LOOP` 推进。写参前会检查 `sensor_ok`、`fault` 和 `{SENS}.line_lost`；发送后必须等 `{ACK}`，评分窗口按 `--window-seconds` 使用接收时间或板端 `ms` 裁剪。若 post-ACK 窗口评分变差则发送旧参数 `SET_PIDX` 回滚；回滚命令必须等匹配 `{ACK}` 后才算完成，收到 `{ERR}` 或超过 `--ack-timeout-seconds` 会中止自动调参。
+自动调参状态机按 `DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP -> SEND_STEP -> OBSERVE_RESULT -> KEEP_OR_ROLLBACK -> NEXT_LOOP` 推进。写参前会检查 `sensor_ok`、`fault` 和 `{SENS}.line_lost`；发送后必须等 `{ACK}`，评分窗口按 `--window-seconds` 使用接收时间或板端 `ms` 裁剪。策略会在稳态偏差时小步增加 `ki`，震荡时优先增加 `kd`，饱和且 `anti_windup` 触发时降低 `ki`，`line_outer` 外环慢响应时用半步 `kp`。若 post-ACK 窗口评分变差则发送旧参数 `SET_PIDX` 回滚；回滚命令必须等匹配 `{ACK}` 后才算完成，收到 `{ERR}` 或超过 `--ack-timeout-seconds` 会中止自动调参。
 
 ## 当前阶段和下一步
 
@@ -280,6 +280,8 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --
 | 已完成 | Python `autotune` 状态机、命令构建、ACK 匹配和变差回滚 |
 | 已完成 | Dashboard 多环状态、自动调参状态、评分和回滚历史 |
 | 已完成 | 实验记录 JSON 落盘，保存每次参数修改前后的曲线、ACK/ERR、配置快照和基础评分 |
+| 已完成 | 更细的自动调参策略，覆盖 `ki/kd`、外环保守步长和积分饱和场景 |
+| 已完成 | 可选二进制遥测/配置协议与 CRC-16/CCITT-FALSE，Python 上位机支持文本和二进制混合流 |
 | 已完成 | 板端接入示例 |
 | 已完成 | 基础 C 测试 |
 
@@ -288,12 +290,12 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --
 | 优先级 | 下一步 | 目标 |
 |---|---|---|
 | 高 | 真实小车板端接入 `{PIDX}` / `{CFGX}` / `{SENS}` | 在硬件上验证串级自动调参闭环 |
-| 中 | 更细的调参策略 | 针对 `ki/kd`、外环和饱和场景引入更丰富的规则 |
-| 低 | 二进制协议和 CRC | 提升高频传输可靠性和带宽效率 |
+| 中 | 在真实车上标定自动调参策略阈值 | 根据实测振荡、饱和和外环轨迹表现调整策略边界 |
+| 低 | 二进制命令帧扩展 | 在保留文本 `{CMD}` 的基础上评估是否需要命令也二进制化 |
 
 ## 移植到真实板子的最小步骤
 
-1. 把 `include/pid_ai.h`、`include/pid_ai_protocol.h`、`src/pid_ai.c`、`src/pid_ai_protocol.c` 加入单片机工程。
+1. 把 `include/pid_ai.h`、`include/pid_ai_protocol.h`、`src/pid_ai.c`、`src/pid_ai_protocol.c` 加入单片机工程；如果需要高频二进制遥测，再加入 `include/pid_ai_binary_protocol.h` 和 `src/pid_ai_binary_protocol.c`。
 2. 在板端初始化时调用 `PIDAI_Init()`、`PIDAI_SetTunings()`、`PIDAI_SetOutputLimits()`、`PIDAI_SetTarget()`。
 3. 在固定控制周期里读取传感器反馈值，并调用 `PIDAI_Update()`。
 4. 把 `PIDAI_Update()` 返回的 `actuator` 写入 PWM、DAC、电机驱动或其他执行器。

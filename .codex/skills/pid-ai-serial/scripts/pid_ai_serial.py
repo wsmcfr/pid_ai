@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -213,6 +214,79 @@ COMMAND_STATUS_TEXTS = {
     "PARAM_RANGE",
     "INTERNAL_ERROR",
 }
+BINARY_MAGIC = b"\xA5\x5A"
+BINARY_VERSION = 1
+BINARY_HEADER_SIZE = 11
+BINARY_CRC_SIZE = 2
+BINARY_TYPE_BY_KIND = {
+    "pid": 1,
+    "pidx": 2,
+    "cfg": 3,
+    "cfgx": 4,
+}
+BINARY_KIND_BY_TYPE = {value: key for key, value in BINARY_TYPE_BY_KIND.items()}
+BINARY_PID_PAYLOAD_FORMAT = "<IIfffffffffffffffiiiiiI"
+BINARY_PID_PAYLOAD_SIZE = struct.calcsize(BINARY_PID_PAYLOAD_FORMAT)
+BINARY_CFG_PAYLOAD_FORMAT = "<ifffffffffiiiI"
+BINARY_CFG_PAYLOAD_SIZE = struct.calcsize(BINARY_CFG_PAYLOAD_FORMAT)
+BINARY_CFGX_PAYLOAD_FORMAT = "<fffffffffiiiI"
+BINARY_CFGX_PAYLOAD_SIZE = struct.calcsize(BINARY_CFGX_PAYLOAD_FORMAT)
+BINARY_PID_FIELD_FORMATS = [
+    "I",
+    "I",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "i",
+    "i",
+    "i",
+    "i",
+    "i",
+    "I",
+]
+BINARY_CFG_FIELD_FORMATS = [
+    "i",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "i",
+    "i",
+    "i",
+    "I",
+]
+BINARY_CFGX_FIELD_FORMATS = [
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "f",
+    "i",
+    "i",
+    "i",
+    "I",
+]
 
 
 @dataclass
@@ -470,6 +544,464 @@ def validate_named_numeric_data(kind: str, data: dict[str, str | int | float]) -
     return None
 
 
+def binary_crc16(data: bytes | bytearray | memoryview) -> int:
+    """
+    函数作用：
+        计算 PID AI 二进制协议使用的 CRC-16/CCITT-FALSE。
+
+    主要流程：
+        初值 0xFFFF，多项式 0x1021，不做输入/输出反转，也不做最终异或。
+
+    参数说明：
+        data 为待校验的字节序列，通常是 header 中 version 开始的字段加 payload。
+
+    返回值：
+        返回 0 到 0xFFFF 范围内的 CRC 整数。
+    """
+    crc = 0xFFFF
+    for value in bytes(data):
+        crc ^= value << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def _binary_pack_named_fields(fields: list[str], formats: list[str], data: dict[str, Any]) -> bytes:
+    """
+    函数作用：
+        按协议字段顺序把 typed frame 数据打包为二进制 payload。
+
+    主要流程：
+        逐字段读取 data，按整数或 float 格式转换，最后用 struct little-endian 打包。
+
+    参数说明：
+        fields 为协议字段名顺序。
+        formats 为每个字段对应的 struct 格式码，不含端序前缀。
+        data 为 parse_frame 得到的 data 字典。
+
+    返回值：
+        返回二进制 payload 字节串；字段缺失或类型非法时抛出 ValueError。
+    """
+    values: list[int | float] = []
+    for field_name, field_format in zip(fields, formats):
+        value = data[field_name]
+        if field_format in ("i", "I"):
+            values.append(int(value))
+        else:
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError(f"{field_name} must be finite")
+            values.append(number)
+    return struct.pack("<" + "".join(formats), *values)
+
+
+def _binary_unpack_named_fields(kind: str, fields: list[str], formats: list[str], payload: bytes) -> dict[str, Any]:
+    """
+    函数作用：
+        将固定字段二进制 payload 解析为 typed frame data 字典。
+
+    主要流程：
+        使用 struct 按 little-endian 解包，再调用既有枚举/非负校验逻辑。
+
+    参数说明：
+        kind 为帧类型，用于校验枚举范围。
+        fields 为字段名顺序。
+        formats 为 struct 格式码顺序。
+        payload 为待解析 payload。
+
+    返回值：
+        返回已通过基础校验的数据字典；非法时抛出 ValueError。
+    """
+    expected_length = struct.calcsize("<" + "".join(formats))
+    if len(payload) != expected_length:
+        raise ValueError(f"expected payload length {expected_length}, got {len(payload)}")
+
+    unpacked = struct.unpack("<" + "".join(formats), payload)
+    data = {field_name: value for field_name, value in zip(fields, unpacked)}
+    validation_error = validate_named_numeric_data(kind, data)
+    if validation_error is not None:
+        raise ValueError(validation_error)
+    return data
+
+
+def _pack_binary_text(value: str) -> bytes:
+    """
+    函数作用：
+        将 loop_id/loop_name 打包为一字节长度前缀加 ASCII 文本。
+
+    主要流程：
+        复用 parse_text_field 做安全校验，再要求长度不超过 255 字节。
+
+    参数说明：
+        value 为待写入文本字段。
+
+    返回值：
+        返回 length + bytes 格式的字段。
+    """
+    text = parse_text_field("loop_id", value)
+    encoded = text.encode("ascii")
+    if len(encoded) > 255:
+        raise ValueError("binary text field is too long")
+    return bytes([len(encoded)]) + encoded
+
+
+def _unpack_binary_text(payload: bytes, offset: int, field_name: str) -> tuple[str, int]:
+    """
+    函数作用：
+        从二进制 payload 中读取一字节长度前缀文本。
+
+    主要流程：
+        校验长度不越界，按 ASCII 解码，再复用 parse_text_field 做安全文本校验。
+
+    参数说明：
+        payload 为完整 payload。
+        offset 为当前读取位置。
+        field_name 为字段名，用于错误消息。
+
+    返回值：
+        返回文本值和新的 offset。
+    """
+    if offset >= len(payload):
+        raise ValueError(f"{field_name} length is missing")
+    length = payload[offset]
+    start = offset + 1
+    end = start + length
+    if end > len(payload):
+        raise ValueError(f"{field_name} exceeds payload length")
+    try:
+        text = payload[start:end].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{field_name} must be ASCII") from exc
+    return parse_text_field(field_name, text), end
+
+
+def build_binary_frame(kind: str, data: dict[str, Any], transport_seq: int = 0) -> bytes:
+    """
+    函数作用：
+        构造一条 PID AI 二进制协议帧，供测试、回放和未来高频发送复用。
+
+    主要流程：
+        1. 按 kind 选择固定 payload schema。
+        2. 写入 magic、版本、类型、flags、传输层序号和 payload 长度。
+        3. CRC 覆盖 version 起始的 header 字段和 payload，最后以 little-endian 追加。
+
+    参数说明：
+        kind 为 pid、pidx、cfg 或 cfgx。
+        data 为 typed frame data 字典。
+        transport_seq 为二进制传输层帧序号。
+
+    返回值：
+        返回完整二进制帧字节串。
+    """
+    normalized_kind = kind.lower()
+    if normalized_kind == "pid":
+        payload = _binary_pack_named_fields(PID_FIELDS, BINARY_PID_FIELD_FORMATS, data)
+    elif normalized_kind == "pidx":
+        payload = (
+            _pack_binary_text(str(data["loop_id"])) +
+            _pack_binary_text(str(data.get("loop_name") or data["loop_id"])) +
+            _binary_pack_named_fields(PID_FIELDS, BINARY_PID_FIELD_FORMATS, data)
+        )
+    elif normalized_kind == "cfg":
+        payload = _binary_pack_named_fields(CFG_FIELDS, BINARY_CFG_FIELD_FORMATS, data)
+    elif normalized_kind == "cfgx":
+        payload = (
+            _pack_binary_text(str(data["loop_id"])) +
+            _pack_binary_text(str(data.get("loop_name") or data["loop_id"])) +
+            _binary_pack_named_fields(CFGX_FIELDS[2:], BINARY_CFGX_FIELD_FORMATS, data)
+        )
+    else:
+        raise ValueError(f"unsupported binary frame kind: {kind}")
+
+    header = struct.pack(
+        "<2sBBB I H",
+        BINARY_MAGIC,
+        BINARY_VERSION,
+        BINARY_TYPE_BY_KIND[normalized_kind],
+        0,
+        int(transport_seq) & 0xFFFFFFFF,
+        len(payload),
+    )
+    crc = binary_crc16(header[2:] + payload)
+    return header + payload + struct.pack("<H", crc)
+
+
+def parse_binary_frame(frame: bytes | bytearray | memoryview) -> dict:
+    """
+    函数作用：
+        将一条完整 PID AI 二进制帧解析为与文本 parse_frame 一致的 typed frame。
+
+    主要流程：
+        1. 校验 magic、版本、完整长度和 CRC。
+        2. 根据 type 解析固定 payload。
+        3. 输出 kind、valid、data、transport_seq 和 raw_bytes。
+
+    参数说明：
+        frame 为完整二进制帧，不包含额外前后缀字节。
+
+    返回值：
+        返回结构化帧字典；校验失败时 valid=False 并写入 error。
+    """
+    raw = bytes(frame)
+    result = {
+        "kind": "binary",
+        "valid": False,
+        "raw": f"<binary:{len(raw)} bytes>",
+        "raw_hex": raw.hex(),
+        "raw_length": len(raw),
+        "data": {},
+        "error": None,
+    }
+    if len(raw) < BINARY_HEADER_SIZE + BINARY_CRC_SIZE:
+        result["error"] = "binary frame too short"
+        return result
+    if raw[:2] != BINARY_MAGIC:
+        result["error"] = "binary magic mismatch"
+        return result
+
+    version, frame_type, flags, transport_seq, payload_length = struct.unpack("<BBB I H", raw[2:BINARY_HEADER_SIZE])
+    if version != BINARY_VERSION:
+        result["error"] = f"unsupported binary version: {version}"
+        return result
+    expected_length = BINARY_HEADER_SIZE + payload_length + BINARY_CRC_SIZE
+    if len(raw) != expected_length:
+        result["error"] = f"binary length mismatch: expected {expected_length}, got {len(raw)}"
+        return result
+
+    payload = raw[BINARY_HEADER_SIZE : BINARY_HEADER_SIZE + payload_length]
+    expected_crc = binary_crc16(raw[2 : BINARY_HEADER_SIZE + payload_length])
+    actual_crc = struct.unpack("<H", raw[BINARY_HEADER_SIZE + payload_length : expected_length])[0]
+    if expected_crc != actual_crc:
+        result["error"] = f"CRC mismatch: expected 0x{expected_crc:04X}, got 0x{actual_crc:04X}"
+        return result
+
+    kind = BINARY_KIND_BY_TYPE.get(frame_type)
+    if kind is None:
+        result["error"] = f"unsupported binary frame type: {frame_type}"
+        return result
+
+    try:
+        if kind == "pid":
+            data = _binary_unpack_named_fields("pid", PID_FIELDS, BINARY_PID_FIELD_FORMATS, payload)
+        elif kind == "pidx":
+            loop_id, offset = _unpack_binary_text(payload, 0, "loop_id")
+            loop_name, offset = _unpack_binary_text(payload, offset, "loop_name")
+            data = _binary_unpack_named_fields("pidx", PID_FIELDS, BINARY_PID_FIELD_FORMATS, payload[offset:])
+            data = {"loop_id": loop_id, "loop_name": loop_name, **data}
+        elif kind == "cfg":
+            data = _binary_unpack_named_fields("cfg", CFG_FIELDS, BINARY_CFG_FIELD_FORMATS, payload)
+        else:
+            loop_id, offset = _unpack_binary_text(payload, 0, "loop_id")
+            loop_name, offset = _unpack_binary_text(payload, offset, "loop_name")
+            data = _binary_unpack_named_fields("cfgx", CFGX_FIELDS[2:], BINARY_CFGX_FIELD_FORMATS, payload[offset:])
+            data = {"loop_id": loop_id, "loop_name": loop_name, **data}
+            validation_error = validate_named_numeric_data("cfgx", data)
+            if validation_error is not None:
+                raise ValueError(validation_error)
+    except (KeyError, struct.error, ValueError) as exc:
+        result["kind"] = kind
+        result["transport_seq"] = transport_seq
+        result["flags"] = flags
+        result["error"] = str(exc)
+        return result
+
+    result.update(
+        {
+            "kind": kind,
+            "valid": True,
+            "data": data,
+            "transport_seq": transport_seq,
+            "flags": flags,
+            "error": None,
+        }
+    )
+    return result
+
+
+class BinaryFrameDecoder:
+    """
+    PID AI 二进制流解码器。
+
+    类作用：
+        从串口字节流中增量提取完整二进制帧；能跳过帧头前噪声，也能等待分块输入补齐。
+
+    线程模型：
+        类本身不加锁，调用方应在单个读取线程中使用或自行同步。
+    """
+
+    def __init__(self) -> None:
+        """初始化内部缓冲区。"""
+        self._buffer = bytearray()
+
+    def feed(self, chunk: bytes | bytearray | memoryview) -> list[dict]:
+        """
+        函数作用：
+            向解码器追加一段串口字节并返回已解析出的完整 typed frame。
+
+        主要流程：
+            1. 追加新字节到内部缓冲。
+            2. 查找 magic，丢弃 magic 前噪声。
+            3. 长度不足时等待下一次 feed。
+            4. 长度足够时取出完整帧并调用 parse_binary_frame。
+
+        参数说明：
+            chunk 为新收到的字节块，允许为空。
+
+        返回值：
+            返回本次成功切出的帧列表；坏 CRC 帧也会返回 valid=False 结果，便于统计错误。
+        """
+        if chunk:
+            self._buffer.extend(bytes(chunk))
+
+        frames: list[dict] = []
+        while True:
+            magic_index = self._buffer.find(BINARY_MAGIC)
+            if magic_index < 0:
+                # 保留最后一个可能成为 magic 首字节的 0xA5，避免跨 chunk 帧头被误删。
+                if self._buffer.endswith(BINARY_MAGIC[:1]):
+                    del self._buffer[:-1]
+                else:
+                    self._buffer.clear()
+                break
+            if magic_index > 0:
+                del self._buffer[:magic_index]
+            if len(self._buffer) < BINARY_HEADER_SIZE:
+                break
+
+            payload_length = struct.unpack("<H", self._buffer[9:11])[0]
+            frame_length = BINARY_HEADER_SIZE + payload_length + BINARY_CRC_SIZE
+            if len(self._buffer) < frame_length:
+                break
+
+            raw_frame = bytes(self._buffer[:frame_length])
+            del self._buffer[:frame_length]
+            frames.append(parse_binary_frame(raw_frame))
+
+        return frames
+
+
+class ProtocolStreamDecoder:
+    """
+    PID AI 混合协议流解码器。
+
+    类作用：
+        同一串口流中同时支持旧文本行协议和新增二进制协议。文本帧以换行结束，
+        二进制帧以 magic 和长度字段定位，不要求换行。
+
+    使用说明：
+        读取线程应调用 serial.read(...) 获取字节块，再交给 feed；不要对二进制流使用
+        readline，因为二进制 payload 内可能不包含换行且会阻塞到超时。
+    """
+
+    def __init__(self) -> None:
+        """初始化内部字节缓冲。"""
+        self._buffer = bytearray()
+
+    def feed(self, chunk: bytes | bytearray | memoryview) -> list[dict]:
+        """
+        函数作用：
+            追加串口字节并返回已解析出的文本或二进制 typed frame。
+
+        主要流程：
+            1. 如果缓冲以二进制 magic 开头，按二进制长度切帧。
+            2. 否则等待文本换行；若 magic 出现在换行前，则先解析 magic 前文本片段。
+            3. 文本片段使用 parse_frame，二进制片段使用 parse_binary_frame。
+
+        参数说明：
+            chunk 为串口读取到的新字节块，允许为空。
+
+        返回值：
+            返回本次解析出的 frame 列表，每个 frame 增加 transport 字段。
+        """
+        if chunk:
+            self._buffer.extend(bytes(chunk))
+
+        frames: list[dict] = []
+        while self._buffer:
+            if self._buffer.startswith(BINARY_MAGIC):
+                if len(self._buffer) < BINARY_HEADER_SIZE:
+                    break
+                payload_length = struct.unpack("<H", self._buffer[9:11])[0]
+                frame_length = BINARY_HEADER_SIZE + payload_length + BINARY_CRC_SIZE
+                if len(self._buffer) < frame_length:
+                    break
+                raw_frame = bytes(self._buffer[:frame_length])
+                del self._buffer[:frame_length]
+                frame = parse_binary_frame(raw_frame)
+                frame["transport"] = "binary"
+                frames.append(frame)
+                continue
+
+            magic_index = self._buffer.find(BINARY_MAGIC)
+            newline_index = self._find_text_newline()
+            if newline_index is None:
+                if magic_index > 0:
+                    text_bytes = bytes(self._buffer[:magic_index])
+                    del self._buffer[:magic_index]
+                    self._append_text_frame(frames, text_bytes)
+                    continue
+                break
+
+            if magic_index >= 0 and magic_index < newline_index:
+                text_bytes = bytes(self._buffer[:magic_index])
+                del self._buffer[:magic_index]
+                self._append_text_frame(frames, text_bytes)
+                continue
+
+            line_bytes = bytes(self._buffer[:newline_index])
+            line_end = newline_index + 1
+            if line_end < len(self._buffer) and self._buffer[newline_index] == 0x0D and self._buffer[line_end] == 0x0A:
+                line_end += 1
+            del self._buffer[:line_end]
+            self._append_text_frame(frames, line_bytes)
+
+        return frames
+
+    def _find_text_newline(self) -> int | None:
+        """
+        函数作用：
+            查找当前缓冲中的文本行结束位置。
+
+        主要流程：
+            同时支持 LF 和 CR；返回的是换行符起始下标，不包含换行字节。
+
+        参数说明：
+            无参数，读取内部缓冲。
+
+        返回值：
+            找到时返回下标；没有完整文本行时返回 None。
+        """
+        candidates = [index for index in (self._buffer.find(b"\n"), self._buffer.find(b"\r")) if index >= 0]
+        if not candidates:
+            return None
+        return min(candidates)
+
+    def _append_text_frame(self, frames: list[dict], text_bytes: bytes) -> None:
+        """
+        函数作用：
+            将一段文本字节解析为协议 frame 并追加到输出列表。
+
+        主要流程：
+            空白文本直接忽略；非空文本按 UTF-8 容错解码，再调用 parse_frame。
+
+        参数说明：
+            frames 为本次 feed 的输出列表。
+            text_bytes 为不包含换行符的文本字节。
+
+        返回值：
+            无返回值，直接修改 frames。
+        """
+        line = decode_line(text_bytes)
+        if not line:
+            return
+        frame = parse_frame(line)
+        frame["transport"] = "text"
+        frames.append(frame)
+
+
 def parse_named_numeric_frame(kind: str, prefix: str, fields: list[str], line: str) -> dict:
     """
     函数作用：
@@ -702,6 +1234,54 @@ def line_prefix(line: str) -> str | None:
     return None
 
 
+def frame_scan_prefix(frame: dict[str, Any]) -> str | None:
+    """
+    函数作用：
+        为 scan 子命令把已解析 frame 映射成可统计的协议类别。
+
+    主要流程：
+        文本帧保留原有 `{PID}` 等前缀；二进制帧按 kind 映射为 `{BIN:PID}` 形式，
+        让纯二进制输出的板端也能被自动识别和打分。
+
+    参数说明：
+        frame 为 ProtocolStreamDecoder 或 parse_frame 输出的结构化帧。
+
+    返回值：
+        返回扫描统计用前缀；未知或无效帧返回 None。
+    """
+    if not frame.get("valid"):
+        return None
+    if frame.get("transport") == "binary":
+        kind = str(frame.get("kind", "")).upper()
+        if kind in ("PID", "PIDX", "CFG", "CFGX"):
+            return f"{{BIN:{kind}}}"
+        return "{BIN}"
+
+    raw = str(frame.get("raw", ""))
+    return line_prefix(raw)
+
+
+def score_scan_frame(frame: dict[str, Any], prefix: str) -> int:
+    """
+    函数作用：
+        为自动扫描计算单帧协议匹配分数。
+
+    主要流程：
+        PID/CFG 主帧权重高，其他辅助帧权重低；typed frame 已通过 parser/CRC 时再加分。
+
+    参数说明：
+        frame 为已解析协议帧。
+        prefix 为 frame_scan_prefix 返回的统计类别。
+
+    返回值：
+        返回该帧贡献的扫描分数。
+    """
+    score = 10 if prefix in ("{PID}", "{CFG}", "{BIN:PID}", "{BIN:CFG}") else 4
+    if frame.get("valid"):
+        score += 5
+    return score
+
+
 def open_serial(port: str, baud: int, timeout: float) -> serial.Serial:
     """
     函数作用：
@@ -750,23 +1330,22 @@ def scan_port(port: str, baud: int, sample_seconds: float, max_lines: int) -> Sc
 
     try:
         with open_serial(port, baud, timeout=0.2) as ser:
+            decoder = ProtocolStreamDecoder()
             while time.monotonic() < deadline and len(sample_lines) < max_lines:
-                raw = ser.readline()
+                raw = ser.read(256)
                 if not raw:
                     continue
-                line = decode_line(raw)
-                if not line:
-                    continue
-                sample_lines.append(line)
-                prefix = line_prefix(line)
-                if prefix is None:
-                    continue
-                prefixes[prefix] = prefixes.get(prefix, 0) + 1
-                frames += 1
-                score += 10 if prefix in ("{PID}", "{CFG}") else 4
-                parsed = parse_frame(line)
-                if parsed.get("valid"):
-                    score += 5
+                for parsed in decoder.feed(raw):
+                    prefix = frame_scan_prefix(parsed)
+                    if prefix is None:
+                        continue
+                    raw_sample = str(parsed.get("raw") or f"<binary:{parsed.get('kind')}>")
+                    sample_lines.append(raw_sample)
+                    prefixes[prefix] = prefixes.get(prefix, 0) + 1
+                    frames += 1
+                    score += score_scan_frame(parsed, prefix)
+                    if len(sample_lines) >= max_lines:
+                        break
     except (OSError, serial.SerialException) as exc:
         return ScanResult(port, baud, 0, 0, {}, [], str(exc))
 
@@ -986,23 +1565,23 @@ def cmd_read(args: argparse.Namespace) -> int:
 
     try:
         with open_serial(port, baud, timeout=0.5) as ser:
+            decoder = ProtocolStreamDecoder()
             while True:
                 if deadline is not None and time.monotonic() >= deadline:
                     break
                 if args.count > 0 and count >= args.count:
                     break
-                raw = ser.readline()
+                raw = ser.read(256)
                 if not raw:
                     continue
-                line = decode_line(raw)
-                if not line:
-                    continue
-                parsed = parse_frame(line)
-                if args.known_only and parsed["kind"] == "raw":
-                    continue
-                record = {"port": port, "baud": baud, "time": time.time(), **parsed}
-                print_record(record, args.jsonl)
-                count += 1
+                for parsed in decoder.feed(raw):
+                    if args.known_only and parsed["kind"] == "raw":
+                        continue
+                    record = {"port": port, "baud": baud, "time": time.time(), **parsed}
+                    print_record(record, args.jsonl)
+                    count += 1
+                    if args.count > 0 and count >= args.count:
+                        break
     except KeyboardInterrupt:
         return 130
     except (OSError, serial.SerialException) as exc:
@@ -1447,6 +2026,8 @@ class AutoTuneController:
             "score": score,
             "command": proposal["command"],
             "reason": proposal["reason"],
+            "strategy": proposal["strategy"],
+            "changed_param": proposal["changed_param"],
         }
 
     def score_loop(self, loop_id: str, start_index: int = 0) -> dict[str, float]:
@@ -1455,7 +2036,8 @@ class AutoTuneController:
             计算某个 loop 最近窗口的调参评分指标。
 
         主要流程：
-            从最近样本中统计平均误差、最大误差、过零次数、饱和比例、抗饱和比例、传感器异常比例和综合分。
+            从最近样本中统计平均误差、最大误差、平均有符号误差、过零次数、饱和比例、
+            抗饱和比例、传感器异常比例和综合分。
             当 start_index 大于 0 时，只统计该索引之后的样本，用于 ACK 后效果评估。
 
         参数说明：
@@ -1491,12 +2073,15 @@ class AutoTuneController:
         anti_ratio = sum(1 for sample in samples if int(sample.get("anti_windup", 0)) != 0) / len(samples)
         sensor_bad_ratio = sum(1 for sample in samples if int(sample.get("sensor_ok", 1)) != 1) / len(samples)
         line_lost_count = float(int(self.latest_sens.get("line_lost", 0)) if self.latest_sens else 0)
+        mean_error = sum(errors) / len(errors)
         mean_abs_error = sum(abs_errors) / len(abs_errors)
         max_abs_error = max(abs_errors)
         score = mean_abs_error + 0.25 * max_abs_error + zero_crossings * 2.0
         score += sat_ratio * 20.0 + anti_ratio * 10.0 + sensor_bad_ratio * 100.0 + line_lost_count * 100.0
 
         return {
+            "sample_count": float(len(samples)),
+            "mean_error": mean_error,
             "mean_abs_error": mean_abs_error,
             "max_abs_error": max_abs_error,
             "zero_crossings": float(zero_crossings),
@@ -1537,8 +2122,8 @@ class AutoTuneController:
             基于当前评分和配置生成一次小步 PID 参数修改。
 
         主要流程：
-            默认仅调整 Kp：误差较大且未明显饱和时按 max_step 增大，否则按 max_step 减小。
-            这是保守首版策略，确保每次只改一个 loop 的一组三参数。
+            根据窗口诊断结果选择一个参数小步调整：积分饱和先收 Ki，震荡先增 Kd，
+            稳态同向误差增 Ki，慢响应增 Kp；外环对 Kp 使用更保守步长。
 
         参数说明：
             loop_id 为目标环路。
@@ -1552,25 +2137,106 @@ class AutoTuneController:
         old_ki = float(cfg["ki"])
         old_kd = float(cfg["kd"])
         step = max(0.0, min(float(self.config.max_step), 0.5))
-        if score["sat_ratio"] > 0.2 or score["zero_crossings"] >= 2.0:
-            factor = 1.0 - step
-            reason = "reduce kp due to saturation or oscillation"
+        strategy = self._select_tuning_strategy(loop_id, score)
+        changed_param = str(strategy["changed_param"])
+        factor = float(strategy["factor"])
+        reason = str(strategy["reason"])
+        strategy_name = str(strategy["strategy"])
+
+        new_kp = old_kp
+        new_ki = old_ki
+        new_kd = old_kd
+        if changed_param == "kp":
+            new_kp = max(0.0, old_kp * factor)
+        elif changed_param == "ki":
+            new_ki = max(0.0, old_ki * factor)
         else:
-            factor = 1.0 + step
-            reason = "increase kp to reduce mean error"
-        new_kp = max(0.0, old_kp * factor)
+            new_kd = max(0.0, old_kd * factor)
+
         command = build_set_pidx_command(loop_id, new_kp, old_ki, old_kd)
+        if changed_param != "kp":
+            command = build_set_pidx_command(loop_id, new_kp, new_ki, new_kd)
         metadata = extract_command_metadata(command)
         return {
             **metadata,
             "loop_id": loop_id,
             "phase": "step",
             "old": {"kp": old_kp, "ki": old_ki, "kd": old_kd},
-            "new": {"kp": new_kp, "ki": old_ki, "kd": old_kd},
+            "new": {"kp": new_kp, "ki": new_ki, "kd": new_kd},
             "baseline_score": score,
             "reason": reason,
+            "strategy": strategy_name,
+            "changed_param": changed_param,
             "ack_received": False,
             "sent_at": None,
+        }
+
+    def _select_tuning_strategy(self, loop_id: str, score: dict[str, float]) -> dict[str, Any]:
+        """
+        函数作用：
+            按调参窗口指标选择一次只改一个 PID 参数的策略。
+
+        主要流程：
+            1. 饱和且 anti_windup 频繁触发时优先降低 Ki，避免积分继续推高执行器输出。
+            2. 误差多次过零时优先增加 Kd 做阻尼，不在无饱和场景下直接砍 Kp。
+            3. 同向稳态误差明显且未饱和时增加 Ki，减少长期偏差。
+            4. 其他慢响应场景增加 Kp；外环 Kp 步长减半，避免把循迹外环推得过激。
+
+        参数说明：
+            loop_id 为目标环路，用于识别外环。
+            score 为 score_loop 生成的指标字典。
+
+        返回值：
+            返回包含 strategy、changed_param、factor 和 reason 的字典。
+        """
+        step = max(0.0, min(float(self.config.max_step), 0.5))
+        sat_ratio = float(score.get("sat_ratio", 0.0))
+        anti_ratio = float(score.get("anti_windup_ratio", 0.0))
+        zero_crossings = float(score.get("zero_crossings", 0.0))
+        mean_abs_error = float(score.get("mean_abs_error", 0.0))
+        max_abs_error = float(score.get("max_abs_error", 0.0))
+        mean_error = float(score.get("mean_error", 0.0))
+        steady_bias = abs(mean_error) >= max(0.5, mean_abs_error * 0.70)
+
+        if sat_ratio > 0.20 and anti_ratio > 0.20:
+            return {
+                "strategy": "reduce_ki_for_integral_saturation",
+                "changed_param": "ki",
+                "factor": 1.0 - step,
+                "reason": "reduce ki because output saturation is clamping integral growth",
+            }
+
+        if zero_crossings >= 2.0:
+            return {
+                "strategy": "increase_kd_for_oscillation",
+                "changed_param": "kd",
+                "factor": 1.0 + step,
+                "reason": "increase kd to add damping for oscillation",
+            }
+
+        if (
+            loop_id != "line_outer" and
+            steady_bias and
+            mean_abs_error > 0.0 and
+            sat_ratio <= 0.05 and
+            anti_ratio <= 0.05
+        ):
+            return {
+                "strategy": "increase_ki_for_steady_bias",
+                "changed_param": "ki",
+                "factor": 1.0 + step,
+                "reason": "increase ki to reduce steady bias",
+            }
+
+        kp_step = step * 0.5 if loop_id == "line_outer" else step
+        if max_abs_error > mean_abs_error * 3.0 and mean_abs_error > 0.0:
+            kp_step *= 0.5
+
+        return {
+            "strategy": "increase_kp_for_slow_response",
+            "changed_param": "kp",
+            "factor": 1.0 + kp_step,
+            "reason": "increase kp to improve slow response",
         }
 
     def _evaluate_pending_step(self, now: float, ack_sample_count: int) -> dict[str, Any]:
@@ -1868,6 +2534,7 @@ def cmd_autotune(args: argparse.Namespace) -> int:
 
     try:
         with open_serial(port, baud, timeout=0.5) as ser:
+            decoder = ProtocolStreamDecoder()
             if args.request_config:
                 # GET_ALL_CFG 是只读同步请求，用于让多环板端立即发送 CFGX 配置快照。
                 ser.write(normalize_command("{CMD}GET_ALL_CFG").encode("ascii"))
@@ -1879,7 +2546,7 @@ def cmd_autotune(args: argparse.Namespace) -> int:
                 if args.count > 0 and frame_count >= args.count:
                     break
 
-                raw = ser.readline()
+                raw = ser.read(256)
                 if not raw:
                     # 串口暂时无新帧时仍推进状态机，确保丢 ACK 会按超时进入 ABORT。
                     action = controller.plan_next_action(now=time.monotonic())
@@ -1887,32 +2554,31 @@ def cmd_autotune(args: argparse.Namespace) -> int:
                         print_autotune_action(action, args.jsonl)
                         return 1
                     continue
-                line = decode_line(raw)
-                if not line:
-                    continue
-                parsed = parse_frame(line)
-                frame_count += 1
+                for parsed in decoder.feed(raw):
+                    frame_count += 1
 
-                if parsed.get("kind") in ("ack", "err"):
-                    controller.handle_response(parsed, now=time.monotonic())
-                else:
-                    controller.ingest_frame(parsed)
+                    if parsed.get("kind") in ("ack", "err"):
+                        controller.handle_response(parsed, now=time.monotonic())
+                    else:
+                        controller.ingest_frame(parsed)
 
-                action = controller.plan_next_action(now=time.monotonic())
-                signature = json.dumps(action, sort_keys=True, default=str)
-                if action.get("type") != "wait" and signature != last_printed_action:
-                    print_autotune_action(action, args.jsonl)
-                    last_printed_action = signature
+                    action = controller.plan_next_action(now=time.monotonic())
+                    signature = json.dumps(action, sort_keys=True, default=str)
+                    if action.get("type") != "wait" and signature != last_printed_action:
+                        print_autotune_action(action, args.jsonl)
+                        last_printed_action = signature
 
-                if action.get("type") in ("send", "rollback") and config.auto:
-                    command = normalize_command(str(action["command"]))
-                    ser.write(command.encode("ascii"))
-                    ser.flush()
-                    if not args.jsonl:
-                        print(f"sent\t{command.strip()}", flush=True)
+                    if action.get("type") in ("send", "rollback") and config.auto:
+                        command = normalize_command(str(action["command"]))
+                        ser.write(command.encode("ascii"))
+                        ser.flush()
+                        if not args.jsonl:
+                            print(f"sent\t{command.strip()}", flush=True)
 
-                if action.get("type") == "abort":
-                    return 1
+                    if action.get("type") == "abort":
+                        return 1
+                    if args.count > 0 and frame_count >= args.count:
+                        break
     except KeyboardInterrupt:
         return 130
     except (OSError, serial.SerialException) as exc:

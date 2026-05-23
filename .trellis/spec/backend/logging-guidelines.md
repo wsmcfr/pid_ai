@@ -15,6 +15,7 @@ through deterministic serial protocol frames and state fields:
 | Multi-loop runtime telemetry | `{PIDX}` frame | `PIDAI_ProtocolBuildTelemetryX()` |
 | Configuration snapshot | `{CFG}` frame | `PIDAI_ProtocolBuildConfig()` |
 | Multi-loop configuration snapshot | `{CFGX}` frame | `PIDAI_ProtocolBuildConfigX()` |
+| High-frequency binary telemetry/config | Binary PID/PIDX/CFG/CFGX frame | `src/pid_ai_binary_protocol.c` |
 | Line-car sensor snapshot | `{SENS}` frame | Board application layer |
 | Command success | `{ACK}` frame | `PIDAI_ProtocolBuildAck()` |
 | Command failure | `{ERR}` frame | `PIDAI_ProtocolBuildError()` |
@@ -44,6 +45,26 @@ the purpose instead.
 
 Do not add `printf()` logging to `src/`. Board examples may use `printf()` only
 as a UART stand-in.
+
+### Binary Frame Contract
+
+The optional binary protocol carries the same PID/config meanings as the text
+frames for high-frequency links.
+
+| Field | Contract |
+|---|---|
+| Magic | First two bytes are `0xA5 0x5A`. |
+| Header | `version:u8`, `type:u8`, `flags:u8`, `transport_seq:u32le`, `payload_len:u16le`. |
+| Types | `1=PID`, `2=PIDX`, `3=CFG`, `4=CFGX`. |
+| CRC | CRC-16/CCITT-FALSE, initial `0xFFFF`, polynomial `0x1021`, no reflection, no final xor. It covers header bytes from `version` through payload. |
+| PID payload | Same order as `{PID}`; 23 fields, 92 bytes. |
+| CFG payload | Same order as `{CFG}`; 14 fields, 56 bytes. |
+| PIDX/CFGX text | `loop_id_len:u8 + loop_id + loop_name_len:u8 + loop_name`, followed by the corresponding fixed payload. |
+
+Any binary protocol change must update `include/pid_ai_binary_protocol.h`,
+`src/pid_ai_binary_protocol.c`, `docs/pid_ai_serial_protocol.md`, Python parser
+tests, and C regression tests. The CRC standard vector `123456789 -> 0x29B1`
+must remain covered.
 
 ---
 

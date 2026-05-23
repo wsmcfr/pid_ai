@@ -10,6 +10,7 @@ SCRIPTS_DIR = pathlib.Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from pid_ai_dashboard import DashboardRequestHandler, DashboardState, extract_command_name
+import pid_ai_serial
 
 
 def make_pid_line(seq: int, feedback: float) -> str:
@@ -291,6 +292,31 @@ class DashboardStateTest(unittest.TestCase):
 
         self.assertEqual(snapshot["parse_errors"], 1)
         self.assertEqual(snapshot["loops"]["speed_l"]["latest_pid"]["data"]["feedback"], 88.0)
+
+    def test_binary_pid_bytes_update_same_state_as_text_frame(self) -> None:
+        """
+        函数作用：
+            验证 dashboard 能接收二进制 PID 帧，并像文本 {PID} 一样更新样本和 latest_pid。
+
+        主要流程：
+            1. 用文本测试帧生成 typed data。
+            2. 构造二进制 PID 帧并调用 ingest_bytes。
+            3. 校验样本缓冲和 latest_pid 都被更新。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        state = DashboardState(max_samples=4)
+        parsed = pid_ai_serial.parse_frame(make_pid_line(1, 90.0))
+        binary_frame = pid_ai_serial.build_binary_frame("pid", parsed["data"], transport_seq=10)
+
+        frames = state.ingest_bytes(binary_frame)
+        snapshot = state.snapshot()
+
+        self.assertEqual(len(frames), 1)
+        self.assertTrue(frames[0]["valid"])
+        self.assertEqual(snapshot["latest_pid"]["data"]["seq"], 1)
+        self.assertEqual(snapshot["sample_count"], 1)
 
     def test_status_contains_autotune_scores_and_rollback_history(self) -> None:
         """

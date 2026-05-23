@@ -317,6 +317,171 @@ class PidAiSerialParserTest(unittest.TestCase):
         self.assertFalse(parsed["valid"])
         self.assertIn("unknown status", parsed["error"])
 
+    def test_binary_crc16_uses_ccitt_false_standard_vector(self) -> None:
+        """
+        函数作用：
+            验证 Python 侧二进制协议 CRC 与板端约定的 CRC-16/CCITT-FALSE 一致。
+
+        主要流程：
+            使用标准测试向量 b"123456789"，校验结果为 0x29B1。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        self.assertEqual(pid_ai_serial.binary_crc16(b"123456789"), 0x29B1)
+
+    def test_binary_pid_frame_parses_to_same_typed_data_as_text_pid(self) -> None:
+        """
+        函数作用：
+            验证二进制 {PID} 帧能解析成与文本 {PID} 相同字段名的 typed frame。
+
+        主要流程：
+            1. 先用现有文本 parser 得到协议样例的数据字典。
+            2. 使用测试构建器打包为二进制 PID 帧。
+            3. 调用 parse_binary_frame 校验 kind、transport_seq 和关键字段。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        text_frame = pid_ai_serial.parse_frame(VALID_PID_LINE)
+        binary_frame = pid_ai_serial.build_binary_frame("pid", text_frame["data"], transport_seq=77)
+
+        parsed = pid_ai_serial.parse_binary_frame(binary_frame)
+
+        self.assertTrue(parsed["valid"])
+        self.assertEqual(parsed["kind"], "pid")
+        self.assertEqual(parsed["transport_seq"], 77)
+        self.assertEqual(parsed["data"]["seq"], 1024)
+        self.assertAlmostEqual(parsed["data"]["target"], 1000.0)
+        self.assertEqual(parsed["data"]["fault"], 0)
+
+    def test_binary_frame_rejects_bad_crc(self) -> None:
+        """
+        函数作用：
+            验证二进制帧 CRC 错误时不会被当作有效 typed frame。
+
+        主要流程：
+            构造合法 PID 二进制帧后翻转最后一个 CRC 字节，再调用 parse_binary_frame。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        text_frame = pid_ai_serial.parse_frame(VALID_PID_LINE)
+        binary_frame = bytearray(pid_ai_serial.build_binary_frame("pid", text_frame["data"], transport_seq=77))
+        binary_frame[-1] ^= 0x01
+
+        parsed = pid_ai_serial.parse_binary_frame(bytes(binary_frame))
+
+        self.assertFalse(parsed["valid"])
+        self.assertIn("CRC", parsed["error"])
+
+    def test_binary_cfg_and_cfgx_frames_parse_to_typed_config(self) -> None:
+        """
+        函数作用：
+            验证二进制 CFG/CFGX 配置帧能解析为与文本协议一致的 typed config。
+
+        主要流程：
+            1. 用文本 CFG 和 CFGX 样例生成 data 字典。
+            2. 分别构造二进制配置帧并解析。
+            3. 校验 profile_id、loop_id、kp 和 version 等关键字段。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        cfg = pid_ai_serial.parse_frame(VALID_CFG_LINE)
+        cfgx = pid_ai_serial.parse_frame(VALID_CFGX_LINE)
+
+        parsed_cfg = pid_ai_serial.parse_binary_frame(
+            pid_ai_serial.build_binary_frame("cfg", cfg["data"], transport_seq=80)
+        )
+        parsed_cfgx = pid_ai_serial.parse_binary_frame(
+            pid_ai_serial.build_binary_frame("cfgx", cfgx["data"], transport_seq=81)
+        )
+
+        self.assertTrue(parsed_cfg["valid"])
+        self.assertEqual(parsed_cfg["kind"], "cfg")
+        self.assertEqual(parsed_cfg["data"]["profile_id"], 0)
+        self.assertAlmostEqual(parsed_cfg["data"]["kp"], 1.2)
+        self.assertEqual(parsed_cfg["data"]["version"], 1)
+        self.assertTrue(parsed_cfgx["valid"])
+        self.assertEqual(parsed_cfgx["kind"], "cfgx")
+        self.assertEqual(parsed_cfgx["data"]["loop_id"], "speed_l")
+        self.assertAlmostEqual(parsed_cfgx["data"]["kd"], 0.08)
+        self.assertEqual(parsed_cfgx["data"]["version"], 3)
+
+    def test_binary_stream_decoder_handles_split_frames_and_garbage_prefix(self) -> None:
+        """
+        函数作用：
+            验证二进制流解码器能处理串口分块输入，并能跳过帧头前的噪声字节。
+
+        主要流程：
+            1. 构造合法二进制 PID 帧并在前面插入垃圾字节。
+            2. 分两次 feed 给 BinaryFrameDecoder，第一次不应输出半帧。
+            3. 第二次补齐后应输出一条有效 PID typed frame。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        text_frame = pid_ai_serial.parse_frame(VALID_PID_LINE)
+        binary_frame = b"noise" + pid_ai_serial.build_binary_frame("pid", text_frame["data"], transport_seq=78)
+        decoder = pid_ai_serial.BinaryFrameDecoder()
+
+        self.assertEqual(decoder.feed(binary_frame[:8]), [])
+        frames = decoder.feed(binary_frame[8:])
+
+        self.assertEqual(len(frames), 1)
+        self.assertTrue(frames[0]["valid"])
+        self.assertEqual(frames[0]["kind"], "pid")
+        self.assertEqual(frames[0]["transport_seq"], 78)
+
+    def test_protocol_stream_decoder_handles_text_and_binary_frames(self) -> None:
+        """
+        函数作用：
+            验证混合协议流解码器能同时处理文本行和无换行二进制帧。
+
+        主要流程：
+            1. 构造一条文本 PID 行和一条二进制 PID 帧。
+            2. 分两次 feed，模拟串口任意分块。
+            3. 校验输出顺序保持为文本 PID、二进制 PID。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        text_frame = pid_ai_serial.parse_frame(VALID_PID_LINE)
+        binary_frame = pid_ai_serial.build_binary_frame("pid", text_frame["data"], transport_seq=79)
+        stream = pid_ai_serial.ProtocolStreamDecoder()
+        mixed = (VALID_PID_LINE + "\r\n").encode("ascii") + binary_frame
+
+        self.assertEqual(stream.feed(mixed[:25]), [])
+        frames = stream.feed(mixed[25:])
+
+        self.assertEqual([frame["kind"] for frame in frames], ["pid", "pid"])
+        self.assertEqual(frames[0].get("transport"), "text")
+        self.assertEqual(frames[1].get("transport"), "binary")
+        self.assertEqual(frames[1].get("transport_seq"), 79)
+
+    def test_binary_frames_contribute_to_scan_score(self) -> None:
+        """
+        函数作用：
+            验证自动扫描逻辑会把有效二进制 PID 帧计为协议匹配。
+
+        主要流程：
+            构造二进制 PID 帧并解析，校验 scan 前缀和分数不低于文本主帧。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        text_frame = pid_ai_serial.parse_frame(VALID_PID_LINE)
+        binary_frame = pid_ai_serial.parse_binary_frame(
+            pid_ai_serial.build_binary_frame("pid", text_frame["data"], transport_seq=82)
+        )
+        binary_frame["transport"] = "binary"
+
+        prefix = pid_ai_serial.frame_scan_prefix(binary_frame)
+
+        self.assertEqual(prefix, "{BIN:PID}")
+        self.assertGreaterEqual(pid_ai_serial.score_scan_frame(binary_frame, prefix), 15)
+
 
 class PidAiAutoTuneTest(unittest.TestCase):
     """测试自动调参纯状态机，不依赖真实串口。"""
@@ -366,6 +531,8 @@ class PidAiAutoTuneTest(unittest.TestCase):
         *,
         fault: int = 0,
         line_lost: int = 0,
+        sat: int = 0,
+        anti_windup: int = 0,
         start_ms: int = 10,
         step_ms: int = 10,
     ) -> None:
@@ -382,6 +549,8 @@ class PidAiAutoTuneTest(unittest.TestCase):
             errors 为窗口内误差序列。
             fault 为注入到最后一条 PIDX 的故障位图。
             line_lost 为注入到 SENS 的丢线状态。
+            sat 为每条样本的输出饱和标志，用于触发饱和调参策略。
+            anti_windup 为每条样本的抗饱和标志，用于触发积分收敛策略。
             start_ms 为第一条样本的板端毫秒时间，用于验证按秒裁剪评分窗口。
             step_ms 为相邻样本的板端毫秒间隔。
 
@@ -393,7 +562,8 @@ class PidAiAutoTuneTest(unittest.TestCase):
             line = (
                 f"{{PIDX}}{loop_id},{loop_id},{index},{ms},10.000,100.000,"
                 f"{100.0 - error:.3f},{error:.3f},0.000,0.000,0.000,0.000,0.000,"
-                "0.000,0.000,0.000,0.000,0.000,1000.000,0,0,1,1,1,"
+                "0.000,0.000,0.000,0.000,0.000,1000.000,"
+                f"{sat},{anti_windup},1,1,1,"
                 f"{fault if index == len(errors) else 0}"
             )
             controller.ingest_frame(pid_ai_serial.parse_frame(line))
@@ -651,6 +821,105 @@ class PidAiAutoTuneTest(unittest.TestCase):
 
         self.assertAlmostEqual(score["mean_abs_error"], 2.0)
         self.assertAlmostEqual(score["max_abs_error"], 3.0)
+
+    def test_steady_bias_strategy_increases_ki_without_changing_kp_or_kd(self) -> None:
+        """
+        函数作用：
+            验证长期同向稳态误差会优先小步增加 Ki，而不是继续增加 Kp。
+
+        主要流程：
+            1. 注入 speed_l 配置和无饱和、无过零的稳定偏差窗口。
+            2. 生成自动调参动作。
+            3. 校验策略元数据和 SET_PIDX 参数只增加 Ki。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [6.0, 5.8, 5.6, 5.5], start_ms=1000, step_ms=10)
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["type"], "send")
+        self.assertEqual(action["changed_param"], "ki")
+        self.assertEqual(action["strategy"], "increase_ki_for_steady_bias")
+        self.assertEqual(action["command"], "{CMD}SET_PIDX,speed_l,1.200,0.033,0.080")
+
+    def test_oscillation_strategy_increases_kd_before_reducing_kp(self) -> None:
+        """
+        函数作用：
+            验证误差频繁过零但没有输出饱和时，策略优先增加 Kd 做阻尼。
+
+        主要流程：
+            注入正负交替的 speed_l 误差窗口，生成调参动作后校验只增加 Kd。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [8.0, -7.0, 6.5, -5.5], start_ms=1000, step_ms=10)
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["changed_param"], "kd")
+        self.assertEqual(action["strategy"], "increase_kd_for_oscillation")
+        self.assertEqual(action["command"], "{CMD}SET_PIDX,speed_l,1.200,0.030,0.088")
+
+    def test_saturation_strategy_reduces_ki_when_anti_windup_is_active(self) -> None:
+        """
+        函数作用：
+            验证长期饱和且 anti_windup 触发时，策略优先降低 Ki 防止积分继续推高输出。
+
+        主要流程：
+            注入带上限饱和和抗饱和标志的窗口，生成调参动作后校验只降低 Ki。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(
+            controller,
+            "speed_l",
+            [20.0, 19.0, 18.0, 17.0],
+            sat=1,
+            anti_windup=1,
+            start_ms=1000,
+            step_ms=10,
+        )
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["changed_param"], "ki")
+        self.assertEqual(action["strategy"], "reduce_ki_for_integral_saturation")
+        self.assertEqual(action["command"], "{CMD}SET_PIDX,speed_l,1.200,0.027,0.080")
+
+    def test_outer_loop_uses_more_conservative_kp_step_for_slow_response(self) -> None:
+        """
+        函数作用：
+            验证循迹外环慢响应时仍可增加 Kp，但步长比内环更保守。
+
+        主要流程：
+            1. 将内环和中环标记为已完成，避免串级顺序挡住 line_outer。
+            2. 注入 line_outer 的慢响应误差窗口。
+            3. 校验 Kp 只增加默认步长的一半。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        controller.completed_loops.update({"speed_l", "speed_r", "yaw_rate"})
+        self.ingest_window(controller, "line_outer", [15.0, 14.0, 13.0, 12.0], start_ms=1000, step_ms=10)
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["loop_id"], "line_outer")
+        self.assertEqual(action["changed_param"], "kp")
+        self.assertEqual(action["strategy"], "increase_kp_for_slow_response")
+        self.assertEqual(action["command"], "{CMD}SET_PIDX,line_outer,1.260,0.030,0.080")
 
 
 if __name__ == "__main__":

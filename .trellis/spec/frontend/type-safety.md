@@ -125,6 +125,12 @@ Reject partial/truncated frames instead of filling missing fields with defaults.
 For UI display, keep a parse error counter and optionally show the last bad line
 for debugging.
 
+Binary protocol frames must decode into the same discriminated union as text
+frames. Host parsers must verify `0xA5 0x5A` magic, version, payload length and
+CRC before parsing payload fields. Invalid binary frames must produce
+`valid=False` and must not mutate `latest_pid`, `latest_cfg`, `loops`, command
+history, or auto-tune state.
+
 Numeric parsing must also reject non-finite values such as `nan`, `inf`, and
 `-inf`. Python's `float()` accepts these strings by default, so host parsers must
 explicitly check `math.isfinite()` before marking a typed frame valid. Text

@@ -87,7 +87,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | 3 | `yaw_rate` | 角速度中环 | 依赖左右轮速度环响应 |
 | 4 | `line_outer` | 8 路循迹外环 | 依赖中环和内环已可控 |
 
-自动调参每次只改一个 loop 的 `kp/ki/kd`，默认单步变化不超过 `--max-step 0.10`，下发参数保留三位小数。不要自动放大输出限幅、自动反转方向或自动启用危险手动输出；这些只能作为人工确认项或紧急停机项处理。
+自动调参每次只改一个 loop 的 `kp/ki/kd`，默认单步变化不超过 `--max-step 0.10`，下发参数保留三位小数。策略会在稳态偏差时小步增加 `ki`，震荡时优先增加 `kd`，输出饱和且 `anti_windup` 频繁触发时降低 `ki`，`line_outer` 外环慢响应时用半步 `kp`。不要自动放大输出限幅、自动反转方向或自动启用危险手动输出；这些只能作为人工确认项或紧急停机项处理。
 
 ## 协议帧
 
@@ -96,6 +96,8 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 ```text
 {PID} {PIDX} {CFG} {CFGX} {SENS} {ACK} {ERR} {STAT} {EVT}
 ```
+
+脚本同时支持可选二进制遥测/配置帧。二进制帧以 `0xA5 0x5A` 开头，header 包含 `version/type/flags/transport_seq/payload_len`，末尾使用 CRC-16/CCITT-FALSE；CRC 标准向量 `123456789` 必须为 `0x29B1`。文本帧和二进制帧可以混合出现在同一串口流，解析后进入相同 typed frame 字段。
 
 多环自动调参依赖扩展帧：
 
@@ -192,7 +194,7 @@ POST /api/autotune
 修改本 skill、协议、C 库、parser、dashboard 或测试后，运行：
 
 ```powershell
-gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; if ($LASTEXITCODE -eq 0) { .\tests\test_pid_ai.exe }
+gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c src/pid_ai_binary_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; if ($LASTEXITCODE -eq 0) { .\tests\test_pid_ai.exe }
 python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v
 python -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py
 python C:\Users\caofengrui\.codex\skills\.system\skill-creator\scripts\quick_validate.py .codex\skills\pid-ai-serial

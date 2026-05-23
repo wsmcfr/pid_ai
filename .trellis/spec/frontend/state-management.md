@@ -166,6 +166,18 @@ baseline telemetry cannot dilute or hide a regression. If a valid ACK/ERR arrive
 for a different command or `loop_id` while a step or rollback is pending, abort
 the auto-tune session and surface the mismatched response.
 
+Auto-tune proposals must include explainable strategy metadata:
+
+| Scenario | Required strategy | Parameter |
+|---|---|---|
+| Steady same-sign error, no saturation | `increase_ki_for_steady_bias` | Increase `ki` only. |
+| Frequent zero crossings | `increase_kd_for_oscillation` | Increase `kd` only. |
+| Output saturation with anti-windup | `reduce_ki_for_integral_saturation` | Decrease `ki` only. |
+| Slow response | `increase_kp_for_slow_response` | Increase `kp`; for `line_outer`, use a more conservative half step. |
+
+The public action object should expose `strategy` and `changed_param` so the UI,
+experiment recorder, and operator can audit why a command was proposed.
+
 ---
 
 ## Experiment Recording Contract

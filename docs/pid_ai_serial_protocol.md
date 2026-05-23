@@ -15,7 +15,7 @@
 | 板端上传前缀 | `{PID}`、`{PIDX}`、`{CFG}`、`{CFGX}`、`{SENS}`、`{STAT}`、`{EVT}`、`{ACK}`、`{ERR}` |
 | 上位机命令前缀 | `{CMD}` |
 
-注意：文本协议牺牲了一部分带宽，但换来了可读性和调试便利。第一版推荐先用文本协议跑通 AI 诊断闭环，后续再按相同字段设计二进制协议。
+注意：文本协议牺牲了一部分带宽，但换来了可读性和调试便利。当前推荐先用文本协议调通板端；高频遥测可以使用第 8 节定义的可选二进制协议，字段语义保持一致，并通过 CRC 提升截断/错包检测能力。
 
 命令帧参数数量必须与下表格式精确匹配。参数不足返回 `ARG_MISSING`，参数格式错误或存在多余参数返回 `ARG_INVALID`，多余参数的 `detail` 为 `UNEXPECTED_ARG`。这样可以避免上位机拼接错误被板端静默忽略。
 
@@ -321,7 +321,37 @@
 | `PARAM_RANGE` | 参数越界或上下限非法 |
 | `INTERNAL_ERROR` | 库接口调用失败 |
 
-## 8. AI 调参闭环建议
+## 8. 可选二进制协议和 CRC
+
+二进制协议与文本协议并存，不替换 `{CMD}` / `{ACK}` / `{ERR}` 的确认语义。它主要用于高频 `{PID}` / `{PIDX}` / `{CFG}` / `{CFGX}` 遥测和配置快照，板端和上位机可以在同一串口流中混合发送文本行和二进制帧。
+
+### 8.1 帧格式
+
+| 字段 | 长度 | 端序 | 含义 |
+|---|---:|---|---|
+| `magic` | 2 | 固定 | `0xA5 0x5A` |
+| `version` | 1 | - | 当前为 `1` |
+| `type` | 1 | - | `1=PID`、`2=PIDX`、`3=CFG`、`4=CFGX` |
+| `flags` | 1 | - | 保留，当前为 `0` |
+| `transport_seq` | 4 | little-endian | 二进制传输层序号，用于检测丢包 |
+| `payload_len` | 2 | little-endian | payload 字节数 |
+| `payload` | 可变 | little-endian | 固定字段 payload |
+| `crc16` | 2 | little-endian | CRC-16/CCITT-FALSE |
+
+CRC-16/CCITT-FALSE 参数：初值 `0xFFFF`，多项式 `0x1021`，不反转输入/输出，不做最终异或。CRC 覆盖 `version` 到 `payload` 的所有字节，不覆盖 `magic` 和 `crc16` 自身。标准向量 `123456789` 的 CRC 必须为 `0x29B1`。
+
+### 8.2 Payload 字段
+
+| 类型 | Payload | 字节数 |
+|---|---|---:|
+| `PID` | `{PID}` 的 23 个字段，`seq/ms/fault` 为 `uint32`，`sat/anti_windup/mode/enable/sensor_ok` 为 `int32`，其余为 `float32` | 92 |
+| `PIDX` | `loop_id_len:u8` + `loop_id` + `loop_name_len:u8` + `loop_name` + `PID` payload | 可变 |
+| `CFG` | `{CFG}` 的 14 个字段，`profile_id/reverse/mode/version` 为 `int32`，`fault` 为 `uint32`，其余为 `float32` | 56 |
+| `CFGX` | `loop_id_len:u8` + `loop_id` + `loop_name_len:u8` + `loop_name` + `{CFGX}` 中 `kp` 到 `fault` 的 13 个字段 | 可变 |
+
+文本字段必须为非空 ASCII，且不能包含逗号、回车或换行。二进制接收端必须先校验长度和 CRC，再把 payload 解析为 typed frame；CRC 错误或字段非法时不得覆盖最新有效状态。
+
+## 9. AI 调参闭环建议
 
 | 步骤 | 操作 | 保护要求 |
 |---|---|---|
@@ -333,9 +363,9 @@
 | 6 | 板端回复 `{ACK}` | 没有 ACK 不认为生效 |
 | 7 | 继续观察 `{PID}` | 对比超调、稳定时间和稳态误差 |
 
-串级小车 profile 的默认顺序为 `speed_l`、`speed_r`、`yaw_rate`、`line_outer`。内环没有完成前不要调外环；每次只修改一个 loop 的一组 `kp/ki/kd`，默认最大变化幅度不超过 10%。自动写参必须等待 `{ACK}` 后进入观察窗口，观察评分应按 `window_seconds` 使用本机接收时间或板端 `ms` 裁剪窗口，不能固定取任意样本数。若评分变差则发送旧参数的 `SET_PIDX` 回滚命令；回滚本身也是独立 pending 命令，必须收到匹配 `{ACK}` 后才允许把该 loop 标记完成，回滚 `{ERR}` 或回滚 ACK 超时必须进入停止状态。出现 `fault != 0`、`sensor_ok = 0`、`line_lost = 1`、`{ERR}`、ACK 超时或蓝牙断流时进入停止状态。
+串级小车 profile 的默认顺序为 `speed_l`、`speed_r`、`yaw_rate`、`line_outer`。内环没有完成前不要调外环；每次只修改一个 loop 的一组 `kp/ki/kd`，默认最大变化幅度不超过 10%。自动写参必须等待 `{ACK}` 后进入观察窗口，观察评分应按 `window_seconds` 使用本机接收时间或板端 `ms` 裁剪窗口，不能固定取任意样本数。策略规则：稳态同向误差且未饱和时增加 `ki`；误差频繁过零时增加 `kd`；输出饱和且 `anti_windup` 频繁触发时降低 `ki`；`line_outer` 外环慢响应时使用半步 `kp`，避免外环过激。若评分变差则发送旧参数的 `SET_PIDX` 回滚命令；回滚本身也是独立 pending 命令，必须收到匹配 `{ACK}` 后才允许把该 loop 标记完成，回滚 `{ERR}` 或回滚 ACK 超时必须进入停止状态。出现 `fault != 0`、`sensor_ok = 0`、`line_lost = 1`、`{ERR}`、ACK 超时或蓝牙断流时进入停止状态。
 
-## 9. 上位机字段配置模板
+## 10. 上位机字段配置模板
 
 如果上位机支持用户自定义字段映射，第一版可以内置下面两个模板。
 
@@ -351,7 +381,7 @@ seq,ms,dt_ms,target,feedback,error,d_error,integral,p_out,i_out,d_out,ff_out,out
 profile_id,kp,ki,kd,kf,sample_ms,integral_min,integral_max,out_min,out_max,reverse,mode,version,fault
 ```
 
-## 10. 板端接入注意事项
+## 11. 板端接入注意事项
 
 | 注意事项 | 说明 |
 |---|---|

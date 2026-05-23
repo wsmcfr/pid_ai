@@ -684,6 +684,7 @@ class DashboardState:
         self._next_command_id = 1
         self._loops: dict[str, dict[str, Any]] = {}
         self._experiment_recorder = ExperimentRecorder(experiment_dir, experiment_window_seconds)
+        self._binary_decoder = serial_tool.BinaryFrameDecoder()
 
         # 串口资源字段只由 connect/disconnect 和读取线程修改，必须在锁内访问。
         self._serial_handle: Any | None = None
@@ -801,15 +802,39 @@ class DashboardState:
         """
         text = line.strip()
         parsed = serial_tool.parse_frame(text)
-        now = time.time()
+        return self.ingest_parsed_frame(parsed, raw_hint=text)
+
+    def ingest_parsed_frame(
+        self,
+        parsed: dict[str, Any],
+        now: float | None = None,
+        raw_hint: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        函数作用：
+            接收一条已解析协议 frame，并更新 dashboard 状态。
+
+        主要流程：
+            合法 PID/PIDX 进入样本队列；CFG/CFGX/SENS/STAT/EVT 更新最新快照；
+            ACK/ERR 先关联命令历史再推进自动调参；非法帧只增加解析错误，不污染有效状态。
+
+        参数说明：
+            parsed 为 pid_ai_serial.parse_frame 或 parse_binary_frame 输出的结构化字典。
+            now 为接收时间戳；None 表示使用当前本机时间。
+            raw_hint 为非法帧时写入 last_bad_line 的原始文本；为空时使用 parsed.error/raw。
+
+        返回值：
+            返回写入状态后的帧或样本深拷贝。
+        """
+        receive_time = time.time() if now is None else float(now)
 
         with self._lock:
-            self.last_line_at = now
+            self.last_line_at = receive_time
 
             if parsed.get("kind") in ("pid", "pidx") and parsed.get("valid"):
                 sample = {
                     "id": self._next_sample_id,
-                    "received_at": now,
+                    "received_at": receive_time,
                     **parsed,
                 }
                 self._next_sample_id += 1
@@ -819,55 +844,89 @@ class DashboardState:
                     if loop_id:
                         loop_state = self._loops.setdefault(loop_id, {"latest_pid": None, "latest_cfg": None})
                         loop_state["latest_pid"] = json_safe_copy(sample)
-                        loop_state["updated_at"] = now
-                self._update_autotune_locked(parsed, now)
-                self._experiment_recorder.observe_sample(sample, now)
-                # 一次拷贝同时供 latest_pid 和返回值使用，避免对同一样本调用两次 deepcopy。
+                        loop_state["updated_at"] = receive_time
+                self._update_autotune_locked(parsed, receive_time)
+                self._experiment_recorder.observe_sample(sample, receive_time)
                 copied = json_safe_copy(sample)
                 self.latest_pid = copied
                 return copied
 
             if parsed.get("kind") in ("cfg", "cfgx") and parsed.get("valid"):
-                record = {"received_at": now, **parsed}
+                record = {"received_at": receive_time, **parsed}
                 if parsed.get("kind") == "cfgx":
                     loop_id = str(parsed.get("data", {}).get("loop_id", ""))
                     if loop_id:
                         loop_state = self._loops.setdefault(loop_id, {"latest_pid": None, "latest_cfg": None})
                         loop_state["latest_cfg"] = json_safe_copy(record)
-                        loop_state["updated_at"] = now
-                self._update_autotune_locked(parsed, now)
+                        loop_state["updated_at"] = receive_time
+                self._update_autotune_locked(parsed, receive_time)
                 self.latest_cfg = json_safe_copy(record)
-                self._experiment_recorder.observe_config(record, now)
+                self._experiment_recorder.observe_config(record, receive_time)
                 return json_safe_copy(record)
 
             if parsed.get("kind") == "sens" and parsed.get("valid"):
-                record = {"received_at": now, **parsed}
-                self._update_autotune_locked(parsed, now)
+                record = {"received_at": receive_time, **parsed}
+                self._update_autotune_locked(parsed, receive_time)
                 self.latest_sens = json_safe_copy(record)
                 return json_safe_copy(record)
 
             if parsed.get("kind") == "stat" and parsed.get("valid"):
-                record = {"received_at": now, **parsed}
+                record = {"received_at": receive_time, **parsed}
                 self.latest_stat = json_safe_copy(record)
                 return json_safe_copy(record)
 
             if parsed.get("kind") == "evt" and parsed.get("valid"):
-                record = {"received_at": now, **parsed}
+                record = {"received_at": receive_time, **parsed}
                 self.latest_evt = json_safe_copy(record)
                 return json_safe_copy(record)
 
             if parsed.get("kind") in ("ack", "err") and parsed.get("valid"):
                 # ACK/ERR 先更新命令历史，再推进 auto-tune；否则状态机可能在同一帧中生成
                 # rollback 命令，随后命令历史把当前 ACK 错配到刚记录的 rollback pending。
-                self._attach_command_response_locked(parsed, now)
-                self._update_autotune_locked(parsed, now)
+                self._attach_command_response_locked(parsed, receive_time)
+                self._update_autotune_locked(parsed, receive_time)
                 return json_safe_copy(parsed)
 
-            # 这里不填默认值，因为坏帧可能来自截断或波特率错误，伪造成 0 会误导调参。
-            if text:
+            if raw_hint or parsed.get("raw") or parsed.get("error"):
                 self.parse_errors += 1
-                self.last_bad_line = text
+                self.last_bad_line = raw_hint or str(parsed.get("error") or parsed.get("raw"))
             return json_safe_copy(parsed)
+
+    def ingest_binary_frame(self, parsed: dict[str, Any], now: float | None = None) -> dict[str, Any]:
+        """
+        函数作用：
+            接收一条已解析的二进制 typed frame，并更新 dashboard 状态。
+
+        主要流程：
+            转发到 ingest_parsed_frame，使二进制和文本帧共享完全一致的状态写入路径。
+
+        参数说明：
+            parsed 为 pid_ai_serial.parse_binary_frame 输出的结构化字典。
+            now 为接收时间戳；None 表示使用当前本机时间。
+
+        返回值：
+            返回写入状态后的帧或样本深拷贝。
+        """
+        return self.ingest_parsed_frame(parsed, now=now)
+
+    def ingest_bytes(self, chunk: bytes | bytearray | memoryview) -> list[dict[str, Any]]:
+        """
+        函数作用：
+            接收串口读取到的原始二进制字节块，并把完整二进制帧写入 dashboard 状态。
+
+        主要流程：
+            1. 将 chunk 交给 BinaryFrameDecoder 做帧头查找、长度等待和 CRC 校验。
+            2. 对每条切出的帧调用 ingest_binary_frame。
+            3. 返回本次已处理帧的状态结果，便于测试和调试。
+
+        参数说明：
+            chunk 为串口读取到的一段原始字节。
+
+        返回值：
+            返回本次处理出的帧列表；没有完整帧时返回空列表。
+        """
+        parsed_frames = self._binary_decoder.feed(chunk)
+        return [self.ingest_binary_frame(parsed) for parsed in parsed_frames]
 
     def record_command(self, command: str, reason: str | None = None) -> dict[str, Any]:
         """
@@ -1355,8 +1414,8 @@ class DashboardState:
             后台串口读取循环。
 
         主要流程：
-            循环读取串口行，调用 ingest_line 更新 typed 状态；遇到串口异常时记录
-            connection_error 并切换为断开状态。
+            循环读取串口字节块，使用混合协议 decoder 同时处理文本行和二进制帧；
+            遇到串口异常时记录 connection_error 并切换为断开状态。
 
         参数说明：
             无参数，读取 self._serial_handle。
@@ -1365,18 +1424,18 @@ class DashboardState:
             无返回值，线程退出代表读取结束。
         """
         try:
+            decoder = serial_tool.ProtocolStreamDecoder()
             while not self._stop_event.is_set():
                 with self._lock:
                     serial_handle = self._serial_handle
                 if serial_handle is None:
                     break
 
-                raw = serial_handle.readline()
+                raw = serial_handle.read(256)
                 if not raw:
                     continue
-                line = serial_tool.decode_line(raw)
-                if line:
-                    self.ingest_line(line)
+                for parsed in decoder.feed(raw):
+                    self.ingest_parsed_frame(parsed, raw_hint=str(parsed.get("raw", "")))
         except (OSError, serial_tool.serial.SerialException) as exc:
             with self._lock:
                 self.connection_error = f"Serial read failed: {exc}"

@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "pid_ai.h"
+#include "pid_ai_binary_protocol.h"
 #include "pid_ai_protocol.h"
 
 /* 测试容差，用于比较浮点 PID 计算结果，避免二进制浮点误差造成误判。 */
@@ -660,6 +661,155 @@ static int test_derivative_kick_suppressed(void)
 
 /*
  * 函数作用：
+ *   测试二进制协议使用的 CRC-16/CCITT-FALSE 是否符合标准向量。
+ *
+ * 主要流程：
+ *   1. 使用 ASCII 文本 "123456789" 作为行业通用校验向量。
+ *   2. 调用 PIDAI_BinaryCrc16。
+ *   3. 校验结果等于 0x29B1，避免主机和板端 CRC 实现发生偏移。
+ *
+ * 返回值：
+ *   返回 1 表示 CRC 实现符合约定；返回 0 表示 CRC 多项式、初值或移位方向错误。
+ */
+static int test_binary_crc16_standard_vector(void)
+{
+    const uint8_t data[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+
+    return PIDAI_BinaryCrc16(data, sizeof(data)) == 0x29B1U;
+}
+
+/*
+ * 函数作用：
+ *   测试二进制 {PID} 遥测帧构建后的头部、载荷长度和 CRC 校验。
+ *
+ * 主要流程：
+ *   1. 构造一次有效 PID 运行状态。
+ *   2. 调用 PIDAI_BinaryBuildTelemetry 生成二进制帧。
+ *   3. 校验 magic、版本、帧类型、载荷长度和 CRC。
+ *   4. 调用 PIDAI_BinaryValidateFrame 验证整帧可被接收端接受。
+ *
+ * 返回值：
+ *   返回 1 表示二进制遥测帧格式和 CRC 正确；否则返回 0。
+ */
+static int test_binary_build_pid_frame_with_crc(void)
+{
+    uint8_t frame[160];
+    PIDAI_Handle pid;
+    PIDAI_BinaryFrameInfo info;
+    int written;
+
+    PIDAI_Init(&pid);
+    PIDAI_SetTunings(&pid, 1.0f, 0.2f, 0.1f);
+    PIDAI_SetOutputLimits(&pid, 0.0f, 100.0f);
+    PIDAI_SetTarget(&pid, 10.0f);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&pid, 1);
+    PIDAI_Update(&pid, 7.0f, 40U, 10.0f);
+
+    written = PIDAI_BinaryBuildTelemetry(&pid, frame, sizeof(frame), 77U);
+
+    if (written <= 0) return 0;
+    if (frame[0] != PIDAI_BINARY_MAGIC_0 || frame[1] != PIDAI_BINARY_MAGIC_1) return 0;
+    if (frame[2] != PIDAI_BINARY_VERSION) return 0;
+    if (frame[3] != PIDAI_BINARY_TYPE_PID) return 0;
+    if (PIDAI_BinaryValidateFrame(frame, (size_t)written, &info) != 0) return 0;
+    if (info.type != PIDAI_BINARY_TYPE_PID) return 0;
+    if (info.seq != 77U) return 0;
+    if (info.payload_length != 92U) return 0;
+    if (written != (int)(PIDAI_BINARY_HEADER_SIZE + 92U + PIDAI_BINARY_CRC_SIZE)) return 0;
+
+    /* 任意翻转载荷字节后 CRC 必须拒绝，证明校验覆盖了 header 和 payload。 */
+    frame[PIDAI_BINARY_HEADER_SIZE] ^= 0x01U;
+    if (PIDAI_BinaryValidateFrame(frame, (size_t)written, &info) == 0) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   测试二进制 {CFG} 和 {CFGX} 配置帧的长度、类型和 CRC。
+ *
+ * 主要流程：
+ *   1. 构造单环 PID 配置并打包为 CFG 二进制帧。
+ *   2. 构造多环 route 并打包为 CFGX 二进制帧。
+ *   3. 校验两类帧均能通过 CRC，并使用约定的 payload 长度。
+ *
+ * 返回值：
+ *   返回 1 表示配置二进制帧正确；否则返回 0。
+ */
+static int test_binary_build_config_frames_with_crc(void)
+{
+    uint8_t frame[192];
+    PIDAI_Handle pid;
+    PIDAI_Handle right;
+    PIDAI_LoopRoute routes[2];
+    PIDAI_BinaryFrameInfo info;
+    int written;
+
+    PIDAI_Init(&pid);
+    PIDAI_SetTunings(&pid, 1.2f, 0.03f, 0.08f);
+    PIDAI_SetFeedForward(&pid, 0.01f);
+    PIDAI_SetOutputLimits(&pid, 0.0f, 1000.0f);
+    PIDAI_SetIntegralLimits(&pid, -500.0f, 500.0f);
+
+    written = PIDAI_BinaryBuildConfig(&pid, 3, 9, frame, sizeof(frame), 90U);
+    if (written <= 0) return 0;
+    if (PIDAI_BinaryValidateFrame(frame, (size_t)written, &info) != 0) return 0;
+    if (info.type != PIDAI_BINARY_TYPE_CFG) return 0;
+    if (info.payload_length != 56U) return 0;
+
+    setup_two_loop_routes(&pid, &right, routes);
+    PIDAI_SetTunings(&pid, 1.2f, 0.03f, 0.08f);
+    written = PIDAI_BinaryBuildConfigX(&routes[0], frame, sizeof(frame), 91U);
+    if (written <= 0) return 0;
+    if (PIDAI_BinaryValidateFrame(frame, (size_t)written, &info) != 0) return 0;
+    if (info.type != PIDAI_BINARY_TYPE_CFGX) return 0;
+    if (info.payload_length != (uint16_t)(2U + strlen("speed_l") + strlen("left_speed") + 52U)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   测试二进制多环 {PIDX} 帧会携带 loop_id、loop_name 和 PID payload。
+ *
+ * 主要流程：
+ *   1. 构造 speed_l loop 并执行一次 PID 更新。
+ *   2. 调用 PIDAI_BinaryBuildTelemetryX 生成二进制多环遥测。
+ *   3. 校验接收端能验证 CRC，且载荷长度包含两个长度前缀文本字段和 PID payload。
+ *
+ * 返回值：
+ *   返回 1 表示多环二进制帧基本结构正确；否则返回 0。
+ */
+static int test_binary_build_pidx_frame_contains_loop_identity(void)
+{
+    uint8_t frame[192];
+    PIDAI_Handle left;
+    PIDAI_Handle right;
+    PIDAI_LoopRoute routes[2];
+    PIDAI_BinaryFrameInfo info;
+    int written;
+
+    setup_two_loop_routes(&left, &right, routes);
+    PIDAI_SetTunings(&left, 1.0f, 0.0f, 0.0f);
+    PIDAI_SetOutputLimits(&left, 0.0f, 100.0f);
+    PIDAI_SetMode(&left, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&left, 1);
+    PIDAI_Update(&left, 80.0f, 50U, 10.0f);
+
+    written = PIDAI_BinaryBuildTelemetryX(&routes[0], frame, sizeof(frame), 88U);
+
+    if (written <= 0) return 0;
+    if (PIDAI_BinaryValidateFrame(frame, (size_t)written, &info) != 0) return 0;
+    if (info.type != PIDAI_BINARY_TYPE_PIDX) return 0;
+    if (info.payload_length != (uint16_t)(2U + strlen("speed_l") + strlen("left_speed") + PIDAI_BINARY_PID_PAYLOAD_SIZE)) return 0;
+    if (frame[PIDAI_BINARY_HEADER_SIZE] != (uint8_t)strlen("speed_l")) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
  *   运行所有 PID AI 库的基础测试。
  *
  * 主要流程：
@@ -735,6 +885,22 @@ int main(void)
     }
     if (!test_derivative_kick_suppressed()) {
         printf("FAIL: test_derivative_kick_suppressed\n");
+        return 1;
+    }
+    if (!test_binary_crc16_standard_vector()) {
+        printf("FAIL: test_binary_crc16_standard_vector\n");
+        return 1;
+    }
+    if (!test_binary_build_pid_frame_with_crc()) {
+        printf("FAIL: test_binary_build_pid_frame_with_crc\n");
+        return 1;
+    }
+    if (!test_binary_build_pidx_frame_contains_loop_identity()) {
+        printf("FAIL: test_binary_build_pidx_frame_contains_loop_identity\n");
+        return 1;
+    }
+    if (!test_binary_build_config_frames_with_crc()) {
+        printf("FAIL: test_binary_build_config_frames_with_crc\n");
         return 1;
     }
 
