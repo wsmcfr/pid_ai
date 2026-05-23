@@ -550,6 +550,66 @@ class DashboardStateTest(unittest.TestCase):
         self.assertEqual(handler.payload["autotune"]["profile"], "single-loop")
         self.assertEqual(handler.payload["autotune"]["mode"], "suggest")
 
+    def test_autotune_http_payload_accepts_generic_multi_loop_options(self) -> None:
+        """
+        函数作用：
+            验证 dashboard 自动调参配置可以接收通用多环 profile 和顺序参数。
+
+        主要流程：
+            1. 构造轻量 handler。
+            2. 调用 handle_autotune 并传入 multi-loop、loop_order、conservative_loops 和 line_safety_enabled。
+            3. 校验响应快照保留这些配置，说明 UI/API/状态机使用同一份多环契约。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+
+        class FakeHandler:
+            """
+            类作用：
+                为 handler 单元测试提供最小替身，避免启动真实 HTTPServer。
+            """
+
+            def __init__(self) -> None:
+                """初始化 fake handler 的状态容器。"""
+                self.state = DashboardState(max_samples=4)
+                self.payload = None
+
+            def write_json(self, payload: dict, status=None) -> None:
+                """
+                函数作用：
+                    捕获 handler 准备写出的 JSON 响应。
+
+                参数说明：
+                    payload 为业务方法生成的响应快照。
+                    status 为可选 HTTP 状态码，本测试不使用。
+
+                返回值：
+                    无返回值，只把 payload 存到对象字段中。
+                """
+                self.payload = payload
+
+        handler = FakeHandler()
+
+        DashboardRequestHandler.handle_autotune(
+            handler,
+            {
+                "enabled": True,
+                "mode": "auto-tune",
+                "profile": "multi-loop",
+                "loop_order": "motor_speed,angle,position",
+                "conservative_loops": "position",
+                "line_safety_enabled": False,
+            },
+        )
+
+        self.assertIsNotNone(handler.payload)
+        autotune = handler.payload["autotune"]
+        self.assertEqual(autotune["profile"], "multi-loop")
+        self.assertEqual(autotune["loop_order"], ["motor_speed", "angle", "position"])
+        self.assertEqual(autotune["conservative_loops"], ["position"])
+        self.assertFalse(autotune["line_safety_enabled"])
+
     def test_dashboard_single_loop_autotune_sends_set_pid_from_cfg_and_pid(self) -> None:
         """
         函数作用：

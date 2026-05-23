@@ -60,7 +60,7 @@ There is no server state yet. Serial board state acts like external device state
 | Mode/enable/sensor state | Trust latest `{PID}` or `{CFG}` from board. |
 | Command result | Do not infer success from write completion; require `{ACK}`. |
 | Fault state | Treat `fault != 0` as active until board sends cleared state after `CLEAR_FAULT`. |
-| Line-car sensor state | Trust only the latest valid `{SENS}` frame; parse errors must not clear `line_lost` or sensor fault evidence. |
+| Optional line sensor state | Trust only the latest valid `{SENS}` frame; parse errors must not clear `line_lost` or sensor fault evidence. |
 
 If future host software adds a backend service or local database, keep it separate
 from board-applied state. The board remains the source of truth for active PID
@@ -81,7 +81,7 @@ Derived tuning indicators should be computed from typed samples:
 | Output saturation | `out_raw`, `out_limited`, `sat`, `out_min`, `out_max` |
 | Unsafe tuning window | `sensor_ok`, `fault`, `mode`, `enable` |
 | Multi-loop score | `{PIDX}` window for one `loop_id`: average error, max error, zero crossings, saturation ratio, anti-windup ratio |
-| Line-car safety | `{SENS}.line_lost`, line sensor booleans, `yaw_rate`, wheel speed fields |
+| Optional line safety | `{SENS}.line_lost`, line sensor booleans, `yaw_rate`, wheel speed fields when line safety is enabled |
 
 Do not run AI tuning suggestions on samples where `sensor_ok == 0`, `fault != 0`,
 or the mode/enable state means the controller is not actually controlling.
@@ -142,7 +142,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 
 | Rule | Required behavior |
 |---|---|
-| Cascade order | Tune `speed_l`, then `speed_r`, then `yaw_rate`, then `line_outer`; do not tune outer loops while inner loops are failing. |
+| Multi-loop order | Tune one loop at a time according to configured inner-to-outer `loop_order`; if absent, use the valid `{CFGX}` / `{PIDX}` discovery order. The `line-car-cascade` preset uses `speed_l`, `speed_r`, `yaw_rate`, `line_outer`. |
 | Single-loop mutation | Only one loop and one `kp/ki/kd` tuple may be changed per step. |
 | Step size | Default maximum change is `10%`; command builders format PID numbers with three decimals. |
 | No-op prevention | If the formatted three-decimal `SET_PIDX` command would not change any applied `kp/ki/kd`, abort auto-tune and require a human-provided non-zero seed instead of sending a no-op. |
@@ -153,7 +153,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | ERR/timeout gate | `{ERR}`, ACK timeout, serial disconnect, or mismatched pending command moves the controller to `ABORT`. |
 | Regression rollback | If post-ACK score is worse and rollback is enabled, send old parameters using `SET_PIDX`, append `rollback_history`, and keep the loop pending until the rollback command receives a matching `{ACK}`. |
 | Rollback failure | Rollback `{ERR}` or rollback ACK timeout moves the controller to `ABORT`; do not mark the loop completed. |
-| Safety abort | `fault != 0`, `sensor_ok != 1`, `{SENS}.line_lost == 1`, serial disconnect, or Bluetooth SPP stream loss aborts auto-tune. |
+| Safety abort | `fault != 0`, `sensor_ok != 1`, serial disconnect, or Bluetooth SPP stream loss aborts auto-tune. `{SENS}.line_lost == 1` aborts only when line safety is enabled; `line-car-cascade` enables it by default and generic `multi-loop` leaves it off by default. |
 | Dangerous changes | Auto-tune must not automatically widen output limits, flip reverse direction, or enable manual output. |
 
 Scores are derived state, not board-confirmed state. They can be recomputed from
@@ -180,7 +180,7 @@ Auto-tune proposals must include explainable strategy metadata:
 | Steady same-sign error, no saturation | `increase_ki_for_steady_bias` | Increase `ki` only. |
 | Frequent zero crossings | `increase_kd_for_oscillation` | Increase `kd` only. |
 | Output saturation with anti-windup | `reduce_ki_for_integral_saturation` | Decrease `ki` only. |
-| Slow response | `increase_kp_for_slow_response` | Increase `kp`; for `line_outer`, use a more conservative half step. |
+| Slow response | `increase_kp_for_slow_response` | Increase `kp`; for configured `conservative_loops`, use a more conservative half step. |
 
 The public action object should expose `strategy` and `changed_param` so the UI,
 experiment recorder, and operator can audit why a command was proposed.

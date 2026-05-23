@@ -709,6 +709,44 @@ class PidAiAutoTuneTest(unittest.TestCase):
         )
         return pid_ai_serial.AutoTuneController(config)
 
+    def make_multi_loop_controller(
+        self,
+        *,
+        loop_order: tuple[str, ...] = (),
+        conservative_loops: tuple[str, ...] = (),
+        line_safety_enabled: bool | None = None,
+    ) -> "pid_ai_serial.AutoTuneController":
+        """
+        函数作用：
+            构造通用 multi-loop profile 自动调参控制器。
+
+        主要流程：
+            1. 使用 `{PIDX}` / `{CFGX}` 多环协议路径。
+            2. 允许测试显式注入调参顺序、保守外环和循迹安全开关。
+            3. 保持自动写参和小窗口设置，便于单测直接观察 send/abort 行为。
+
+        参数说明：
+            loop_order 为按内环到外环排列的 loop_id 元组；空元组表示使用发现顺序。
+            conservative_loops 为需要更保守 Kp 步长的 loop_id 元组。
+            line_safety_enabled 为循迹丢线安全开关；None 表示采用 profile 默认值。
+
+        返回值：
+            返回 AutoTuneController 实例。
+        """
+        config = pid_ai_serial.AutoTuneConfig(
+            auto=True,
+            profile="multi-loop",
+            mode="auto-tune",
+            max_step=0.10,
+            window_seconds=0.02,
+            ack_timeout_seconds=0.50,
+            rollback_on_regression=True,
+            loop_order=loop_order,
+            conservative_loops=conservative_loops,
+            line_safety_enabled=line_safety_enabled,
+        )
+        return pid_ai_serial.AutoTuneController(config)
+
     def make_single_loop_controller(self) -> "pid_ai_serial.AutoTuneController":
         """
         函数作用：
@@ -746,6 +784,24 @@ class PidAiAutoTuneTest(unittest.TestCase):
         for loop_id in ["speed_l", "speed_r", "yaw_rate", "line_outer"]:
             line = VALID_CFGX_LINE.replace("speed_l", loop_id, 1).replace("left_speed", loop_id)
             controller.ingest_frame(pid_ai_serial.parse_frame(line))
+
+    def ingest_cfgx(self, controller: "pid_ai_serial.AutoTuneController", loop_id: str) -> None:
+        """
+        函数作用：
+            向自动调参控制器注入指定 loop 的 `{CFGX}` 配置。
+
+        主要流程：
+            复用协议样例，把 loop_id 和 loop_name 替换为测试目标环路，模拟板端同步配置。
+
+        参数说明：
+            controller 为被测自动调参控制器。
+            loop_id 为目标多环 PID 标识。
+
+        返回值：
+            无返回值。
+        """
+        line = VALID_CFGX_LINE.replace("speed_l", loop_id, 1).replace("left_speed", loop_id)
+        controller.ingest_frame(pid_ai_serial.parse_frame(line))
 
     def ingest_window(
         self,
@@ -902,6 +958,147 @@ class PidAiAutoTuneTest(unittest.TestCase):
         self.assertEqual(action["type"], "send")
         self.assertEqual(action["loop_id"], "speed_l")
         self.assertTrue(action["command"].startswith("{CMD}SET_PIDX,speed_l,"))
+
+    def test_multi_loop_profile_uses_configured_loop_order(self) -> None:
+        """
+        函数作用：
+            验证通用多环 profile 会按用户给定顺序先调内环。
+
+        主要流程：
+            1. 创建 multi-loop 控制器，并指定 motor_speed -> angle -> position 顺序。
+            2. 按反向顺序注入配置和遥测，证明选择逻辑不依赖串口到达顺序。
+            3. 校验第一条自动写参命令作用于 motor_speed。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_multi_loop_controller(loop_order=("motor_speed", "angle", "position"))
+        for loop_id in ["position", "angle", "motor_speed"]:
+            self.ingest_cfgx(controller, loop_id)
+            self.ingest_window(controller, loop_id, [12.0, 11.0, 10.0])
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["type"], "send")
+        self.assertEqual(action["loop_id"], "motor_speed")
+        self.assertTrue(action["command"].startswith("{CMD}SET_PIDX,motor_speed,"))
+
+    def test_multi_loop_profile_uses_discovery_order_when_loop_order_is_empty(self) -> None:
+        """
+        函数作用：
+            验证通用多环未显式配置顺序时，使用 CFGX/PIDX 首次发现顺序。
+
+        主要流程：
+            1. 创建不带 loop_order 的 multi-loop 控制器。
+            2. 依次注入 encoder_speed、angle_rate、position 三个环路。
+            3. 校验第一个可调 loop 是最早发现且具备配置和遥测的 encoder_speed。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_multi_loop_controller()
+        for loop_id in ["encoder_speed", "angle_rate", "position"]:
+            self.ingest_cfgx(controller, loop_id)
+            self.ingest_window(controller, loop_id, [9.0, 8.5, 8.0])
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["type"], "send")
+        self.assertEqual(action["loop_id"], "encoder_speed")
+        self.assertTrue(action["command"].startswith("{CMD}SET_PIDX,encoder_speed,"))
+
+    def test_multi_loop_conservative_loop_uses_half_kp_step(self) -> None:
+        """
+        函数作用：
+            验证通用多环可以把任意 loop 标记为保守外环，而不是只识别 line_outer。
+
+        主要流程：
+            1. 创建 multi-loop 控制器，并把 position 标记为 conservative loop。
+            2. 注入 position 的慢响应窗口触发增加 Kp 策略。
+            3. 校验 Kp 从 1.200 半步增加到 1.260，而不是完整 10% 到 1.320。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_multi_loop_controller(
+            loop_order=("position",),
+            conservative_loops=("position",),
+        )
+        self.ingest_cfgx(controller, "position")
+        self.ingest_window(controller, "position", [15.0, 14.0, 13.0, 12.0], start_ms=1000, step_ms=10)
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["type"], "send")
+        self.assertEqual(action["loop_id"], "position")
+        self.assertEqual(action["changed_param"], "kp")
+        self.assertEqual(action["command"], "{CMD}SET_PIDX,position,1.260,0.030,0.080")
+
+    def test_multi_loop_default_line_lost_does_not_abort(self) -> None:
+        """
+        函数作用：
+            验证通用多环默认不会因为 `{SENS}.line_lost` 中止，避免误伤倒立摆或编码器项目。
+
+        主要流程：
+            1. 创建默认 multi-loop 控制器。
+            2. 注入有效配置、遥测和 line_lost=1 的 SENS 帧。
+            3. 校验控制器仍能生成写参动作。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_multi_loop_controller(loop_order=("angle",))
+        self.ingest_cfgx(controller, "angle")
+        self.ingest_window(controller, "angle", [10.0, 9.0, 8.0], line_lost=1)
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["type"], "send")
+        self.assertEqual(action["loop_id"], "angle")
+        self.assertNotEqual(controller.state, "ABORT")
+
+    def test_multi_loop_default_line_lost_does_not_penalize_score(self) -> None:
+        """
+        函数作用：
+            验证通用多环默认关闭 line safety 时，`line_lost` 不参与评分惩罚。
+
+        主要流程：
+            1. 创建默认 multi-loop 控制器并注入 angle 遥测。
+            2. 注入 line_lost=1 的 SENS 帧，模拟非循迹项目复用串口字段或旧传感器状态。
+            3. 校验评分中的 line_lost_count 为 0，避免非循迹调参被循迹安全字段扭曲。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_multi_loop_controller(loop_order=("angle",))
+        self.ingest_cfgx(controller, "angle")
+        self.ingest_window(controller, "angle", [4.0, 3.0, 2.0], line_lost=1)
+
+        score = controller.score_loop("angle")
+
+        self.assertEqual(score["line_lost_count"], 0.0)
+
+    def test_line_car_profile_line_lost_still_aborts(self) -> None:
+        """
+        函数作用：
+            验证旧循迹小车 profile 仍默认启用丢线安全门槛。
+
+        主要流程：
+            1. 创建 line-car-cascade 控制器。
+            2. 注入 speed_l 配置、遥测和 line_lost=1 的 SENS 帧。
+            3. 校验自动调参进入 ABORT，不产生写参命令。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [10.0, 9.0, 8.0], line_lost=1)
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["type"], "abort")
+        self.assertEqual(controller.state, "ABORT")
 
     def test_fault_or_line_lost_aborts_without_sending_command(self) -> None:
         """

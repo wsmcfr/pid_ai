@@ -59,11 +59,13 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port C
 
 ## 自动调参 CLI
 
-单环普通 PID 使用 `single-loop` profile；串级小车使用 `line-car-cascade` profile：
+单环普通 PID 使用 `single-loop` profile；通用多环使用 `multi-loop` profile，并通过 `--loop-order` 按内环到外环指定顺序。`line-car-cascade` 只作为循迹小车兼容预设：
 
 ```powershell
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --profile single-loop --mode observe
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --profile single-loop --mode suggest
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --profile multi-loop --loop-order motor_speed,angle_rate,angle,position --conservative-loops angle,position --mode observe
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --profile multi-loop --loop-order motor_speed,angle_rate,angle,position --conservative-loops angle,position --mode suggest
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode observe
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode suggest
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode auto-tune --max-step 0.10 --window-seconds 2.0 --ack-timeout-seconds 2.0 --min-post-ack-samples 3 --rollback-on-regression
@@ -78,18 +80,18 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 
 任一安全门槛失败、收到 `{ERR}`、ACK 超时、蓝牙断流或用户停止时进入 `ABORT`。`window_seconds` 必须按接收时间或板端 `ms` 裁剪评分窗口；ACK 后至少等待 `--min-post-ack-samples` 条新 `{PID}` 或 `{PIDX}` 样本后才允许 keep/rollback，不能用单个偶然样本决定是否回滚，也不能把固定样本数伪装成秒级窗口。
 
-## 串级 PID 顺序
+## 通用多环顺序
 
-默认 `line-car-cascade` profile 按内环到外环调参：
+多环自动调参不是为某一个场景写死的联合调参算法，而是“按依赖顺序逐个调单环 PID”。`multi-loop` 应显式给出 `--loop-order`，未给时按 `{CFGX}` / `{PIDX}` 首次发现顺序选择已有配置和遥测的 loop。典型顺序示例：
 
-| 顺序 | loop_id | 含义 | 说明 |
-|---:|---|---|---|
-| 1 | `speed_l` | 左轮速度内环 | 内环未稳定时不要调中环或外环 |
-| 2 | `speed_r` | 右轮速度内环 | 每次只修改当前轮的一组 PID 参数 |
-| 3 | `yaw_rate` | 角速度中环 | 依赖左右轮速度环响应 |
-| 4 | `line_outer` | 8 路循迹外环 | 依赖中环和内环已可控 |
+| 场景 | 推荐 loop_order | conservative_loops | 说明 |
+|---|---|---|---|
+| 倒立摆 | `motor_speed,angle_rate,angle,position` | `angle,position` | 先让执行基础可控，再调姿态和位置外环 |
+| 循迹小车 | `speed_l,speed_r,yaw_rate,line_outer` | `line_outer` | 等价于 `line-car-cascade` 预设 |
+| 编码器位置控制 | `velocity,position` | `position` | 速度内环稳定后再调位置环 |
+| 云台/姿态 | `motor_speed,gyro_rate,angle` | `angle` | 角速度环稳定后再调角度环 |
 
-自动调参每次只改一个 `kp/ki/kd` 组，默认单步变化不超过 `--max-step 0.10`，下发参数保留三位小数。`single-loop` 使用 `{PID}` / `{CFG}` 和 `SET_PID`；`line-car-cascade` 使用 `{PIDX}` / `{CFGX}` 和 `SET_PIDX`。策略会在稳态偏差时小步增加 `ki`，震荡时优先增加 `kd`，输出饱和且 `anti_windup` 频繁触发时降低 `ki`，`line_outer` 外环慢响应时用半步 `kp`。如果新旧 `SET_PID` / `SET_PIDX` 按三位小数格式化后完全相同（例如参数全为 0 或过小），必须中止并要求人工先给非零 seed 参数；不要自动猜测硬件种子。不要自动放大输出限幅、自动反转方向或自动启用危险手动输出；这些只能作为人工确认项或紧急停机项处理。
+自动调参每次只改一个 `kp/ki/kd` 组，默认单步变化不超过 `--max-step 0.10`，下发参数保留三位小数。`single-loop` 使用 `{PID}` / `{CFG}` 和 `SET_PID`；`multi-loop` / `line-car-cascade` 使用 `{PIDX}` / `{CFGX}` 和 `SET_PIDX`。策略会在稳态偏差时小步增加 `ki`，震荡时优先增加 `kd`，输出饱和且 `anti_windup` 频繁触发时降低 `ki`，`--conservative-loops` 中的环路慢响应时用半步 `kp`。如果新旧 `SET_PID` / `SET_PIDX` 按三位小数格式化后完全相同（例如参数全为 0 或过小），必须中止并要求人工先给非零 seed 参数；不要自动猜测硬件种子。不要自动放大输出限幅、自动反转方向或自动启用危险手动输出；这些只能作为人工确认项或紧急停机项处理。
 
 ## 协议帧
 
@@ -164,7 +166,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 |---|---|
 | PID fault | 任一当前 loop 的 `fault != 0` |
 | 传感器状态 | 当前 loop 的 `sensor_ok != 1` |
-| 循迹状态 | `{SENS}.line_lost == 1` |
+| 循迹状态 | 启用 line safety 时 `{SENS}.line_lost == 1`；`line-car-cascade` 默认启用，`multi-loop` 默认关闭 |
 | 串口状态 | 断流、端口关闭、蓝牙 SPP 断开或持续无有效帧 |
 | 命令结果 | `{ERR}`、ACK 超时或 pending 命令不匹配 |
 | 用户操作 | dashboard stop、CLI 中断或明确要求 emergency-stop |

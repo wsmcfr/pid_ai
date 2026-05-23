@@ -182,7 +182,7 @@
 |---|---|---|
 | `line0` 到 `line7` | int | 8 路循迹传感器状态，`0/1` |
 | `line_pos` | float | 归一化或应用层定义的线位置 |
-| `line_lost` | int | `1` 表示丢线，自动调参必须停止 |
+| `line_lost` | int | `1` 表示丢线；启用 line safety 时自动调参必须停止 |
 | `yaw` / `yaw_rate` | float | 姿态角和角速度 |
 | `enc_l` / `enc_r` | int | 左右编码器计数 |
 | `v_l` / `v_r` / `v_avg` | float | 左右轮和平均速度 |
@@ -383,7 +383,7 @@ CRC 正确不代表 payload 数值有效。二进制 payload 中的所有 `float
 | 6 | 板端回复 `{ACK}` | 没有 ACK 不认为生效 |
 | 7 | 继续观察 `{PID}` | 对比超调、稳定时间和稳态误差 |
 
-`single-loop` profile 使用旧 `{PID}` / `{CFG}` 帧和 `{CMD}SET_PID,kp,ki,kd` 命令，适合只有一个 PID 控制器的普通项目。`line-car-cascade` profile 使用 `{PIDX}` / `{CFGX}` 和 `SET_PIDX`，默认顺序为 `speed_l`、`speed_r`、`yaw_rate`、`line_outer`。串级内环没有完成前不要调外环；每次只修改一个 loop 的一组 `kp/ki/kd`，默认最大变化幅度不超过 10%。自动写参必须等待 `{ACK}` 后进入观察窗口，观察评分应按 `window_seconds` 使用本机接收时间或板端 `ms` 裁剪窗口，并且默认至少等待 3 条 ACK 后新 `{PID}` 或 `{PIDX}` 样本，不能用单个偶然样本决定 keep/rollback，也不能固定取任意样本数伪装成秒级窗口。策略规则：稳态同向误差且未饱和时增加 `ki`；误差频繁过零时增加 `kd`；输出饱和且 `anti_windup` 频繁触发时降低 `ki`；`line_outer` 外环慢响应时使用半步 `kp`，避免外环过激。若新旧 `SET_PID` / `SET_PIDX` 按三位小数格式化后完全相同，自动调参必须中止并要求人工先给非零 seed 参数，不能发送 no-op 命令。若评分变差则发送旧参数回滚命令；回滚本身也是独立 pending 命令，必须收到匹配 `{ACK}` 后才允许把该环路标记完成，回滚 `{ERR}` 或回滚 ACK 超时必须进入停止状态。出现 `fault != 0`、`sensor_ok = 0`、`line_lost = 1`、`{ERR}`、ACK 超时或蓝牙断流时进入停止状态。
+`single-loop` profile 使用旧 `{PID}` / `{CFG}` 帧和 `{CMD}SET_PID,kp,ki,kd` 命令，适合只有一个 PID 控制器的普通项目。`multi-loop` profile 使用 `{PIDX}` / `{CFGX}` 和 `SET_PIDX`，适合倒立摆、编码器位置控制、云台、循迹车等多环项目；上位机应通过 `loop_order` 按内环到外环给出顺序，例如倒立摆可用 `motor_speed,angle_rate,angle,position`，循迹车可用 `speed_l,speed_r,yaw_rate,line_outer`。`line-car-cascade` profile 是循迹小车兼容预设，默认顺序为 `speed_l`、`speed_r`、`yaw_rate`、`line_outer`，并把 `line_outer` 作为保守外环。串级内环没有完成前不要调外环；每次只修改一个 loop 的一组 `kp/ki/kd`，默认最大变化幅度不超过 10%。自动写参必须等待 `{ACK}` 后进入观察窗口，观察评分应按 `window_seconds` 使用本机接收时间或板端 `ms` 裁剪窗口，并且默认至少等待 3 条 ACK 后新 `{PID}` 或 `{PIDX}` 样本，不能用单个偶然样本决定 keep/rollback，也不能固定取任意样本数伪装成秒级窗口。策略规则：稳态同向误差且未饱和时增加 `ki`；误差频繁过零时增加 `kd`；输出饱和且 `anti_windup` 频繁触发时降低 `ki`；`conservative_loops` 中的环路慢响应时使用半步 `kp`，避免外环过激。若新旧 `SET_PID` / `SET_PIDX` 按三位小数格式化后完全相同，自动调参必须中止并要求人工先给非零 seed 参数，不能发送 no-op 命令。若评分变差则发送旧参数回滚命令；回滚本身也是独立 pending 命令，必须收到匹配 `{ACK}` 后才允许把该环路标记完成，回滚 `{ERR}` 或回滚 ACK 超时必须进入停止状态。出现 `fault != 0`、`sensor_ok = 0`、`{ERR}`、ACK 超时或蓝牙断流时进入停止状态；`{SENS}.line_lost = 1` 只在启用 line safety 时进入停止状态，`line-car-cascade` 默认启用，通用 `multi-loop` 默认关闭。
 
 ## 10. 上位机字段配置模板
 

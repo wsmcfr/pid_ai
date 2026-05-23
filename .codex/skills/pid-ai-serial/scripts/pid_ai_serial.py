@@ -196,10 +196,13 @@ NON_NEGATIVE_INTEGER_FIELDS = {
     "line6",
     "line7",
 }
-CASCADE_PROFILE_ORDER = ("speed_l", "speed_r", "yaw_rate", "line_outer")
 SINGLE_LOOP_PROFILE = "single-loop"
+MULTI_LOOP_PROFILE = "multi-loop"
+LINE_CAR_CASCADE_PROFILE = "line-car-cascade"
 SINGLE_LOOP_ID = "single"
-SUPPORTED_AUTOTUNE_PROFILES = ("line-car-cascade", SINGLE_LOOP_PROFILE)
+LINE_CAR_CASCADE_ORDER = ("speed_l", "speed_r", "yaw_rate", "line_outer")
+LINE_CAR_CONSERVATIVE_LOOPS = ("line_outer",)
+SUPPORTED_AUTOTUNE_PROFILES = (MULTI_LOOP_PROFILE, LINE_CAR_CASCADE_PROFILE, SINGLE_LOOP_PROFILE)
 LOOP_COMMANDS = {
     "SET_PIDX",
     "SET_KFX",
@@ -1729,6 +1732,44 @@ def validate_loop_id(loop_id: str) -> str:
     return parse_text_field("loop_id", loop_id)
 
 
+def parse_loop_id_list(value: str | Iterable[str] | None) -> tuple[str, ...]:
+    """
+    函数作用：
+        把 CLI、dashboard 或测试传入的 loop_id 列表统一解析成安全元组。
+
+    主要流程：
+        1. None 或空字符串表示没有显式配置。
+        2. 字符串按英文逗号拆分；其他可迭代对象逐项读取。
+        3. 每个 loop_id 复用 validate_loop_id，确保后续命令构造和 ACK 匹配只使用安全标识符。
+        4. 保留首次出现顺序并去重，避免重复 loop 造成状态机重复调同一环。
+
+    参数说明：
+        value 为 None、逗号分隔字符串或字符串可迭代对象。
+
+    返回值：
+        返回去重后的 loop_id 元组；非法标识符会抛出 ValueError。
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    else:
+        raw_items = [str(item) for item in value]
+
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_items:
+        item = str(raw_item).strip()
+        if not item:
+            continue
+        loop_id = validate_loop_id(item)
+        if loop_id in seen:
+            continue
+        seen.add(loop_id)
+        parsed.append(loop_id)
+    return tuple(parsed)
+
+
 def build_set_pidx_command(loop_id: str, kp: float, ki: float, kd: float) -> str:
     """
     函数作用：
@@ -1894,16 +1935,34 @@ def response_matches_pending_command(metadata: dict[str, Any], response: dict[st
 
 @dataclass
 class AutoTuneConfig:
-    """自动调参运行配置，全部字段来自 CLI 或 dashboard 显式开关。"""
+    """
+    自动调参运行配置。
+
+    字段说明：
+        auto 表示是否允许状态机自动生成写串口动作。
+        profile 选择协议/预设；single-loop 使用旧单环帧，multi-loop 使用通用分环帧。
+        mode 表示 observe、suggest 或 auto-tune。
+        max_step 是单次 PID 参数变化比例上限。
+        window_seconds 是评分窗口长度，单位秒。
+        ack_timeout_seconds 是等待 ACK/ERR 的超时时间，单位秒。
+        min_post_ack_samples 是 ACK 后至少需要的新遥测样本数。
+        rollback_on_regression 表示评分变差时是否回滚。
+        loop_order 是多环按内环到外环的调参顺序；空值表示按发现顺序。
+        conservative_loops 是需要更保守 Kp 步长的环路集合，通常用于外环。
+        line_safety_enabled 控制 `{SENS}.line_lost` 是否作为中止门槛；None 使用 profile 默认值。
+    """
 
     auto: bool = False
-    profile: str = "line-car-cascade"
+    profile: str = MULTI_LOOP_PROFILE
     mode: str = "observe"
     max_step: float = 0.10
     window_seconds: float = 3.0
     ack_timeout_seconds: float = 2.0
     min_post_ack_samples: int = DEFAULT_MIN_POST_ACK_SAMPLES
     rollback_on_regression: bool = True
+    loop_order: tuple[str, ...] = ()
+    conservative_loops: tuple[str, ...] = ()
+    line_safety_enabled: bool | None = None
 
 
 class AutoTuneController:
@@ -1912,7 +1971,7 @@ class AutoTuneController:
 
     类作用：
         接收已解析的 `{PID}` / `{CFG}` 或 `{PIDX}` / `{CFGX}` / `{SENS}` / `{ACK}` / `{ERR}` 帧，
-        按 single-loop 或 line-car-cascade profile 生成观察、建议、自动发送或回滚动作。
+        按 single-loop、multi-loop 或 line-car-cascade profile 生成观察、建议、自动发送或回滚动作。
         该类不直接读写串口，便于单元测试和 dashboard/CLI 复用。
     """
 
@@ -1922,7 +1981,7 @@ class AutoTuneController:
             初始化自动调参控制器。
 
         主要流程：
-            保存配置、确定串级 loop 顺序、创建配置表/样本表/历史表，并进入 DISCOVER 状态。
+            保存配置、确定单环或多环调参顺序、创建配置表/样本表/历史表，并进入 DISCOVER 状态。
 
         参数说明：
             config 为自动调参配置；auto=False 或 mode 非 auto-tune 时不会自动生成发送动作。
@@ -1934,7 +1993,24 @@ class AutoTuneController:
         if config.profile not in SUPPORTED_AUTOTUNE_PROFILES:
             raise ValueError(f"profile must be one of: {', '.join(SUPPORTED_AUTOTUNE_PROFILES)}")
         self.single_loop = config.profile == SINGLE_LOOP_PROFILE
-        self.loop_order = [SINGLE_LOOP_ID] if self.single_loop else list(CASCADE_PROFILE_ORDER)
+        explicit_order = parse_loop_id_list(config.loop_order)
+        explicit_conservative = parse_loop_id_list(config.conservative_loops)
+        if self.single_loop:
+            # 单环旧协议没有 loop_id；内部固定使用 single 复用多环评分和回滚逻辑。
+            self.loop_order = [SINGLE_LOOP_ID]
+            self.conservative_loops: set[str] = set()
+            self.line_safety_enabled = bool(config.line_safety_enabled) if config.line_safety_enabled is not None else False
+        elif config.profile == LINE_CAR_CASCADE_PROFILE:
+            # 旧循迹小车 profile 保留既有四环顺序和丢线安全，避免破坏已接入项目。
+            self.loop_order = list(explicit_order or LINE_CAR_CASCADE_ORDER)
+            self.conservative_loops = set(explicit_conservative or LINE_CAR_CONSERVATIVE_LOOPS)
+            self.line_safety_enabled = bool(config.line_safety_enabled) if config.line_safety_enabled is not None else True
+        else:
+            # 通用多环不推断硬件拓扑；用户可显式给顺序，未给时使用 CFGX/PIDX 发现顺序。
+            self.loop_order = list(explicit_order)
+            self.conservative_loops = set(explicit_conservative)
+            self.line_safety_enabled = bool(config.line_safety_enabled) if config.line_safety_enabled is not None else False
+        self.discovered_loop_order: list[str] = []
         self.state = "DISCOVER"
         self.loop_configs: dict[str, dict[str, Any]] = {}
         self.samples_by_loop: dict[str, list[dict[str, Any]]] = {}
@@ -1976,6 +2052,7 @@ class AutoTuneController:
 
         if kind == "cfgx":
             loop_id = str(data["loop_id"])
+            self._remember_discovered_loop(loop_id)
             self.loop_configs[loop_id] = dict(data)
             if self.state == "DISCOVER":
                 self.state = "SYNC_CONFIG"
@@ -1987,13 +2064,34 @@ class AutoTuneController:
 
         if kind == "pidx":
             loop_id = str(data["loop_id"])
+            self._remember_discovered_loop(loop_id)
             self._append_pid_sample(loop_id, data, frame)
             return
 
         if kind == "sens":
             self.latest_sens = dict(data)
-            if int(data.get("line_lost", 0)) != 0:
+            if self.line_safety_enabled and int(data.get("line_lost", 0)) != 0:
                 self._abort("line lost")
+
+    def _remember_discovered_loop(self, loop_id: str) -> None:
+        """
+        函数作用：
+            记录多环 `{CFGX}` / `{PIDX}` 首次出现的 loop 顺序。
+
+        主要流程：
+            对已通过 parser 校验的 loop_id 做去重追加；该顺序只在用户没有显式配置
+            loop_order 时作为通用 multi-loop 的保守默认顺序。
+
+        参数说明：
+            loop_id 为已解析并通过安全字符校验的环路 ID。
+
+        返回值：
+            无返回值。
+        """
+        if self.single_loop:
+            return
+        if loop_id not in self.discovered_loop_order:
+            self.discovered_loop_order.append(loop_id)
 
     def handle_response(self, response: dict[str, Any], now: float | None = None) -> None:
         """
@@ -2088,7 +2186,7 @@ class AutoTuneController:
         主要流程：
             1. ABORT 状态只返回 abort。
             2. 存在 pending_step 时先检查 ACK 超时，再按 step/rollback 阶段推进。
-            3. 没有 pending_step 时按 speed_l、speed_r、yaw_rate、line_outer 顺序选第一个可调 loop。
+            3. 没有 pending_step 时按显式 loop_order 或发现顺序选第一个可调 loop。
             4. observe 模式只返回诊断，suggest 模式只返回建议，auto-tune 模式且 auto=True 才返回 send。
 
         参数说明：
@@ -2254,6 +2352,7 @@ class AutoTuneController:
         返回值：
             返回指标字典；score 越低表示效果越好。
         """
+        line_lost_count = self._line_lost_count_for_score()
         samples = self._window_samples(loop_id, start_index=start_index)
         if not samples:
             return {
@@ -2263,7 +2362,7 @@ class AutoTuneController:
                 "sat_ratio": 1.0,
                 "anti_windup_ratio": 1.0,
                 "sensor_bad_ratio": 1.0,
-                "line_lost_count": float(int(self.latest_sens.get("line_lost", 0)) if self.latest_sens else 0),
+                "line_lost_count": line_lost_count,
                 "score": float("inf"),
             }
 
@@ -2279,7 +2378,6 @@ class AutoTuneController:
         sat_ratio = sum(1 for sample in samples if int(sample.get("sat", 0)) != 0) / len(samples)
         anti_ratio = sum(1 for sample in samples if int(sample.get("anti_windup", 0)) != 0) / len(samples)
         sensor_bad_ratio = sum(1 for sample in samples if int(sample.get("sensor_ok", 1)) != 1) / len(samples)
-        line_lost_count = float(int(self.latest_sens.get("line_lost", 0)) if self.latest_sens else 0)
         mean_error = sum(errors) / len(errors)
         mean_abs_error = sum(abs_errors) / len(abs_errors)
         max_abs_error = max(abs_errors)
@@ -2299,6 +2397,25 @@ class AutoTuneController:
             "score": score,
         }
 
+    def _line_lost_count_for_score(self) -> float:
+        """
+        函数作用：
+            根据当前 profile 安全配置返回评分用的循迹丢线惩罚。
+
+        主要流程：
+            只有 line_safety_enabled 为真时，最新有效 `{SENS}.line_lost` 才参与评分；
+            通用 multi-loop 默认关闭该项，避免倒立摆、编码器位置环等非循迹项目被循迹字段误伤。
+
+        参数说明：
+            无参数。
+
+        返回值：
+            返回 0.0 或 1.0；1.0 表示当前安全配置下检测到丢线。
+        """
+        if not self.line_safety_enabled or not self.latest_sens:
+            return 0.0
+        return float(int(self.latest_sens.get("line_lost", 0)))
+
     def _select_next_loop(self) -> str | None:
         """
         函数作用：
@@ -2306,6 +2423,7 @@ class AutoTuneController:
 
         主要流程：
             只选择同时具备配置快照和 PID 样本、且尚未完成的环路；单环 profile 使用虚拟 single 环路。
+            多环显式配置 loop_order 时按配置顺序；未配置时按 CFGX/PIDX 首次发现顺序。
 
         参数说明：
             无参数。
@@ -2313,7 +2431,8 @@ class AutoTuneController:
         返回值：
             返回 loop_id；没有可调 loop 时返回 None。
         """
-        for loop_id in self.loop_order:
+        candidate_order = self.loop_order if self.loop_order else self.discovered_loop_order
+        for loop_id in candidate_order:
             if loop_id in self.completed_loops:
                 continue
             if loop_id not in self.loop_configs:
@@ -2418,11 +2537,11 @@ class AutoTuneController:
         主要流程：
             1. 饱和且 anti_windup 频繁触发时优先降低 Ki，避免积分继续推高执行器输出。
             2. 误差多次过零时优先增加 Kd 做阻尼，不在无饱和场景下直接砍 Kp。
-            3. 同向稳态误差明显且未饱和时增加 Ki，减少长期偏差。
-            4. 其他慢响应场景增加 Kp；外环 Kp 步长减半，避免把循迹外环推得过激。
+            3. 非保守环同向稳态误差明显且未饱和时增加 Ki，减少长期偏差。
+            4. 其他慢响应场景增加 Kp；conservative_loops 中的环路 Kp 步长减半。
 
         参数说明：
-            loop_id 为目标环路，用于识别外环。
+            loop_id 为目标环路，用于判断是否属于保守调参环路。
             score 为 score_loop 生成的指标字典。
 
         返回值：
@@ -2454,7 +2573,7 @@ class AutoTuneController:
             }
 
         if (
-            loop_id != "line_outer" and
+            loop_id not in self.conservative_loops and
             steady_bias and
             mean_abs_error > 0.0 and
             sat_ratio <= 0.05 and
@@ -2467,7 +2586,7 @@ class AutoTuneController:
                 "reason": "increase ki to reduce steady bias",
             }
 
-        kp_step = step * 0.5 if loop_id == "line_outer" else step
+        kp_step = step * 0.5 if loop_id in self.conservative_loops else step
         if max_abs_error > mean_abs_error * 3.0 and mean_abs_error > 0.0:
             kp_step *= 0.5
 
@@ -2773,6 +2892,9 @@ def cmd_autotune(args: argparse.Namespace) -> int:
         ack_timeout_seconds=args.ack_timeout_seconds,
         min_post_ack_samples=args.min_post_ack_samples,
         rollback_on_regression=args.rollback_on_regression,
+        loop_order=parse_loop_id_list(args.loop_order),
+        conservative_loops=parse_loop_id_list(args.conservative_loops),
+        line_safety_enabled=args.line_safety_enabled,
     )
     controller = AutoTuneController(config)
     deadline = time.monotonic() + args.duration if args.duration > 0 else None
@@ -2908,9 +3030,32 @@ def build_parser() -> argparse.ArgumentParser:
     autotune_parser.add_argument("--include-bluetooth", action="store_true", help="Also scan Bluetooth virtual ports in --auto mode.")
     autotune_parser.add_argument(
         "--profile",
-        default="line-car-cascade",
+        default=MULTI_LOOP_PROFILE,
         choices=list(SUPPORTED_AUTOTUNE_PROFILES),
-        help="Auto-tune profile; use single-loop for legacy PID/CFG or line-car-cascade for PIDX/CFGX.",
+        help="Auto-tune profile; use multi-loop for generic PIDX/CFGX, single-loop for legacy PID/CFG, or line-car-cascade preset.",
+    )
+    autotune_parser.add_argument(
+        "--loop-order",
+        default="",
+        help="Comma-separated multi-loop tuning order from inner to outer, for example motor_speed,angle,position.",
+    )
+    autotune_parser.add_argument(
+        "--conservative-loops",
+        default="",
+        help="Comma-separated loop IDs that should use half Kp steps, usually outer loops.",
+    )
+    autotune_parser.add_argument(
+        "--line-safety",
+        dest="line_safety_enabled",
+        action="store_true",
+        default=None,
+        help="Abort auto-tune when a valid SENS frame reports line_lost=1.",
+    )
+    autotune_parser.add_argument(
+        "--no-line-safety",
+        dest="line_safety_enabled",
+        action="store_false",
+        help="Do not use SENS line_lost as an auto-tune abort gate.",
     )
     autotune_parser.add_argument(
         "--mode",
@@ -2945,7 +3090,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="request_config",
         action="store_true",
         default=True,
-        help="Send read-only config request at session start: GET_CFG for single-loop, GET_ALL_CFG for cascade.",
+        help="Send read-only config request at session start: GET_CFG for single-loop, GET_ALL_CFG for multi-loop profiles.",
     )
     autotune_parser.add_argument(
         "--no-request-config",

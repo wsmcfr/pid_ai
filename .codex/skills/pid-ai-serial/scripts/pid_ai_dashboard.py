@@ -711,10 +711,13 @@ class DashboardState:
         self.autotune: dict[str, Any] = {
             "enabled": False,
             "mode": "observe",
-            "profile": "line-car-cascade",
+            "profile": serial_tool.MULTI_LOOP_PROFILE,
             "state": "IDLE",
             "current_loop": None,
             "last_action": None,
+            "loop_order": [],
+            "conservative_loops": [],
+            "line_safety_enabled": False,
         }
         self.scores: dict[str, Any] = {}
         self.rollback_history: list[dict[str, Any]] = []
@@ -1164,12 +1167,15 @@ class DashboardState:
         self,
         enabled: bool,
         mode: str = "observe",
-        profile: str = "line-car-cascade",
+        profile: str = serial_tool.MULTI_LOOP_PROFILE,
         max_step: float = 0.10,
         window_seconds: float = 3.0,
         ack_timeout_seconds: float = 2.0,
         min_post_ack_samples: int = serial_tool.DEFAULT_MIN_POST_ACK_SAMPLES,
         rollback_on_regression: bool = True,
+        loop_order: str | list[str] | tuple[str, ...] | None = None,
+        conservative_loops: str | list[str] | tuple[str, ...] | None = None,
+        line_safety_enabled: bool | None = None,
     ) -> dict[str, Any]:
         """
         函数作用：
@@ -1183,12 +1189,15 @@ class DashboardState:
         参数说明：
             enabled 表示是否启用自动调参状态机。
             mode 为 observe、suggest 或 auto-tune；只有 auto-tune 会自动写命令。
-            profile 为自动调参 profile，single-loop 使用 `{PID}/{CFG}`，line-car-cascade 使用 `{PIDX}/{CFGX}`。
+            profile 为自动调参 profile，single-loop 使用 `{PID}/{CFG}`，multi-loop/line-car-cascade 使用 `{PIDX}/{CFGX}`。
             max_step 为单次参数最大变化比例。
             window_seconds 为评分窗口秒数。
             ack_timeout_seconds 为等待板端 ACK 的最长秒数。
             min_post_ack_samples 为 ACK 后至少等待的新 PID/PIDX 样本数，避免单点噪声决定保留或回滚。
             rollback_on_regression 表示评分变差时是否生成回滚命令。
+            loop_order 为按内环到外环排列的 loop_id 列表；空值表示使用发现顺序或 profile 预设。
+            conservative_loops 为需要半步 Kp 的 loop_id 列表。
+            line_safety_enabled 控制 `{SENS}.line_lost` 是否作为自动调参中止门槛；None 使用 profile 默认值。
 
         返回值：
             返回更新后的 dashboard 快照。
@@ -1196,7 +1205,7 @@ class DashboardState:
         if mode not in ("observe", "suggest", "auto-tune"):
             raise ValueError("mode must be observe, suggest, or auto-tune")
         if profile not in serial_tool.SUPPORTED_AUTOTUNE_PROFILES:
-            raise ValueError("profile must be single-loop or line-car-cascade")
+            raise ValueError("profile must be single-loop, multi-loop, or line-car-cascade")
         if max_step <= 0.0 or max_step > 0.5:
             raise ValueError("max_step must be within 0.0 and 0.5")
         if window_seconds <= 0.0:
@@ -1205,6 +1214,8 @@ class DashboardState:
             raise ValueError("ack_timeout_seconds must be positive")
         if min_post_ack_samples <= 0:
             raise ValueError("min_post_ack_samples must be positive")
+        parsed_loop_order = serial_tool.parse_loop_id_list(loop_order)
+        parsed_conservative_loops = serial_tool.parse_loop_id_list(conservative_loops)
 
         config = serial_tool.AutoTuneConfig(
             auto=bool(enabled and mode == "auto-tune"),
@@ -1215,9 +1226,13 @@ class DashboardState:
             ack_timeout_seconds=ack_timeout_seconds,
             min_post_ack_samples=int(min_post_ack_samples),
             rollback_on_regression=rollback_on_regression,
+            loop_order=parsed_loop_order,
+            conservative_loops=parsed_conservative_loops,
+            line_safety_enabled=line_safety_enabled,
         )
+        controller = serial_tool.AutoTuneController(config)
         with self._lock:
-            self._autotune_controller = serial_tool.AutoTuneController(config)
+            self._autotune_controller = controller
             self.scores = {}
             self.rollback_history = []
             self.autotune = {
@@ -1232,6 +1247,9 @@ class DashboardState:
                 "ack_timeout_seconds": ack_timeout_seconds,
                 "min_post_ack_samples": int(min_post_ack_samples),
                 "rollback_on_regression": bool(rollback_on_regression),
+                "loop_order": list(parsed_loop_order),
+                "conservative_loops": list(parsed_conservative_loops),
+                "line_safety_enabled": bool(controller.line_safety_enabled),
             }
         return self.snapshot()
 
@@ -1964,9 +1982,19 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
             <div class="autotune-controls">
               <label>profile
                 <select id="autotuneProfile">
+                  <option value="multi-loop" selected>multi-loop</option>
                   <option value="single-loop">single-loop</option>
-                  <option value="line-car-cascade" selected>line-car-cascade</option>
+                  <option value="line-car-cascade">line-car-cascade</option>
                 </select>
+              </label>
+              <label>loop_order
+                <input id="autotuneLoopOrder" type="text" placeholder="motor_speed,angle,position" />
+              </label>
+              <label>conservative
+                <input id="autotuneConservativeLoops" type="text" placeholder="position,line_outer" />
+              </label>
+              <label>line_safety
+                <input id="autotuneLineSafety" type="checkbox" />
               </label>
               <label>mode
                 <select id="autotuneMode">
@@ -2445,6 +2473,11 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
       return el(id).value.trim();
     }
 
+    function checked(id) {
+      // checkbox 字段用于传递可选安全门槛，保持布尔值而不是字符串。
+      return Boolean(el(id).checked);
+    }
+
     function fixed(id) {
       const number = Number(value(id));
       if (!Number.isFinite(number)) throw new Error(`${id} 需要数字`);
@@ -2539,7 +2572,10 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
         body: JSON.stringify({
           enabled,
           mode,
-          profile: value("autotuneProfile") || "line-car-cascade",
+          profile: value("autotuneProfile") || "multi-loop",
+          loop_order: value("autotuneLoopOrder"),
+          conservative_loops: value("autotuneConservativeLoops"),
+          line_safety_enabled: checked("autotuneLineSafety") ? true : null,
           max_step: Number(value("autotuneMaxStep")) || 0.10,
           window_seconds: Number(value("autotuneWindow")) || 3.0,
           ack_timeout_seconds: Number(value("autotuneAckTimeout")) || 2.0,
@@ -2829,8 +2865,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             配置 dashboard 内置自动调参状态机。
 
         主要流程：
-            读取 enabled、mode、profile、max_step、window_seconds、ack_timeout_seconds、
-            min_post_ack_samples 和 rollback_on_regression，调用 DashboardState.configure_autotune
+            读取 enabled、mode、profile、loop_order、conservative_loops、line_safety_enabled、
+            max_step、window_seconds、ack_timeout_seconds、min_post_ack_samples 和 rollback_on_regression，
+            调用 DashboardState.configure_autotune
             后返回最新状态快照。
 
         参数说明：
@@ -2842,12 +2879,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         status = self.state.configure_autotune(
             enabled=bool(payload.get("enabled", False)),
             mode=str(payload.get("mode") or "observe"),
-            profile=str(payload.get("profile") or "line-car-cascade"),
+            profile=str(payload.get("profile") or serial_tool.MULTI_LOOP_PROFILE),
             max_step=float(payload.get("max_step") or 0.10),
             window_seconds=float(payload.get("window_seconds") or 3.0),
             ack_timeout_seconds=float(payload.get("ack_timeout_seconds") or 2.0),
             min_post_ack_samples=int(payload.get("min_post_ack_samples") or serial_tool.DEFAULT_MIN_POST_ACK_SAMPLES),
             rollback_on_regression=bool(payload.get("rollback_on_regression", True)),
+            loop_order=payload.get("loop_order"),
+            conservative_loops=payload.get("conservative_loops"),
+            line_safety_enabled=payload.get("line_safety_enabled"),
         )
         self.write_json(status)
 
