@@ -1,6 +1,7 @@
 #include "pid_ai.h"
 
 #include <float.h>
+#include <stdint.h>
 #include <string.h>
 
 /* 参数绝对值上限，用于拦截串口误包导致的离谱 PID 参数。 */
