@@ -484,3 +484,55 @@ telemetry/config protocol, then pushed the feature commit to GitHub.
 ### Next Steps
 
 - None - task complete
+
+
+## Session 10: Session 10 - PID autotune safety hardening
+
+**Date**: 2026-05-23
+**Task**: Session 10 - PID autotune safety hardening
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+本次会话完成 PID 核心控制和 `pid-ai-serial` 自动调参流程的审查加固，并将功能提交推送到 GitHub。
+重点解决运行期非法输入污染遥测、反向控制 D 项符号、ACK 后过早评分、空读 tick 误推进状态机、坏帧触发写参、以及无效 no-op 写参等风险。
+
+### Main Changes
+
+| 模块 | 本次记录内容 |
+|------|--------------|
+| PID 核心安全 | 修复非法 feedback / dt_ms 进入遥测的问题；非法输入时保持遥测有限值、标记故障并触发安全停机；修正 reverse=1 时 D 项方向语义。 |
+| 自动调参状态机 | ACK 后新增 post-ACK 最小样本门槛，避免单个偶然样本触发 keep/rollback；空读 tick 只处理等待和超时，不再创建 phantom pending step。 |
+| 串口与 Dashboard | invalid frame 不推进 proposal/send；新增 no-op SET_PIDX 防护，避免三位小数格式化后参数未变化仍写板；CLI/API/UI 透传 min_post_ack_samples。 |
+| 文档与规范 | 同步 PID 串口协议、Dashboard 文档、Skill 说明和 Trellis backend/frontend 规范，明确 D 项语义、ACK 后样本门槛和自动调参安全边界。 |
+| 测试覆盖 | 新增非法 runtime 输入 finite telemetry、reverse D 项方向、post-ACK 样本门槛、timeout tick、no-op 保护、Dashboard 透传等回归测试。 |
+
+**验证命令**:
+- `python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v` -> 64 tests OK
+- `python -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py` -> exit 0
+- `gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c src/pid_ai_binary_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; if ($LASTEXITCODE -eq 0) { .\tests\test_pid_ai.exe }` -> PASS: all pid_ai tests
+- `python -X utf8 C:\Users\caofengrui\.codex\skills\.system\skill-creator\scripts\quick_validate.py .codex\skills\pid-ai-serial` -> Skill is valid!
+- `git diff --check` -> exit 0，仅 Windows LF/CRLF 提示
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c734967` | (see git log) |
+
+### Testing
+
+- [OK] Python skill 测试：`python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v`，64 tests OK。
+- [OK] Python 脚本语法编译：`python -m py_compile ...`，exit 0。
+- [OK] C 单元测试：`gcc ... tests/test_pid_ai.c ...; .\tests\test_pid_ai.exe`，输出 `PASS: all pid_ai tests`。
+- [OK] Skill 校验：`quick_validate.py .codex\skills\pid-ai-serial`，输出 `Skill is valid!`。
+- [OK] Diff 空白检查：`git diff --check`，exit 0，仅 Windows LF/CRLF 提示。
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
