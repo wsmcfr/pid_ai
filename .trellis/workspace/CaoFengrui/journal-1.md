@@ -644,3 +644,50 @@ without a battery-voltage sampling channel.
 ### Next Steps
 
 - None - task complete
+
+
+## Session 13: Session 13 - Code Review Fixes
+
+**Date**: 2026-05-23
+**Task**: Session 13 - Code Review Fixes
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| 修复项 | 说明 |
+|--------|------|
+| D 项首帧尖峰 | `PIDAI_Update` 首次调用（seq==1）时跳过 D 项计算，将 `last_feedback` 初始化为当前 feedback，消除执行器抖动 |
+| 死代码删除 | 删除 `plan_next_action` 和 `plan_timeout_action` 中 rollback+ack_received=True 的不可达分支 |
+| 重复验证 | 删除 `parse_binary_frame` cfgx 分支中重复的 `validate_named_numeric_data` 调用 |
+| 窗口回退标记 | `_window_samples` 改为返回 `(samples, window_fallback)` 元组，`score_loop` 暴露 `window_fallback` 字段 |
+| 哨兵值 | `PIDAI_TRAILING_EMPTY_TOKEN` 由 `(char*)1` 改为静态字符数组地址，消除严格别名警告 |
+| 文档 | SKILL.md 补充 4 条未记录命令；说明 `sample_ms` 与 C 库 `dt_ms` 对应关系 |
+
+**修改文件**:
+- `src/pid_ai.c`
+- `src/pid_ai_protocol.c`
+- `.codex/skills/pid-ai-serial/scripts/pid_ai_serial.py`
+- `.codex/skills/pid-ai-serial/SKILL.md`
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `388be70` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
