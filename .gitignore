@@ -24,6 +24,9 @@ Desktop.ini
 __pycache__/
 *.pyc
 
+# Dashboard 实验记录是本地采集数据，默认保存在仓库根目录但不应提交。
+experiments/
+
 # C/C++ 编译产物。
 *.exe
 *.obj

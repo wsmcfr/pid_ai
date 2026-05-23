@@ -1,6 +1,8 @@
 import pathlib
 import sys
+import tempfile
 import unittest
+import json
 
 
 # 测试脚本目录，用于把 skill 自带的 scripts 目录加入导入路径。
@@ -308,6 +310,84 @@ class DashboardStateTest(unittest.TestCase):
         self.assertFalse(snapshot["autotune"]["enabled"])
         self.assertEqual(snapshot["scores"], {})
         self.assertEqual(snapshot["rollback_history"], [])
+
+    def test_experiment_record_is_saved_for_acknowledged_pidx_change(self) -> None:
+        """
+        函数作用：
+            验证 dashboard 会把一次已 ACK 的分环参数修改保存为实验记录文件。
+
+        主要流程：
+            1. 使用临时目录创建启用实验记录的 DashboardState。
+            2. 注入改参前的 CFGX 和 PIDX 样本，作为参数快照和前置曲线。
+            3. 记录 SET_PIDX 命令并注入 ACK，模拟板端确认参数已生效。
+            4. 注入 ACK 后的新 PIDX 样本，触发后置曲线窗口保存。
+            5. 读取实验 JSON，校验命令、ACK、前后样本和配置快照都已落盘。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = DashboardState(
+                max_samples=8,
+                experiment_dir=pathlib.Path(temp_dir),
+                experiment_window_seconds=0.2,
+            )
+
+            state.ingest_line(make_cfgx_line("speed_l", 1.0))
+            state.ingest_line(make_pidx_line("speed_l", 1, 80.0))
+            state.ingest_line(make_pidx_line("speed_l", 2, 82.0))
+            state.record_command("{CMD}SET_PIDX,speed_l,1.200,0.030,0.080", reason="manual tune")
+            state.ingest_line("{ACK}SET_PIDX,speed_l,OK")
+            state.ingest_line(make_pidx_line("speed_l", 3, 91.0))
+            state.ingest_line(make_pidx_line("speed_l", 4, 95.0))
+
+            snapshot = state.snapshot()
+            files = sorted(pathlib.Path(temp_dir).glob("*.json"))
+
+            self.assertEqual(len(files), 1)
+            self.assertEqual(snapshot["experiment_recording"]["record_count"], 1)
+            self.assertEqual(snapshot["experiment_recording"]["latest_record"]["status"], "ack")
+
+            record = json.loads(files[0].read_text(encoding="utf-8"))
+
+            self.assertEqual(record["command"]["command_name"], "SET_PIDX")
+            self.assertEqual(record["command"]["loop_id"], "speed_l")
+            self.assertEqual(record["command"]["reason"], "manual tune")
+            self.assertEqual(record["result"]["status"], "ack")
+            self.assertEqual(record["response"]["detail"], "OK")
+            self.assertAlmostEqual(record["before_config"]["data"]["kp"], 1.0)
+            self.assertEqual([sample["data"]["seq"] for sample in record["before_samples"]], [1, 2])
+            self.assertEqual([sample["data"]["seq"] for sample in record["after_samples"]], [3, 4])
+            self.assertIn("before_score", record["result"])
+            self.assertIn("after_score", record["result"])
+
+    def test_experiment_record_preserves_local_send_error(self) -> None:
+        """
+        函数作用：
+            验证串口未连接导致的本地发送失败也会写入实验记录。
+
+        主要流程：
+            1. 使用临时目录创建启用实验记录的 DashboardState。
+            2. 在未连接串口时调用 send_command 发送 SET_PID。
+            3. 读取实验 JSON，校验状态为 error 且响应类型为 local_error。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = DashboardState(max_samples=4, experiment_dir=pathlib.Path(temp_dir))
+
+            entry = state.send_command("{CMD}SET_PID,1.200,0.030,0.080", reason="manual tune")
+            files = sorted(pathlib.Path(temp_dir).glob("*.json"))
+
+            self.assertEqual(entry["status"], "error")
+            self.assertEqual(len(files), 1)
+
+            record = json.loads(files[0].read_text(encoding="utf-8"))
+
+            self.assertEqual(record["result"]["status"], "error")
+            self.assertEqual(record["response"]["kind"], "local_error")
+            self.assertIn("not connected", record["response"]["detail"])
 
     def test_autotune_http_payload_preserves_ack_timeout(self) -> None:
         """

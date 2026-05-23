@@ -30,6 +30,7 @@ from collections import deque
 from dataclasses import asdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -40,6 +41,32 @@ DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8765
 DEFAULT_MAX_SAMPLES = 1200
 DEFAULT_COMMAND_HISTORY = 120
+DEFAULT_EXPERIMENT_DIR = "experiments"
+DEFAULT_EXPERIMENT_WINDOW_SECONDS = 3.0
+
+# 这些命令会改变控制行为或运行参数，收到 ACK/ERR 后需要形成实验记录。
+EXPERIMENT_RECORD_COMMANDS = {
+    "SET_PID",
+    "SET_PIDX",
+    "SET_KF",
+    "SET_KFX",
+    "SET_TARGET",
+    "SET_TARGETX",
+    "SET_OUT_LIMIT",
+    "SET_OUT_LIMITX",
+    "SET_I_LIMIT",
+    "SET_I_LIMITX",
+    "SET_MODE",
+    "SET_MANUAL_OUT",
+    "ENABLE",
+    "ENABLEX",
+    "SET_REVERSE",
+    "SET_SENSOR_OK",
+    "RESET_I",
+    "RESET_IX",
+    "RESET",
+    "CLEAR_FAULT",
+}
 
 
 def json_safe_copy(value: Any) -> Any:
@@ -106,6 +133,515 @@ def make_local_response(kind: str, command_name: str, detail: str) -> dict[str, 
     }
 
 
+def sanitize_filename_part(value: str) -> str:
+    """
+    函数作用：
+        将命令名、loop_id 等短文本转换为可安全放入文件名的片段。
+
+    主要流程：
+        逐字符保留 ASCII 字母、数字、下划线、连字符和点号；其他字符替换为下划线。
+        如果输入为空，则返回 `none`，避免生成空文件名片段。
+
+    参数说明：
+        value 为待转换文本，通常来自已校验的命令元数据。
+
+    返回值：
+        返回安全文件名片段，不包含路径分隔符。
+    """
+    safe = "".join(
+        char if (char.isascii() and (char.isalnum() or char in ("_", "-", "."))) else "_"
+        for char in str(value)
+    )
+    return safe or "none"
+
+
+def score_experiment_samples(samples: list[dict[str, Any]]) -> dict[str, float] | None:
+    """
+    函数作用：
+        为实验记录中的曲线窗口计算基础质量指标。
+
+    主要流程：
+        从 typed `{PID}` / `{PIDX}` 样本的 `data` 中读取 error、sat、anti_windup 和
+        sensor_ok，统计平均绝对误差、最大绝对误差、安全比例和综合分。这里的分数用于
+        人工对比，不替代 AutoTuneController 的 ACK 后决策逻辑。
+
+    参数说明：
+        samples 为实验窗口内的样本列表；允许为空。
+
+    返回值：
+        有样本时返回指标字典；无样本时返回 None。
+    """
+    if not samples:
+        return None
+
+    errors = [float(sample.get("data", {}).get("error", 0.0)) for sample in samples]
+    abs_errors = [abs(error) for error in errors]
+    sat_ratio = sum(1 for sample in samples if int(sample.get("data", {}).get("sat", 0)) != 0) / len(samples)
+    anti_ratio = (
+        sum(1 for sample in samples if int(sample.get("data", {}).get("anti_windup", 0)) != 0) / len(samples)
+    )
+    sensor_bad_ratio = (
+        sum(1 for sample in samples if int(sample.get("data", {}).get("sensor_ok", 1)) != 1) / len(samples)
+    )
+    mean_abs_error = sum(abs_errors) / len(abs_errors)
+    max_abs_error = max(abs_errors)
+    score = mean_abs_error + 0.25 * max_abs_error + sat_ratio * 20.0 + anti_ratio * 10.0
+    score += sensor_bad_ratio * 100.0
+
+    return {
+        "sample_count": float(len(samples)),
+        "mean_abs_error": mean_abs_error,
+        "max_abs_error": max_abs_error,
+        "sat_ratio": sat_ratio,
+        "anti_windup_ratio": anti_ratio,
+        "sensor_bad_ratio": sensor_bad_ratio,
+        "score": score,
+    }
+
+
+class ExperimentRecorder:
+    """
+    参数修改实验记录器。
+
+    类作用：
+        把一次 `{CMD}` 参数修改事务转成可回放的 JSON 文件，记录 ACK/ERR、改参前曲线、
+        ACK 后曲线、配置快照和基础评分。该类不直接解析串口文本，只消费 DashboardState
+        已验证的 typed 状态，避免落盘逻辑重复实现协议解析。
+
+    线程模型：
+        DashboardState 在持有自身 RLock 时调用本类方法，因此本类内部不再加锁。文件写入
+        失败只记录错误摘要，不影响串口读取和命令 ACK 处理。
+    """
+
+    def __init__(self, directory: str | Path | None, window_seconds: float):
+        """
+        函数作用：
+            初始化实验记录器。
+
+        主要流程：
+            保存根目录、窗口秒数和内存索引。directory 为 None 时关闭落盘，但仍能返回
+            disabled 摘要，便于单元测试构造纯内存状态对象。
+
+        参数说明：
+            directory 为实验 JSON 输出目录；None 表示禁用记录。
+            window_seconds 为每次改参前后各截取的曲线窗口长度，单位秒。
+
+        返回值：
+            构造函数无显式返回值。
+        """
+        self.directory = Path(directory) if directory is not None else None
+        self.window_seconds = max(float(window_seconds), 0.001)
+        self._records_by_command_id: dict[int, dict[str, Any]] = {}
+        self._paths_by_command_id: dict[int, Path] = {}
+        self._latest_summary: dict[str, Any] | None = None
+        self._record_count = 0
+        self._write_errors: list[str] = []
+
+    def snapshot(self) -> dict[str, Any]:
+        """
+        函数作用：
+            返回实验记录功能摘要，供 `/api/status` 展示。
+
+        主要流程：
+            复制启用状态、目录、窗口秒数、记录数量、最近记录摘要和最近写入错误。
+
+        参数说明：
+            无参数。
+
+        返回值：
+            返回 JSON 兼容字典。
+        """
+        return {
+            "enabled": self.directory is not None,
+            "directory": str(self.directory) if self.directory is not None else None,
+            "window_seconds": self.window_seconds,
+            "record_count": self._record_count,
+            "latest_record": json_safe_copy(self._latest_summary),
+            "write_errors": json_safe_copy(self._write_errors[-5:]),
+        }
+
+    def start_command(
+        self,
+        entry: dict[str, Any],
+        samples: list[dict[str, Any]],
+        loops: dict[str, dict[str, Any]],
+        latest_cfg: dict[str, Any] | None,
+        now: float,
+    ) -> None:
+        """
+        函数作用：
+            在命令进入 pending 历史时创建实验记录草稿。
+
+        主要流程：
+            1. 只处理会改变控制行为的命令。
+            2. 根据 loop_id 选择同环路的前置样本窗口。
+            3. 保存当前 CFG/CFGX 作为改参前配置快照。
+            4. 立即写入 pending JSON，防止后续异常导致事务完全丢失。
+
+        参数说明：
+            entry 为 command_history 中的新命令条目。
+            samples 为当前有界遥测样本快照。
+            loops 为多环状态表，用于读取对应 loop 的 CFGX。
+            latest_cfg 为单环最新 CFG。
+            now 为命令创建时间戳。
+
+        返回值：
+            无返回值；内部索引和文件会被更新。
+        """
+        if self.directory is None:
+            return
+
+        command_name = str(entry.get("command_name", "")).upper()
+        if command_name not in EXPERIMENT_RECORD_COMMANDS:
+            return
+
+        loop_id = entry.get("loop_id")
+        before_samples = self._select_window_samples(samples, loop_id, now)
+        before_config = self._select_config(loop_id, loops, latest_cfg)
+        record_id = self._make_record_id(entry, now)
+        record = {
+            "schema_version": 1,
+            "record_id": record_id,
+            "created_at": now,
+            "updated_at": now,
+            "window_seconds": self.window_seconds,
+            "status": "pending",
+            "command": {
+                "id": entry.get("id"),
+                "command": entry.get("command"),
+                "command_name": command_name,
+                "loop_id": loop_id,
+                "reason": entry.get("reason"),
+                "created_at": entry.get("created_at"),
+            },
+            "response": None,
+            "before_config": json_safe_copy(before_config),
+            "after_config": None,
+            "before_samples": before_samples,
+            "after_samples": [],
+            "result": {
+                "status": "pending",
+                "before_score": score_experiment_samples(before_samples),
+                "after_score": None,
+            },
+        }
+        command_id = int(entry["id"])
+        self._records_by_command_id[command_id] = record
+        self._paths_by_command_id[command_id] = self.directory / f"{record_id}.json"
+        self._record_count += 1
+        self._write_record(command_id)
+
+    def attach_response(self, entry: dict[str, Any], response: dict[str, Any], now: float) -> None:
+        """
+        函数作用：
+            把 ACK/ERR 响应写入对应实验记录。
+
+        主要流程：
+            查找命令 id 对应的记录；ACK 表示参数已被板端接受，ERR 表示本次修改失败。
+            两者都会更新 result.status 并立即落盘。
+
+        参数说明：
+            entry 为已更新响应的命令历史条目。
+            response 为解析后的 ACK/ERR 帧。
+            now 为收到响应的本机时间戳。
+
+        返回值：
+            无返回值。
+        """
+        record = self._records_by_command_id.get(int(entry["id"]))
+        if record is None:
+            return
+
+        status = str(entry.get("status", response.get("kind", "unknown")))
+        record["updated_at"] = now
+        record["status"] = status
+        record["response"] = json_safe_copy(response)
+        record["result"]["status"] = status
+        if status == "ack":
+            record["ack_at"] = now
+        self._write_record(int(entry["id"]))
+
+    def attach_local_error(self, entry: dict[str, Any], detail: str, now: float) -> None:
+        """
+        函数作用：
+            将串口未连接或本地写入失败写入实验记录。
+
+        主要流程：
+            本地错误不是板端 ERR，但仍属于一次失败的参数修改尝试，必须保留原因供排查。
+
+        参数说明：
+            entry 为命令历史条目。
+            detail 为本地错误说明。
+            now 为错误发生时间戳。
+
+        返回值：
+            无返回值。
+        """
+        record = self._records_by_command_id.get(int(entry["id"]))
+        if record is None:
+            return
+
+        record["updated_at"] = now
+        record["status"] = "error"
+        record["response"] = make_local_response("local_error", str(entry.get("command_name", "")), detail)
+        record["result"]["status"] = "error"
+        self._write_record(int(entry["id"]))
+
+    def observe_sample(self, sample: dict[str, Any], now: float) -> None:
+        """
+        函数作用：
+            将 ACK 后的新遥测样本追加到仍处于后置窗口内的实验记录。
+
+        主要流程：
+            只处理已 ACK 的记录；按 loop_id 过滤样本；超过 ACK 后窗口的样本不再写入。
+            每次追加后重新计算 after_score 并落盘，使断电或进程退出前已有数据不会丢失。
+
+        参数说明：
+            sample 为 DashboardState 已验证并保存的 PID/PIDX 样本。
+            now 为样本接收时间戳。
+
+        返回值：
+            无返回值。
+        """
+        for command_id, record in list(self._records_by_command_id.items()):
+            if record.get("status") != "ack":
+                continue
+            ack_at = record.get("ack_at")
+            if not isinstance(ack_at, (int, float)):
+                continue
+            if now - float(ack_at) > self.window_seconds:
+                continue
+            if not self._sample_matches_loop(sample, record.get("command", {}).get("loop_id")):
+                continue
+
+            record["after_samples"].append(json_safe_copy(sample))
+            record["updated_at"] = now
+            record["result"]["after_score"] = score_experiment_samples(record["after_samples"])
+            self._write_record(command_id)
+
+    def observe_config(self, config_record: dict[str, Any], now: float) -> None:
+        """
+        函数作用：
+            在 ACK 后收到新的 CFG/CFGX 时更新实验记录的 after_config。
+
+        主要流程：
+            只更新已 ACK 且仍在后置窗口内的记录；分环命令要求 CFGX 的 loop_id 匹配。
+
+        参数说明：
+            config_record 为 DashboardState 保存的 CFG/CFGX 记录。
+            now 为配置帧接收时间戳。
+
+        返回值：
+            无返回值。
+        """
+        for command_id, record in list(self._records_by_command_id.items()):
+            if record.get("status") != "ack":
+                continue
+            ack_at = record.get("ack_at")
+            if not isinstance(ack_at, (int, float)):
+                continue
+            if now - float(ack_at) > self.window_seconds:
+                continue
+            if not self._config_matches_loop(config_record, record.get("command", {}).get("loop_id")):
+                continue
+
+            record["after_config"] = json_safe_copy(config_record)
+            record["updated_at"] = now
+            self._write_record(command_id)
+
+    def attach_autotune_action(self, command_id: int | None, action: dict[str, Any], now: float) -> None:
+        """
+        函数作用：
+            把自动调参 keep/rollback 决策补充进对应实验记录。
+
+        主要流程：
+            使用 dashboard 保存的 last_sent_command_id 定位刚被评估的 step 命令，写入
+            AutoTuneController 给出的 baseline/current score 和动作类型。手动改参没有该字段。
+
+        参数说明：
+            command_id 为最近一次 auto-tune step 命令 id；None 表示无可关联记录。
+            action 为 AutoTuneController.plan_next_action 返回的动作。
+            now 为动作生成时间戳。
+
+        返回值：
+            无返回值。
+        """
+        if command_id is None:
+            return
+        record = self._records_by_command_id.get(int(command_id))
+        if record is None:
+            return
+
+        action_type = str(action.get("type", ""))
+        if action_type not in ("keep", "rollback"):
+            return
+
+        record["updated_at"] = now
+        record["result"]["autotune_action"] = action_type
+        record["result"]["autotune_reason"] = action.get("reason")
+        record["result"]["baseline_score"] = json_safe_copy(action.get("baseline_score"))
+        record["result"]["current_score"] = json_safe_copy(action.get("current_score"))
+        if action_type == "rollback":
+            record["result"]["rollback_command"] = action.get("command")
+        self._write_record(int(command_id))
+
+    def _select_window_samples(
+        self,
+        samples: list[dict[str, Any]],
+        loop_id: Any,
+        now: float,
+    ) -> list[dict[str, Any]]:
+        """
+        函数作用：
+            从全局有界样本中截取某次命令的前置曲线窗口。
+
+        主要流程：
+            按接收时间保留 `now - window_seconds` 之后的样本，并根据 loop_id 过滤。
+            loop_id 为空时保留所有样本，适配单环或全局命令。
+
+        参数说明：
+            samples 为 DashboardState 的样本快照。
+            loop_id 为命令目标环路；None 表示不按环路过滤。
+            now 为命令创建时间戳。
+
+        返回值：
+            返回深拷贝后的样本列表。
+        """
+        cutoff = now - self.window_seconds
+        selected = [
+            sample
+            for sample in samples
+            if float(sample.get("received_at", cutoff - 1.0)) >= cutoff and self._sample_matches_loop(sample, loop_id)
+        ]
+        return json_safe_copy(selected)
+
+    def _select_config(
+        self,
+        loop_id: Any,
+        loops: dict[str, dict[str, Any]],
+        latest_cfg: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """
+        函数作用：
+            选择命令对应的改参前配置快照。
+
+        主要流程：
+            分环命令优先读取 `loops[loop_id].latest_cfg`；普通命令使用 latest_cfg。
+
+        参数说明：
+            loop_id 为命令目标环路。
+            loops 为多环状态表。
+            latest_cfg 为单环最新配置。
+
+        返回值：
+            返回配置记录深拷贝；没有配置时返回 None。
+        """
+        if loop_id:
+            loop_state = loops.get(str(loop_id), {})
+            return json_safe_copy(loop_state.get("latest_cfg"))
+        return json_safe_copy(latest_cfg)
+
+    def _sample_matches_loop(self, sample: dict[str, Any], loop_id: Any) -> bool:
+        """
+        函数作用：
+            判断一个 PID/PIDX 样本是否属于命令目标环路。
+
+        主要流程：
+            loop_id 为空时所有样本都可用于全局命令；否则只接受 data.loop_id 完全匹配的 PIDX。
+
+        参数说明：
+            sample 为样本记录。
+            loop_id 为命令目标环路。
+
+        返回值：
+            匹配返回 True，否则返回 False。
+        """
+        if not loop_id:
+            return True
+        return str(sample.get("data", {}).get("loop_id", "")) == str(loop_id)
+
+    def _config_matches_loop(self, config_record: dict[str, Any], loop_id: Any) -> bool:
+        """
+        函数作用：
+            判断 CFG/CFGX 配置帧是否属于命令目标环路。
+
+        主要流程：
+            loop_id 为空时接受普通 CFG；loop_id 非空时只接受同名 CFGX。
+
+        参数说明：
+            config_record 为配置记录。
+            loop_id 为命令目标环路。
+
+        返回值：
+            匹配返回 True，否则返回 False。
+        """
+        if not loop_id:
+            return config_record.get("kind") == "cfg"
+        return str(config_record.get("data", {}).get("loop_id", "")) == str(loop_id)
+
+    def _make_record_id(self, entry: dict[str, Any], now: float) -> str:
+        """
+        函数作用：
+            生成稳定且可读的实验记录文件名前缀。
+
+        主要流程：
+            使用本地时间、命令 id、命令名和 loop_id 组合；各片段先经过文件名清理。
+
+        参数说明：
+            entry 为命令历史条目。
+            now 为记录创建时间戳。
+
+        返回值：
+            返回不含扩展名的记录 id。
+        """
+        timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+        command_name = sanitize_filename_part(str(entry.get("command_name", "cmd")).lower())
+        loop_id = sanitize_filename_part(str(entry.get("loop_id") or "global").lower())
+        return f"{timestamp}-{int(entry.get('id', 0)):04d}-{command_name}-{loop_id}"
+
+    def _write_record(self, command_id: int) -> None:
+        """
+        函数作用：
+            将指定实验记录写入 JSON 文件。
+
+        主要流程：
+            先写同目录临时文件，再用 replace 原子替换目标文件；写入失败时仅记录错误，
+            避免文件系统问题影响实时串口控制。
+
+        参数说明：
+            command_id 为命令历史 id。
+
+        返回值：
+            无返回值。
+        """
+        if self.directory is None:
+            return
+        record = self._records_by_command_id.get(command_id)
+        path = self._paths_by_command_id.get(command_id)
+        if record is None or path is None:
+            return
+
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            record["path"] = str(path)
+            temp_path = path.with_suffix(path.suffix + ".tmp")
+            with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(record, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            temp_path.replace(path)
+            self._latest_summary = {
+                "record_id": record.get("record_id"),
+                "path": str(path),
+                "status": record.get("status"),
+                "command_name": record.get("command", {}).get("command_name"),
+                "loop_id": record.get("command", {}).get("loop_id"),
+                "updated_at": record.get("updated_at"),
+            }
+        except OSError as exc:
+            message = f"{path}: {exc}"
+            self._write_errors.append(message)
+
+
 class DashboardState:
     """
     本地上位机运行状态。
@@ -118,17 +654,25 @@ class DashboardState:
         RLock 保护。对外返回数据时使用深拷贝，避免调用方修改内部结构。
     """
 
-    def __init__(self, max_samples: int = DEFAULT_MAX_SAMPLES, max_command_history: int = DEFAULT_COMMAND_HISTORY):
+    def __init__(
+        self,
+        max_samples: int = DEFAULT_MAX_SAMPLES,
+        max_command_history: int = DEFAULT_COMMAND_HISTORY,
+        experiment_dir: str | Path | None = None,
+        experiment_window_seconds: float = DEFAULT_EXPERIMENT_WINDOW_SECONDS,
+    ):
         """
         函数作用：
             初始化 dashboard 状态容器。
 
         主要流程：
-            创建锁、有界样本队列、命令历史队列、串口连接字段和诊断字段。
+            创建锁、有界样本队列、命令历史队列、实验记录器、串口连接字段和诊断字段。
 
         参数说明：
             max_samples 为保留的最大 PID 样本数，至少为 1。
             max_command_history 为保留的最大命令历史条数，至少为 1。
+            experiment_dir 为实验记录输出目录；None 表示不自动落盘。
+            experiment_window_seconds 为每次改参前后保存的曲线窗口长度，单位秒。
 
         返回值：
             构造函数无显式返回值。
@@ -139,6 +683,7 @@ class DashboardState:
         self._next_sample_id = 1
         self._next_command_id = 1
         self._loops: dict[str, dict[str, Any]] = {}
+        self._experiment_recorder = ExperimentRecorder(experiment_dir, experiment_window_seconds)
 
         # 串口资源字段只由 connect/disconnect 和读取线程修改，必须在锁内访问。
         self._serial_handle: Any | None = None
@@ -212,6 +757,7 @@ class DashboardState:
                 "sample_count": len(self._samples),
                 "latest_sample_id": latest_sample_id,
                 "command_history": json_safe_copy(list(self._command_history)),
+                "experiment_recording": self._experiment_recorder.snapshot(),
             }
 
     def get_samples_after(self, since_id: int, limit: int | None = None) -> list[dict[str, Any]]:
@@ -275,6 +821,7 @@ class DashboardState:
                         loop_state["latest_pid"] = json_safe_copy(sample)
                         loop_state["updated_at"] = now
                 self._update_autotune_locked(parsed, now)
+                self._experiment_recorder.observe_sample(sample, now)
                 # 一次拷贝同时供 latest_pid 和返回值使用，避免对同一样本调用两次 deepcopy。
                 copied = json_safe_copy(sample)
                 self.latest_pid = copied
@@ -290,6 +837,7 @@ class DashboardState:
                         loop_state["updated_at"] = now
                 self._update_autotune_locked(parsed, now)
                 self.latest_cfg = json_safe_copy(record)
+                self._experiment_recorder.observe_config(record, now)
                 return json_safe_copy(record)
 
             if parsed.get("kind") == "sens" and parsed.get("valid"):
@@ -347,10 +895,11 @@ class DashboardState:
                 raise ValueError(
                     f"{command_name} already has a pending loop command; wait for ACK/ERR before sending another."
                 )
+            now = time.time()
             entry = {
                 "id": self._next_command_id,
-                "created_at": time.time(),
-                "updated_at": time.time(),
+                "created_at": now,
+                "updated_at": now,
                 "command": normalized,
                 "command_name": command_name,
                 "loop_id": loop_id,
@@ -361,6 +910,13 @@ class DashboardState:
             }
             self._next_command_id += 1
             self._command_history.append(entry)
+            self._experiment_recorder.start_command(
+                entry,
+                list(self._samples),
+                self._loops,
+                self.latest_cfg,
+                now,
+            )
             return json_safe_copy(entry)
 
     def _has_conflicting_pending_command_locked(self, command_name: str) -> bool:
@@ -407,9 +963,11 @@ class DashboardState:
             for entry in self._command_history:
                 if entry["id"] != command_id:
                     continue
+                now = time.time()
                 entry["status"] = "error"
-                entry["updated_at"] = time.time()
+                entry["updated_at"] = now
                 entry["response"] = make_local_response("local_error", entry["command_name"], detail)
+                self._experiment_recorder.attach_local_error(entry, detail, now)
                 return json_safe_copy(entry)
         return None
 
@@ -496,6 +1054,7 @@ class DashboardState:
             entry["status"] = response_kind
             entry["updated_at"] = now
             entry["response"] = json_safe_copy(parsed)
+            self._experiment_recorder.attach_response(entry, parsed, now)
             return
 
         entry = {
@@ -615,6 +1174,11 @@ class DashboardState:
         self.autotune["current_loop"] = action.get("loop_id")
         self.autotune["last_action"] = json_safe_copy(action)
         self.autotune["updated_at"] = now
+        self._experiment_recorder.attach_autotune_action(
+            self.autotune.get("last_sent_command_id"),
+            action,
+            now,
+        )
 
         if action.get("type") not in ("send", "rollback"):
             return
@@ -2336,6 +2900,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT, help="Preferred HTTP port; choose free port if busy.")
     parser.add_argument("--open", action="store_true", help="Open the dashboard in the default browser.")
     parser.add_argument("--max-samples", type=int, default=DEFAULT_MAX_SAMPLES, help="Maximum PID samples kept in memory.")
+    parser.add_argument(
+        "--experiment-dir",
+        default=DEFAULT_EXPERIMENT_DIR,
+        help="Directory for parameter-change experiment JSON records.",
+    )
+    parser.add_argument(
+        "--experiment-window-seconds",
+        type=float,
+        default=DEFAULT_EXPERIMENT_WINDOW_SECONDS,
+        help="Seconds of curve samples saved before and after each acknowledged parameter change.",
+    )
+    parser.add_argument(
+        "--disable-experiment-recording",
+        action="store_true",
+        help="Disable automatic experiment JSON recording for parameter-change commands.",
+    )
 
     parser.add_argument("--auto", action="store_true", help="Auto-detect and connect to the PID AI board after launch.")
     parser.add_argument("--serial-port", help="Serial port to connect after launch, for example COM5.")
@@ -2367,7 +2947,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    state = DashboardState(max_samples=args.max_samples)
+    experiment_dir = None if args.disable_experiment_recording else args.experiment_dir
+    state = DashboardState(
+        max_samples=args.max_samples,
+        experiment_dir=experiment_dir,
+        experiment_window_seconds=args.experiment_window_seconds,
+    )
     http_port = choose_http_port(args.host, args.port)
     server = create_server(args.host, http_port, state)
     url = f"http://{args.host}:{http_port}/"

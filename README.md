@@ -115,6 +115,31 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port C
 | 自动调参 | 支持 `observe`、`suggest`、`auto-tune`，按串级顺序生成小步 `SET_PIDX`，ACK 后观察，变差时回滚并等待 rollback ACK |
 | 参数设置 | 生成并发送 `SET_PID`、`SET_KF`、`SET_TARGET`、`SET_OUT_LIMIT`、`SET_I_LIMIT`、`SET_MODE`、`SET_MANUAL_OUT`、`ENABLE`、`SET_REVERSE`、`SET_SENSOR_OK`、`RESET_I`、`CLEAR_FAULT`、`GET_CFG` |
 | 命令历史 | 记录 pending 命令、`loop_id` 和调参原因，并只在收到 `{ACK}` 后标记为确认；收到 `{ERR}` 或本地串口错误时显示失败 |
+| 实验记录 | 默认把每次参数/控制命令的前后曲线、ACK/ERR、配置快照和基础评分保存到 `experiments/*.json` |
+
+### 实验记录
+
+Dashboard 启动后会默认启用实验记录。每次发送 `SET_PID` / `SET_PIDX` / `SET_TARGETX` / `SET_OUT_LIMITX` 等会改变控制行为的 `{CMD}` 时，上位机会先截取命令前最近一段 `{PID}` / `{PIDX}` 曲线；收到匹配 `{ACK}` 后，再保存 ACK 后窗口内的新曲线样本。记录文件使用 JSON，便于后续回放、脚本分析和对比。
+
+| 字段 | 说明 |
+|---|---|
+| `command` | 命令文本、命令名、`loop_id`、发送原因和命令历史 id |
+| `response` | 板端 `{ACK}` / `{ERR}` 或本地串口错误 |
+| `before_config` / `after_config` | 命令前后能观测到的 `{CFG}` / `{CFGX}` 配置快照 |
+| `before_samples` / `after_samples` | 命令前窗口和 ACK 后窗口的 typed 曲线样本 |
+| `result.before_score` / `result.after_score` | 基于误差、饱和、anti-windup 和传感器状态的基础评分 |
+
+可通过参数调整保存位置和窗口长度：
+
+```powershell
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --auto --experiment-dir .\experiments --experiment-window-seconds 3.0 --open
+```
+
+如只想查看实时曲线、不保存文件：
+
+```powershell
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --auto --disable-experiment-recording --open
+```
 
 ### 安全约束
 
@@ -254,6 +279,7 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --
 | 已完成 | ACK/ERR 回复机制 |
 | 已完成 | Python `autotune` 状态机、命令构建、ACK 匹配和变差回滚 |
 | 已完成 | Dashboard 多环状态、自动调参状态、评分和回滚历史 |
+| 已完成 | 实验记录 JSON 落盘，保存每次参数修改前后的曲线、ACK/ERR、配置快照和基础评分 |
 | 已完成 | 板端接入示例 |
 | 已完成 | 基础 C 测试 |
 
@@ -262,7 +288,6 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --
 | 优先级 | 下一步 | 目标 |
 |---|---|---|
 | 高 | 真实小车板端接入 `{PIDX}` / `{CFGX}` / `{SENS}` | 在硬件上验证串级自动调参闭环 |
-| 中 | 实验记录系统 | 保存每次参数修改前后的曲线和结果 |
 | 中 | 更细的调参策略 | 针对 `ki/kd`、外环和饱和场景引入更丰富的规则 |
 | 低 | 二进制协议和 CRC | 提升高频传输可靠性和带宽效率 |
 

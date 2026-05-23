@@ -26,7 +26,7 @@ experiments, and send confirmed commands.
 | Auto-tune runtime | User mode plus parsed frames and command results | Auto-tune module | Mode, state, current loop, pending step, scores, and rollback history. |
 | Tuning form draft | User edits | Tuning UI | Separate from board-confirmed config. |
 | Diagnosis window | Derived from telemetry samples | Diagnosis module | Use a time/sample window, not entire session by default. |
-| Experiment record | Explicit user/AI recording flow | Recording module | May persist to CSV/database in future host code. |
+| Experiment record | Command transactions plus typed telemetry | Recording module | Persist command-scoped JSON records for parameter changes, including pre/post curves and ACK/ERR result. |
 
 ---
 
@@ -165,6 +165,151 @@ matching ACK. The post-step score must start after that boundary so pre-change
 baseline telemetry cannot dilute or hide a regression. If a valid ACK/ERR arrives
 for a different command or `loop_id` while a step or rollback is pending, abort
 the auto-tune session and surface the mismatched response.
+
+---
+
+## Experiment Recording Contract
+
+Host-side experiment recording persists parameter-change transactions to JSON.
+The recorder consumes only typed dashboard state; it must not parse raw serial
+strings or infer board-applied state before a matching ACK.
+
+### 1. Scope / Trigger
+
+Use this contract for dashboard or future host tools that save PID tuning
+experiments after `{CMD}` commands. It applies to commands that change control
+behavior, including `SET_PID`, `SET_PIDX`, `SET_KF`, `SET_KFX`, `SET_TARGET`,
+`SET_TARGETX`, limit commands, mode/enable commands, reset commands, and fault
+clear commands.
+
+### 2. Signatures
+
+Current Python dashboard entry points:
+
+```python
+class DashboardState:
+    def __init__(
+        self,
+        max_samples: int = DEFAULT_MAX_SAMPLES,
+        max_command_history: int = DEFAULT_COMMAND_HISTORY,
+        experiment_dir: str | Path | None = None,
+        experiment_window_seconds: float = DEFAULT_EXPERIMENT_WINDOW_SECONDS,
+    ): ...
+
+class ExperimentRecorder:
+    def start_command(
+        self,
+        entry: dict[str, Any],
+        samples: list[dict[str, Any]],
+        loops: dict[str, dict[str, Any]],
+        latest_cfg: dict[str, Any] | None,
+        now: float,
+    ) -> None: ...
+    def attach_response(self, entry: dict[str, Any], response: dict[str, Any], now: float) -> None: ...
+    def attach_local_error(self, entry: dict[str, Any], detail: str, now: float) -> None: ...
+    def observe_sample(self, sample: dict[str, Any], now: float) -> None: ...
+    def observe_config(self, config_record: dict[str, Any], now: float) -> None: ...
+```
+
+Dashboard CLI flags:
+
+```text
+--experiment-dir <path>
+--experiment-window-seconds <seconds>
+--disable-experiment-recording
+```
+
+`GET /api/status` must include:
+
+```text
+experiment_recording.enabled
+experiment_recording.directory
+experiment_recording.window_seconds
+experiment_recording.record_count
+experiment_recording.latest_record
+experiment_recording.write_errors
+```
+
+### 3. Contracts
+
+| Boundary | Contract |
+|---|---|
+| Command -> recorder | Create a pending record when a recordable `{CMD}` is added to command history. |
+| Telemetry -> recorder | Use only validated `{PID}` / `{PIDX}` samples already accepted by dashboard state. |
+| Config -> recorder | Use latest `{CFG}` for global commands and matching `loops[loop_id].latest_cfg` for loop commands. |
+| ACK/ERR -> recorder | Update the same command id record after command history matches the response. |
+| Local send error -> recorder | Mark status `error` with a `local_error` response; do not fabricate board ACK/ERR. |
+| File output | Write JSON atomically with a temporary file and replacement; file IO errors must not stop serial processing. |
+
+Experiment JSON must contain these top-level fields:
+
+```text
+schema_version, record_id, created_at, updated_at, window_seconds,
+status, command, response, before_config, after_config,
+before_samples, after_samples, result
+```
+
+### 4. Validation & Error Matrix
+
+| Case | Required behavior |
+|---|---|
+| Recordable command pending | Write pending JSON with `before_samples` and `before_config` if available. |
+| Matching ACK | Set `status=ack`, preserve parsed response, and start accepting post-ACK samples. |
+| Matching ERR | Set `status=err`, preserve status/detail, and do not mark the parameter as applied. |
+| Serial not connected or write failure | Set `status=error` and `response.kind=local_error`. |
+| Sample from another `loop_id` | Do not add it to a loop-specific record. |
+| Bad protocol frame | Do not enter experiment samples because it never enters typed dashboard state. |
+| Output directory write failure | Add a write error to `experiment_recording.write_errors`; keep runtime state alive. |
+
+### 5. Good/Base/Bad Cases
+
+| Case | Example | Required behavior |
+|---|---|---|
+| Good | `SET_PIDX,speed_l` with matching ACK and later speed_l PIDX | JSON contains before/after samples for `speed_l`. |
+| Base | `SET_PID` while disconnected | JSON contains local error and no fake ACK. |
+| Bad | ACK received for unrelated command | Existing ACK matching rules decide unsolicited/mismatch; recorder must not update the wrong record. |
+| Bad | Raw malformed `{PIDX}` line | Parse errors increase, but experiment record samples are unchanged. |
+
+### 6. Tests Required
+
+Add dashboard tests under `.codex/skills/pid-ai-serial/tests/`:
+
+| Test point | Required assertions |
+|---|---|
+| ACKed loop command | A JSON file is created; command, loop_id, ACK detail, before samples, after samples, and before config are present. |
+| Local send error | A JSON file is created with `result.status=error` and `response.kind=local_error`. |
+| Cross-loop filtering | A `SET_PIDX` record does not include samples from a different `loop_id`. |
+| Status summary | `snapshot()["experiment_recording"]` reports enabled state, count, latest record, and write errors. |
+
+### 7. Wrong vs Correct
+
+Wrong:
+
+```python
+# Treating write success as experiment success loses board rejection evidence.
+record["status"] = "ack"
+```
+
+Correct:
+
+```python
+# Command history must first match a real ACK/ERR or local transport error.
+self._experiment_recorder.attach_response(entry, parsed_ack_or_err, now)
+```
+
+Wrong:
+
+```python
+# Re-parsing raw serial text in recorder duplicates protocol rules.
+fields = raw_line.split(",")
+```
+
+Correct:
+
+```python
+# Recorder receives only validated typed samples from DashboardState.
+self._experiment_recorder.observe_sample(sample, now)
+```
 
 ---
 

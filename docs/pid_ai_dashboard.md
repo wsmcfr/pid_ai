@@ -95,6 +95,7 @@ DashboardState typed state
 | `sample_count` | number | 当前保留样本数量 |
 | `latest_sample_id` | number | 最新样本自增 ID |
 | `command_history` | array | 命令交易历史 |
+| `experiment_recording` | object | 实验记录开关、目录、窗口秒数、记录数量和最近记录摘要 |
 
 ### `GET /api/samples?since=0&limit=500`
 
@@ -114,6 +115,33 @@ DashboardState typed state
 | `samples[].kind` | string | `pid` 或 `pidx` |
 | `samples[].valid` | boolean | 固定为 `true` |
 | `samples[].data` | object | 按协议字段名解析后的 `{PID}` / `{PIDX}` 数据 |
+
+## 4. 实验记录落盘
+
+Dashboard 默认把参数修改实验保存为 JSON 文件，目录默认为仓库根目录下的 `experiments/`。可通过 `--experiment-dir` 修改路径，或用 `--disable-experiment-recording` 关闭。
+
+| 触发点 | 行为 |
+|---|---|
+| 参数/控制类 `{CMD}` 入队 | 创建 pending 实验记录，保存命令前窗口样本和当前配置快照 |
+| 收到匹配 `{ACK}` | 标记记录为 `ack`，后续窗口开始接收 ACK 后样本 |
+| 收到匹配 `{ERR}` | 标记记录为 `err`，保留板端拒绝原因 |
+| 串口未连接或写入失败 | 标记记录为 `error`，保留本地错误，不伪装成板端回复 |
+| ACK 后 `{PID}` / `{PIDX}` 到达 | 追加到 `after_samples`，并刷新 `result.after_score` |
+| ACK 后 `{CFG}` / `{CFGX}` 到达 | 更新 `after_config` |
+
+实验 JSON 核心字段：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `schema_version` | number | 记录格式版本，当前为 1 |
+| `record_id` | string | 文件名同源 ID，包含时间、命令 id、命令名和 loop_id |
+| `command` | object | 命令文本、命令名、`loop_id`、reason 和命令历史 id |
+| `response` | object/null | `{ACK}`、`{ERR}` 或本地错误结构 |
+| `before_config` / `after_config` | object/null | 命令前后配置快照 |
+| `before_samples` / `after_samples` | array | 命令前窗口和 ACK 后窗口的 typed PID 样本 |
+| `result` | object | 状态、基础评分和自动调参 keep/rollback 信息 |
+
+基础评分只用于回放和人工对比，字段包括 `mean_abs_error`、`max_abs_error`、`sat_ratio`、`anti_windup_ratio`、`sensor_bad_ratio` 和 `score`。自动调参是否保留或回滚仍由 `AutoTuneController` 的 ACK 后窗口决策负责。
 
 ### `POST /api/connect`
 
