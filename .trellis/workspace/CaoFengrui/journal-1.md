@@ -118,7 +118,10 @@ and pushed the feature branch to GitHub.
 
 ### Summary
 
-(Add summary)
+Split the PID AI protocol library into independently selectable text and binary
+modules. The shared multi-loop route/table types now live in a small common
+header, so firmware projects can compile only the text protocol, only the binary
+protocol, both protocols, or just the PID core.
 
 ### Main Changes
 
@@ -155,7 +158,10 @@ and pushed the feature branch to GitHub.
 
 ### Testing
 
-- [OK] (Add test results)
+- [OK] Text-only standalone compile test passed.
+- [OK] Binary-only standalone compile test passed.
+- [OK] Full C regression suite passed with `PASS: all pid_ai tests`.
+- [OK] Board example compiled successfully.
 
 ### Status
 
@@ -374,6 +380,56 @@ telemetry/config protocol, then pushed the feature commit to GitHub.
 - [OK] C regression suite passed with `PASS: all pid_ai tests`
 - [OK] Python serial/dashboard unittest suite passed with 48 tests
 - [OK] Python script compile, skill validation, and `git diff --check` passed
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 8: Session 8 - split text and binary protocol modules
+
+**Date**: 2026-05-23
+**Task**: Session 8 - split text and binary protocol modules
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| Area | Details |
+|---|---|
+| Protocol split | Split shared multi-loop route/table definitions into `include/pid_ai_protocol_types.h`, so text and binary protocol headers no longer depend on each other. |
+| Text module | Kept `include/pid_ai_protocol.h` focused on `{CMD}` parsing, text `{PID}` / `{CFG}` / `{PIDX}` / `{CFGX}` frame builders, and `{ACK}` / `{ERR}` helpers. |
+| Binary module | Updated `include/pid_ai_binary_protocol.h` to depend only on PID core plus shared protocol types, enabling users to compile binary telemetry without the text protocol implementation. |
+| Tests | Added standalone compile tests for text-only and binary-only builds, plus retained full regression coverage. |
+| Docs | Updated README, serial protocol docs, and backend Trellis specs to document the selectable module sets: PID core only, text protocol, binary protocol, or mixed text+binary. |
+
+**Verification**:
+- `git diff --check`
+- `gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c tests/test_text_protocol_standalone.c -o tests/test_text_protocol_standalone.exe; .\\tests\\test_text_protocol_standalone.exe`
+- `gcc -Iinclude src/pid_ai.c src/pid_ai_binary_protocol.c tests/test_binary_protocol_standalone.c -o tests/test_binary_protocol_standalone.exe; .\\tests\\test_binary_protocol_standalone.exe`
+- `gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c src/pid_ai_binary_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; .\\tests\\test_pid_ai.exe` -> `PASS: all pid_ai tests`
+- `gcc -Iinclude -DPID_AI_EXAMPLE_BUILD_MAIN src/pid_ai.c src/pid_ai_protocol.c examples/pid_ai_board_example.c -o examples/pid_ai_board_example.exe`
+
+**GitHub**:
+- Pushed `cb03159 feat(protocol): split text and binary modules` to `origin/feat/pid-ai-autotune`.
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `cb03159` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
 
 ### Status
 
