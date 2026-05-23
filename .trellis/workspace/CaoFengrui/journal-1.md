@@ -159,3 +159,68 @@ Implemented and pushed the PID AI serial dashboard skill, local Web upper-comput
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: Harden PID cascade autotune transactions
+
+**Date**: 2026-05-23
+**Task**: Harden PID cascade autotune transactions
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| 项目 | 内容 |
+|---|---|
+| 分支 | `feat/pid-ai-autotune` |
+| 业务提交 | `f7b8ded fix(pid): harden cascade autotune transactions` |
+| 工作范围 | 修复 PID AI 串级自动调参审查问题，补齐代码、测试、协议文档、dashboard 文档、skill 和 Trellis spec |
+
+## 完成内容
+
+| 模块 | 记录 |
+|---|---|
+| Python parser / autotune | ACK/ERR 兼容旧格式与带 `loop_id` 新格式；step/rollback 均记录发送时间并支持 `ack_timeout_seconds`；rollback 建模为独立 pending 事务；`window_seconds` 按 `received_at` 或板端 `ms` 裁剪评分窗口 |
+| Dashboard | `/api/autotune` 和页面 payload 接入 `ack_timeout_seconds`；禁止同名分环命令并发 pending；ACK/ERR 先更新命令历史再推进 autotune；串口断开时 ABORT 并关闭自动写参 |
+| C 协议库 | `PIDAI_ProtocolHandleCommandX()` 对无效 loop table 返回 `INTERNAL_ERROR/NO_VALID_LOOP_TABLE`；所有 `*X` 命令先查 `loop_id` 再解析后续数值，未知 loop 不被坏数字掩盖 |
+| 测试 | 增加 C 回归测试、parser 状态机测试、dashboard 状态/API 测试，覆盖 ACK timeout、rollback ACK/ERR/timeout、时间窗口评分、同名 pending 冲突和无效 loop table |
+| 文档/spec | README、协议文档、dashboard 文档、`pid-ai-serial` skill、Trellis backend/frontend spec 已同步 ACK 闭环、rollback 事务、`ack_timeout_seconds`、旧 ACK 并发限制和 `{CFGX}` 15 字段契约 |
+
+## 验证
+
+| 命令 | 结果 |
+|---|---|
+| `gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; if ($LASTEXITCODE -eq 0) { .\tests\test_pid_ai.exe }` | 通过，`PASS: all pid_ai tests` |
+| `python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v` | 通过，30 个测试 OK |
+| `python -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py` | 通过 |
+| `python C:\Users\caofengrui\.codex\skills\.system\skill-creator\scripts\quick_validate.py .codex\skills\pid-ai-serial` | 通过，`Skill is valid!` |
+| `git diff --check` | 通过，无空白错误；仅 Windows LF/CRLF 提示 |
+
+## 注意事项
+
+| 项目 | 状态 |
+|---|---|
+| `.spec-workflow/` | 仍为未跟踪目录，按计划未提交 |
+| 远端 | `f7b8ded` 已推送到 `origin/feat/pid-ai-autotune` |
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f7b8ded` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
