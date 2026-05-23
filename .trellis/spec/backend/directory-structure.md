@@ -12,8 +12,8 @@ module pair.
 
 | Directory | Purpose | Examples |
 |---|---|---|
-| `include/` | Public, platform-neutral API headers consumed by MCU firmware and PC tests. | `include/pid_ai.h`, `include/pid_ai_protocol.h` |
-| `src/` | Portable C implementations for the public headers. | `src/pid_ai.c`, `src/pid_ai_protocol.c` |
+| `include/` | Public, platform-neutral API headers consumed by MCU firmware and PC tests. | `include/pid_ai.h`, `include/pid_ai_protocol.h`, `include/pid_ai_binary_protocol.h` |
+| `src/` | Portable C implementations for the public headers. | `src/pid_ai.c`, `src/pid_ai_protocol.c`, `src/pid_ai_binary_protocol.c` |
 | `docs/` | Human-readable protocol and architecture documentation. | `docs/pid_ai_serial_protocol.md` |
 | `examples/` | Board integration examples with weak platform assumptions. | `examples/pid_ai_board_example.c` |
 | `tests/` | PC-side C regression tests. | `tests/test_pid_ai.c` |
@@ -24,11 +24,14 @@ module pair.
 
 ```text
 include/
-├── pid_ai.h              # Core PID state, enums, and public functions.
-└── pid_ai_protocol.h     # Serial command/result/frame public functions.
+├── pid_ai.h                  # Core PID state, enums, and public functions.
+├── pid_ai_protocol_types.h   # Shared multi-loop route/table types for protocol modules.
+├── pid_ai_protocol.h         # Text command/result/frame public functions.
+└── pid_ai_binary_protocol.h  # Binary telemetry/config frame public functions.
 src/
-├── pid_ai.c              # PID math, limits, modes, and fault handling.
-└── pid_ai_protocol.c     # Text command parsing and frame formatting.
+├── pid_ai.c                  # PID math, limits, modes, and fault handling.
+├── pid_ai_protocol.c         # Text command parsing and frame formatting.
+└── pid_ai_binary_protocol.c  # Binary frame packing, CRC, and validation.
 docs/
 └── pid_ai_serial_protocol.md
 examples/
@@ -49,7 +52,9 @@ implementation in `src/`.
 | Module | Public API | Implementation |
 |---|---|---|
 | Core PID | `include/pid_ai.h` | `src/pid_ai.c` |
-| Serial protocol | `include/pid_ai_protocol.h` | `src/pid_ai_protocol.c` |
+| Shared protocol types | `include/pid_ai_protocol_types.h` | Header-only shared structs |
+| Text serial protocol | `include/pid_ai_protocol.h` | `src/pid_ai_protocol.c` |
+| Binary serial protocol | `include/pid_ai_binary_protocol.h` | `src/pid_ai_binary_protocol.c` |
 
 New portable modules should follow the same shape:
 

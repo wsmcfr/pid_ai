@@ -19,6 +19,19 @@
 
 命令帧参数数量必须与下表格式精确匹配。参数不足返回 `ARG_MISSING`，参数格式错误或存在多余参数返回 `ARG_INVALID`，多余参数的 `detail` 为 `UNEXPECTED_ARG`。这样可以避免上位机拼接错误被板端静默忽略。
 
+### 1.1 C 库模块选择
+
+板端通用 C 库把协议实现分成文本和二进制两套，用户可以自行选择编译哪一套：
+
+| 模块 | 文件 | 作用 |
+|---|---|---|
+| PID 核心 | `include/pid_ai.h`、`src/pid_ai.c` | 必选，提供 PID 计算、限幅、模式和状态字段 |
+| 公共协议类型 | `include/pid_ai_protocol_types.h` | 多环 `PIDAI_LoopRoute` / `PIDAI_LoopTable`，供文本和二进制协议共享 |
+| 文本协议 | `include/pid_ai_protocol.h`、`src/pid_ai_protocol.c` | `{CMD}` 解析、`{PID}` / `{CFG}` / `{PIDX}` / `{CFGX}` 文本帧、`{ACK}` / `{ERR}` |
+| 二进制协议 | `include/pid_ai_binary_protocol.h`、`src/pid_ai_binary_protocol.c` | PID/CFG/PIDX/CFGX 二进制帧、CRC-16 校验和接收端帧校验 |
+
+只使用二进制遥测时不需要包含 `pid_ai_protocol.h` 或编译 `src/pid_ai_protocol.c`；只使用文本协议时不需要包含 `pid_ai_binary_protocol.h` 或编译 `src/pid_ai_binary_protocol.c`。
+
 ## 2. 高频 PID 遥测帧 `{PID}`
 
 `{PID}` 是最重要的实时数据帧，建议按 PID 控制周期或降频后上传。普通调参可以 50 Hz 到 200 Hz；如果串口带宽不足，可以板端 1 kHz 控制、100 Hz 上传。
@@ -323,7 +336,7 @@
 
 ## 8. 可选二进制协议和 CRC
 
-二进制协议与文本协议并存，不替换 `{CMD}` / `{ACK}` / `{ERR}` 的确认语义。它主要用于高频 `{PID}` / `{PIDX}` / `{CFG}` / `{CFGX}` 遥测和配置快照，板端和上位机可以在同一串口流中混合发送文本行和二进制帧。
+二进制协议是独立的可选 C 模块，与文本协议并存，不替换 `{CMD}` / `{ACK}` / `{ERR}` 的确认语义。它主要用于高频 `{PID}` / `{PIDX}` / `{CFG}` / `{CFGX}` 遥测和配置快照，板端和上位机可以在同一串口流中混合发送文本行和二进制帧；也可以只编译二进制协议模块，由应用层自行处理参数下发。
 
 ### 8.1 帧格式
 

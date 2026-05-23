@@ -43,13 +43,29 @@
 |---|---|
 | `include/pid_ai.h` | 通用 PID 驱动库头文件，定义 PID 状态结构体、模式、故障码和核心 API |
 | `src/pid_ai.c` | 通用 PID 驱动库实现，包含 PID 计算、输出限幅、积分限幅、抗积分饱和和模式控制 |
-| `include/pid_ai_protocol.h` | 串口协议头文件，定义命令解析结果、ACK/ERR、遥测打包接口 |
-| `src/pid_ai_protocol.c` | 串口协议实现，负责解析 `{CMD}` 命令并打包 `{PID}`、`{CFG}`、`{ACK}`、`{ERR}` |
+| `include/pid_ai_protocol_types.h` | 文本协议和二进制协议共享的多环 route/table 类型，不包含具体协议 API |
+| `include/pid_ai_protocol.h` | 文本协议头文件，定义 `{CMD}` 命令结果、ACK/ERR、文本遥测/配置打包接口 |
+| `src/pid_ai_protocol.c` | 文本协议实现，负责解析 `{CMD}` 命令并打包 `{PID}`、`{CFG}`、`{ACK}`、`{ERR}` |
+| `include/pid_ai_binary_protocol.h` | 二进制协议头文件，定义 PID/CFG 二进制帧、CRC 和校验接口 |
+| `src/pid_ai_binary_protocol.c` | 二进制协议实现，负责打包和校验高频 PID/CFG 二进制帧 |
 | `docs/pid_ai_serial_protocol.md` | 串口协议详细文档，说明每个上传字段和每条下发命令的含义 |
 | `docs/pid_ai_dashboard.md` | 本地 Web 上位机启动方式、API 契约、错误矩阵和验证命令 |
 | `examples/pid_ai_board_example.c` | 板端接入示例，演示如何初始化 PID、周期计算、上传遥测、处理上位机命令 |
 | `tests/test_pid_ai.c` | PC 侧 C 测试，用于验证 PID 计算、限幅、手动模式和协议解析是否正确 |
 | `.codex/skills/pid-ai-serial/` | Codex skill：自动识别板端 COM 口、读取串口帧，并可打开本地 Web 上位机 |
+
+## C 库模块选择
+
+PID 核心、文本协议和二进制协议现在是可独立选择的三层。用户可以按项目带宽、调试方式和上位机支持情况自行决定使用哪一套协议。
+
+| 用法 | 需要加入工程的文件 | 适用场景 |
+|---|---|---|
+| 只用 PID 核心 | `include/pid_ai.h`、`src/pid_ai.c` | 已有自定义通信协议，只需要 PID 计算和状态字段 |
+| 使用文本协议 | `include/pid_ai.h`、`include/pid_ai_protocol_types.h`、`include/pid_ai_protocol.h`、`src/pid_ai.c`、`src/pid_ai_protocol.c` | 优先可读性、串口调试和 `{CMD}` / `{ACK}` / `{ERR}` 闭环 |
+| 使用二进制协议 | `include/pid_ai.h`、`include/pid_ai_protocol_types.h`、`include/pid_ai_binary_protocol.h`、`src/pid_ai.c`、`src/pid_ai_binary_protocol.c` | 高频遥测/配置快照，需要更低带宽和 CRC 校验 |
+| 文本 + 二进制混合 | 以上两套协议文件全部加入 | 用文本 `{CMD}` 控制参数，用二进制帧上传高频遥测 |
+
+二进制协议头不依赖文本协议头；如果项目只需要二进制遥测，可以不编译 `src/pid_ai_protocol.c`，也不包含 `include/pid_ai_protocol.h`。
 
 ## 系统整体架构
 
@@ -295,13 +311,13 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --
 
 ## 移植到真实板子的最小步骤
 
-1. 把 `include/pid_ai.h`、`include/pid_ai_protocol.h`、`src/pid_ai.c`、`src/pid_ai_protocol.c` 加入单片机工程；如果需要高频二进制遥测，再加入 `include/pid_ai_binary_protocol.h` 和 `src/pid_ai_binary_protocol.c`。
-2. 在板端初始化时调用 `PIDAI_Init()`、`PIDAI_SetTunings()`、`PIDAI_SetOutputLimits()`、`PIDAI_SetTarget()`。
-3. 在固定控制周期里读取传感器反馈值，并调用 `PIDAI_Update()`。
-4. 把 `PIDAI_Update()` 返回的 `actuator` 写入 PWM、DAC、电机驱动或其他执行器。
-5. 周期性调用 `PIDAI_ProtocolBuildTelemetry()` 生成 `{PID}` 并通过串口发送。
-6. 串口收到一整行 `{CMD}` 后调用 `PIDAI_ProtocolHandleCommand()`。
-7. 根据命令结果调用 `PIDAI_ProtocolBuildAck()` 或 `PIDAI_ProtocolBuildError()` 回复上位机。
+1. 先加入 PID 核心文件：`include/pid_ai.h`、`src/pid_ai.c`。
+2. 按通信方式选择协议模块：文本协议加入 `include/pid_ai_protocol_types.h`、`include/pid_ai_protocol.h`、`src/pid_ai_protocol.c`；二进制协议加入 `include/pid_ai_protocol_types.h`、`include/pid_ai_binary_protocol.h`、`src/pid_ai_binary_protocol.c`；两者混用时全部加入。
+3. 在板端初始化时调用 `PIDAI_Init()`、`PIDAI_SetTunings()`、`PIDAI_SetOutputLimits()`、`PIDAI_SetTarget()`。
+4. 在固定控制周期里读取传感器反馈值，并调用 `PIDAI_Update()`。
+5. 把 `PIDAI_Update()` 返回的 `actuator` 写入 PWM、DAC、电机驱动或其他执行器。
+6. 使用文本协议时，周期性调用 `PIDAI_ProtocolBuildTelemetry()` 生成 `{PID}`，串口收到 `{CMD}` 后调用 `PIDAI_ProtocolHandleCommand()` 并用 `PIDAI_ProtocolBuildAck()` / `PIDAI_ProtocolBuildError()` 回复。
+7. 使用二进制协议时，周期性调用 `PIDAI_BinaryBuildTelemetry()` 或 `PIDAI_BinaryBuildTelemetryX()` 生成二进制 PID/PIDX 帧；如果仍需要上位机下发参数，建议同时保留文本协议的 `{CMD}` / `{ACK}` / `{ERR}` 闭环。
 
 ## 重要注意事项
 

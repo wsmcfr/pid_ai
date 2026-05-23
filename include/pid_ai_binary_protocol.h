@@ -4,7 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "pid_ai_protocol.h"
+#include "pid_ai.h"
+#include "pid_ai_protocol_types.h"
 
 #ifdef __cplusplus
 extern "C" {

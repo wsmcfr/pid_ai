@@ -12,7 +12,9 @@ portable C library that runs on the board side:
 | Area | Files | Responsibility |
 |---|---|---|
 | Core PID engine | `include/pid_ai.h`, `src/pid_ai.c` | PID state, tunings, limits, modes, fault bits, and telemetry values |
-| Serial protocol | `include/pid_ai_protocol.h`, `src/pid_ai_protocol.c` | `{CMD}` parsing and `{PID}` / `{CFG}` / `{ACK}` / `{ERR}` frame generation |
+| Shared protocol types | `include/pid_ai_protocol_types.h` | Multi-loop route/table types shared by text and binary protocol modules |
+| Text serial protocol | `include/pid_ai_protocol.h`, `src/pid_ai_protocol.c` | `{CMD}` parsing and `{PID}` / `{CFG}` / `{ACK}` / `{ERR}` frame generation |
+| Binary serial protocol | `include/pid_ai_binary_protocol.h`, `src/pid_ai_binary_protocol.c` | Binary PID/CFG/PIDX/CFGX frame generation and CRC validation |
 | Board integration | `examples/pid_ai_board_example.c` | Demonstrates how MCU firmware should call the portable library |
 | Regression tests | `tests/test_pid_ai.c` | PC-side C tests for PID behavior and protocol formatting |
 
@@ -41,7 +43,8 @@ Before changing board-side C code, read the relevant files below.
 | Change Type | Must Read |
 |---|---|
 | PID algorithm, modes, limits, fault bits | `backend/directory-structure.md`, `backend/error-handling.md`, `backend/quality-guidelines.md`, `include/pid_ai.h`, `src/pid_ai.c` |
-| Serial command or frame fields | `backend/error-handling.md`, `backend/logging-guidelines.md`, `docs/pid_ai_serial_protocol.md`, `include/pid_ai_protocol.h`, `src/pid_ai_protocol.c` |
+| Text serial command or frame fields | `backend/error-handling.md`, `backend/logging-guidelines.md`, `docs/pid_ai_serial_protocol.md`, `include/pid_ai_protocol_types.h`, `include/pid_ai_protocol.h`, `src/pid_ai_protocol.c` |
+| Binary serial frame fields | `backend/logging-guidelines.md`, `docs/pid_ai_serial_protocol.md`, `include/pid_ai_protocol_types.h`, `include/pid_ai_binary_protocol.h`, `src/pid_ai_binary_protocol.c` |
 | Board integration example | `backend/directory-structure.md`, `backend/logging-guidelines.md`, `examples/pid_ai_board_example.c` |
 | Tests or behavior verification | `backend/quality-guidelines.md`, `tests/test_pid_ai.c` |
 | Any persistence or experiment-recording idea | `backend/database-guidelines.md` first, because persistence is currently outside the board library |
