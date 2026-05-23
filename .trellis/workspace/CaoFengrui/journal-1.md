@@ -536,3 +536,61 @@ telemetry/config protocol, then pushed the feature commit to GitHub.
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: PID autotune single-loop support
+
+**Date**: 2026-05-23
+**Task**: PID autotune single-loop support
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+Completed the host-side PID autotune compatibility fix so AI-assisted tuning now
+supports both legacy single-loop PID projects and the cascade line-car profile.
+The session also documented that `{SENS}.battery` is optional for projects
+without a battery-voltage sampling channel.
+
+### Main Changes
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 审查并修复 PID 库与 AI 自动调参的单环/串级兼容性问题 |
+| 自动调参 | 增加 `single-loop` profile，基于旧 `{PID}` / `{CFG}` 生成 `{CMD}SET_PID`；保留 `line-car-cascade` 使用 `{PIDX}` / `{CFGX}` 和 `SET_PIDX` |
+| 传感器帧 | `{SENS}` 末尾 `battery` 改为可选，缺失时 host 侧记录 `battery=None`，避免没有电池采样的项目必须填假值 |
+| Dashboard | 自动调参配置和 UI 支持 profile 选择；single-loop 路径可从 `{CFG}` / `{PID}` 自动生成 `SET_PID` 并进入命令历史 |
+| 安全闭环 | ACK/ERR 匹配、post-ACK 最小样本、ACK 超时、fault/sensor/line_lost 安全门槛和回滚 ACK 要求保持不放宽 |
+| 文档 | 同步 README、串口协议文档、dashboard 文档和 pid-ai-serial skill，明确 `SET_PID` / `SET_PIDX` 与可选 battery 语义 |
+
+**验证**:
+- `python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v` -> 70 tests OK
+- `python -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py` -> 通过
+- `gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c src/pid_ai_binary_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; .\tests\test_pid_ai.exe` -> `PASS: all pid_ai tests`
+- `git diff --check` -> 通过
+- `quick_validate.py .codex\skills\pid-ai-serial` -> `Skill is valid!`
+
+**Commit**:
+- `14692e2 fix(serial): support single-loop autotune`
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `14692e2` | (see git log) |
+
+### Testing
+
+- [OK] Python pid-ai-serial unit suite: 70 tests OK
+- [OK] Python syntax compile for serial and dashboard scripts
+- [OK] C PID/protocol regression executable: `PASS: all pid_ai tests`
+- [OK] `git diff --check`
+- [OK] pid-ai-serial skill validation
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
