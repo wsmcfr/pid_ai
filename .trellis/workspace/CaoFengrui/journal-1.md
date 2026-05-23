@@ -329,3 +329,56 @@ and pushed the feature branch to GitHub.
 ### Next Steps
 
 - None - task complete
+
+
+## Session 7: Session 7 - Binary protocol and autotune strategies
+
+**Date**: 2026-05-23
+**Task**: Session 7 - Binary protocol and autotune strategies
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+Implemented richer PID auto-tune strategy selection and the optional binary
+telemetry/config protocol, then pushed the feature commit to GitHub.
+
+### Main Changes
+
+| 项目 | 记录 |
+|---|---|
+| 自动调参策略 | 增加稳态偏差增 `ki`、震荡增 `kd`、输出饱和且 `anti_windup` 降 `ki`、`line_outer` 慢响应半步增 `kp` 的策略分支。`plan_next_action()` 输出 `strategy` 和 `changed_param`，方便 dashboard、实验记录和操作员审计。 |
+| 二进制协议 | 新增 `include/pid_ai_binary_protocol.h` 和 `src/pid_ai_binary_protocol.c`，支持 PID/PIDX/CFG/CFGX 二进制帧、magic `0xA5 0x5A`、version `1`、CRC-16/CCITT-FALSE，并覆盖标准向量 `123456789 -> 0x29B1`。 |
+| Host 解析 | `pid_ai_serial.py` 新增二进制构帧/解析、`BinaryFrameDecoder` 和 `ProtocolStreamDecoder`，串口读取、扫描、autotune 与 dashboard reader 支持文本/二进制混合流。 |
+| Dashboard | `pid_ai_dashboard.py` 新增统一 `ingest_parsed_frame()` 和 `ingest_bytes()`，二进制 PID/CFG typed frame 与文本帧进入相同状态更新流程，坏帧不污染最新有效状态。 |
+| 文档与规范 | README、`docs/pid_ai_serial_protocol.md`、`docs/pid_ai_dashboard.md`、`.codex/skills/pid-ai-serial/SKILL.md` 和 Trellis backend/frontend spec 已同步二进制协议与调参策略契约。 |
+
+**验证**:
+- `gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c src/pid_ai_binary_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; if ($LASTEXITCODE -eq 0) { .\tests\test_pid_ai.exe }` -> `PASS: all pid_ai tests`
+- `python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v` -> 48 tests OK
+- `python -B -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py` -> exit 0
+- `$env:PYTHONUTF8='1'; python C:\Users\caofengrui\.codex\skills\.system\skill-creator\scripts\quick_validate.py .codex\skills\pid-ai-serial` -> `Skill is valid!`
+- `git diff --check` -> exit 0，仅 LF/CRLF warning
+
+**提交**:
+- `9f11aa2 feat(serial): add binary protocol and richer autotune strategies`
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9f11aa2` | (see git log) |
+
+### Testing
+
+- [OK] C regression suite passed with `PASS: all pid_ai tests`
+- [OK] Python serial/dashboard unittest suite passed with 48 tests
+- [OK] Python script compile, skill validation, and `git diff --check` passed
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
