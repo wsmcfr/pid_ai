@@ -180,7 +180,9 @@ protocol, both protocols, or just the PID core.
 
 ### Summary
 
-(Add summary)
+Hardened the `pid-ai-serial` skill after code review, covering parser validation,
+dashboard write/API safety, ACK timeout progression, command matching, regression
+tests, and synchronized project documentation/specs.
 
 ### Main Changes
 
@@ -226,7 +228,10 @@ protocol, both protocols, or just the PID core.
 
 ### Testing
 
-- [OK] (Add test results)
+- [OK] `python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v` - 59 tests passed.
+- [OK] `python -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py`
+- [OK] `gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c src/pid_ai_binary_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; if ($LASTEXITCODE -eq 0) { .\tests\test_pid_ai.exe }` - `PASS: all pid_ai tests`.
+- [OK] `python -X utf8 C:\Users\caofengrui\.codex\skills\.system\skill-creator\scripts\quick_validate.py .codex\skills\pid-ai-serial` - `Skill is valid!`.
 
 ### Status
 
@@ -426,6 +431,47 @@ telemetry/config protocol, then pushed the feature commit to GitHub.
 | Hash | Message |
 |------|---------|
 | `cb03159` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 9: Session 9 - pid ai skill hardening
+
+**Date**: 2026-05-23
+**Task**: Session 9 - pid ai skill hardening
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| Area | Work Completed |
+|------|----------------|
+| Parser hardening | Rejected non-finite binary float payloads after CRC validation, tightened `loop_id`/`loop_name` to safe ASCII identifiers, and bounded mixed-stream decoder noise buffering. |
+| Command safety | Rejected embedded newline command injection and made CLI `send` wait for ACK/ERR matching the current command metadata. |
+| Dashboard safety | Added per-process `X-PID-AI-Token` for write APIs, removed wildcard CORS from JSON/OPTIONS responses, escaped dynamic protocol text before DOM insertion, and injected the token into the local page. |
+| Auto-tune reliability | Added `tick_autotune()` and wired `/api/status` plus reader idle ticks so ACK timeout advances even when the serial stream is silent. |
+| Docs/spec sync | Updated pid-ai-serial skill docs, dashboard/protocol docs, and frontend Trellis specs for token/CORS, finite binary floats, safe text fields, ACK matching, and timeout ticking. |
+| Verification | Ran Python unit tests (59 OK), Python compile checks, C protocol tests (`PASS: all pid_ai tests`), and skill quick validation (`Skill is valid!`). |
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `96615fd` | (see git log) |
 
 ### Testing
 
