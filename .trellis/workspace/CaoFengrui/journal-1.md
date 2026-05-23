@@ -691,3 +691,42 @@ without a battery-voltage sampling channel.
 ### Next Steps
 
 - None - task complete
+
+
+## Session 14: Session 14 - D-term NaN sentinel fix
+
+**Date**: 2026-05-23
+**Task**: Session 14 - D-term NaN sentinel fix
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| 修复项 | 说明 |
+|--------|------|
+| D 项首帧尖峰（正确修法） | 将 `seq==1U` 判断替换为 NaN 哨兵检测。`seq` 在 `Update()` 入口递增，STOP/disable/MANUAL/bad-dt 帧都会增加 seq，导致 `seq==1` 在真正的第一次 AUTO 帧到达前就已失效。`Init()` 和 `Reset()` 现在将 `last_feedback` 写入 `PIDAI_LAST_FEEDBACK_UNINIT_BITS`（quiet NaN），`PIDAI_Update` 用 `last_feedback != last_feedback` 检测未初始化状态，对所有提前退出路径均有效 |
+
+**修改文件**:
+- `src/pid_ai.c`
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `212982a` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
