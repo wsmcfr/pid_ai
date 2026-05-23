@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import struct
 import sys
 import time
@@ -213,7 +214,10 @@ COMMAND_STATUS_TEXTS = {
     "ARG_INVALID",
     "PARAM_RANGE",
     "INTERNAL_ERROR",
+    "UNKNOWN_STATUS",
 }
+SAFE_TEXT_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
+DEFAULT_STREAM_MAX_BUFFER_SIZE = 4096
 BINARY_MAGIC = b"\xA5\x5A"
 BINARY_VERSION = 1
 BINARY_HEADER_SIZE = 11
@@ -476,7 +480,8 @@ def parse_text_field(field_name: str, value: str) -> str:
 
     主要流程：
         1. 去掉字段两侧空白。
-        2. 拒绝空字符串、逗号和换行，避免破坏 CSV 协议边界。
+        2. 拒绝空字符串、逗号、换行和控制字符，避免破坏 CSV 协议边界。
+        3. 只接受稳定 ASCII 标识符字符，防止 loop 文本进入 UI 时形成 HTML/脚本注入面。
 
     参数说明：
         field_name 为字段名，用于生成错误消息。
@@ -490,6 +495,8 @@ def parse_text_field(field_name: str, value: str) -> str:
         raise ValueError(f"{field_name} is required")
     if "," in text or "\r" in text or "\n" in text:
         raise ValueError(f"{field_name} contains invalid separator")
+    if not text.isascii() or not SAFE_TEXT_PATTERN.fullmatch(text):
+        raise ValueError(f"{field_name} contains unsafe characters")
     return text
 
 
@@ -620,7 +627,12 @@ def _binary_unpack_named_fields(kind: str, fields: list[str], formats: list[str]
         raise ValueError(f"expected payload length {expected_length}, got {len(payload)}")
 
     unpacked = struct.unpack("<" + "".join(formats), payload)
-    data = {field_name: value for field_name, value in zip(fields, unpacked)}
+    data: dict[str, Any] = {}
+    for field_name, field_format, value in zip(fields, formats, unpacked):
+        if field_format not in ("i", "I") and not math.isfinite(float(value)):
+            # 二进制 float32 可能直接携带 NaN/Inf；CRC 只能证明传输完整，不能证明数值可用于调参。
+            raise ValueError(f"{field_name} must be finite")
+        data[field_name] = value
     validation_error = validate_named_numeric_data(kind, data)
     if validation_error is not None:
         raise ValueError(validation_error)
@@ -896,9 +908,20 @@ class ProtocolStreamDecoder:
         readline，因为二进制 payload 内可能不包含换行且会阻塞到超时。
     """
 
-    def __init__(self) -> None:
-        """初始化内部字节缓冲。"""
+    def __init__(self, max_buffer_size: int = DEFAULT_STREAM_MAX_BUFFER_SIZE) -> None:
+        """
+        函数作用：
+            初始化内部字节缓冲和最大缓冲长度。
+
+        参数说明：
+            max_buffer_size 为无完整帧时最多保留的字节数；超限会丢弃旧文本噪声，
+            避免异常串口流长期没有换行或二进制 magic 时耗尽内存。
+
+        返回值：
+            构造函数无显式返回值。
+        """
         self._buffer = bytearray()
+        self.max_buffer_size = max(1, int(max_buffer_size))
 
     def feed(self, chunk: bytes | bytearray | memoryview) -> list[dict]:
         """
@@ -918,6 +941,7 @@ class ProtocolStreamDecoder:
         """
         if chunk:
             self._buffer.extend(bytes(chunk))
+            self._trim_unframed_noise()
 
         frames: list[dict] = []
         while self._buffer:
@@ -959,6 +983,25 @@ class ProtocolStreamDecoder:
             self._append_text_frame(frames, line_bytes)
 
         return frames
+
+    def _trim_unframed_noise(self) -> None:
+        """
+        函数作用：
+            控制混合协议解码器在无完整帧输入时的缓冲上限。
+
+        主要流程：
+            如果缓冲超过 max_buffer_size，优先保留末尾可能组成二进制 magic 的字节和最近文本片段；
+            文本协议依赖换行成帧，过长未终止片段只能视为噪声丢弃。
+
+        参数说明：
+            无参数，读取并修改 self._buffer。
+
+        返回值：
+            无返回值。
+        """
+        if len(self._buffer) <= self.max_buffer_size:
+            return
+        del self._buffer[: len(self._buffer) - self.max_buffer_size]
 
     def _find_text_newline(self) -> int | None:
         """
@@ -1596,7 +1639,7 @@ def normalize_command(command: str) -> str:
         规范化待发送的 PID AI 命令文本。
 
     主要流程：
-        检查命令必须以 {CMD} 开头，并保证以 CRLF 结尾。
+        检查命令必须以 {CMD} 开头，拒绝嵌入换行，最后保证以 CRLF 结尾。
 
     参数说明：
         command 为用户显式提供的命令。
@@ -1607,6 +1650,8 @@ def normalize_command(command: str) -> str:
     text = command.strip()
     if not text.startswith("{CMD}"):
         raise ValueError("command must start with {CMD}")
+    if "\r" in text or "\n" in text:
+        raise ValueError("command must be a single line")
     return text + "\r\n"
 
 
@@ -2435,6 +2480,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     port, baud = resolved
 
     try:
+        metadata = extract_command_metadata(args.command)
         command = normalize_command(args.command)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
@@ -2456,7 +2502,13 @@ def cmd_send(args: argparse.Namespace) -> int:
                 record = {"port": port, "baud": baud, "time": time.time(), **parsed}
                 print_record(record, args.jsonl)
                 if parsed["kind"] in ("ack", "err"):
-                    return 0 if parsed["kind"] == "ack" else 1
+                    if response_matches_pending_command(metadata, parsed):
+                        return 0 if parsed["kind"] == "ack" else 1
+                    if not args.jsonl:
+                        print(
+                            f"Ignored unmatched response for {parsed.get('command')}; waiting for {metadata['command_name']}.",
+                            file=sys.stderr,
+                        )
     except (OSError, serial.SerialException) as exc:
         print(f"Serial send failed: {exc}", file=sys.stderr)
         return 1

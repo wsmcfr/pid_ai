@@ -1,5 +1,9 @@
+import argparse
+import contextlib
+import io
 import pathlib
 import sys
+import struct
 import unittest
 
 
@@ -375,6 +379,32 @@ class PidAiSerialParserTest(unittest.TestCase):
         self.assertFalse(parsed["valid"])
         self.assertIn("CRC", parsed["error"])
 
+    def test_binary_pid_frame_rejects_non_finite_float_fields(self) -> None:
+        """
+        函数作用：
+            验证二进制 PID payload 中的 NaN/Inf 不会绕过文本 parser 的有限数校验。
+
+        主要流程：
+            1. 构造一条合法二进制 PID 帧。
+            2. 手工把 target 的 float32 字节改成 NaN，并重新计算 CRC，模拟板端坏数据。
+            3. 调用 parse_binary_frame，要求返回 valid=False 且错误指向 target。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        text_frame = pid_ai_serial.parse_frame(VALID_PID_LINE)
+        binary_frame = bytearray(pid_ai_serial.build_binary_frame("pid", text_frame["data"], transport_seq=83))
+        target_offset = pid_ai_serial.BINARY_HEADER_SIZE + 12
+        binary_frame[target_offset : target_offset + 4] = struct.pack("<f", float("nan"))
+        payload_length = struct.unpack("<H", binary_frame[9:11])[0]
+        crc = pid_ai_serial.binary_crc16(binary_frame[2 : pid_ai_serial.BINARY_HEADER_SIZE + payload_length])
+        binary_frame[pid_ai_serial.BINARY_HEADER_SIZE + payload_length :] = struct.pack("<H", crc)
+
+        parsed = pid_ai_serial.parse_binary_frame(bytes(binary_frame))
+
+        self.assertFalse(parsed["valid"])
+        self.assertIn("target must be finite", parsed["error"])
+
     def test_binary_cfg_and_cfgx_frames_parse_to_typed_config(self) -> None:
         """
         函数作用：
@@ -481,6 +511,137 @@ class PidAiSerialParserTest(unittest.TestCase):
 
         self.assertEqual(prefix, "{BIN:PID}")
         self.assertGreaterEqual(pid_ai_serial.score_scan_frame(binary_frame, prefix), 15)
+
+    def test_protocol_stream_decoder_bounds_unterminated_text_noise(self) -> None:
+        """
+        函数作用：
+            验证混合协议流解码器会限制无换行文本噪声的缓冲长度。
+
+        主要流程：
+            1. 使用很小的 max_buffer_size 创建 decoder。
+            2. 输入大量没有换行、没有二进制 magic 的噪声字节。
+            3. 校验内部缓冲不会无限增长，避免异常串口流耗尽内存。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        stream = pid_ai_serial.ProtocolStreamDecoder(max_buffer_size=16)
+
+        frames = stream.feed(b"x" * 128)
+
+        self.assertEqual(frames, [])
+        self.assertLessEqual(len(stream._buffer), 16)
+
+    def test_text_fields_reject_html_like_loop_identifiers(self) -> None:
+        """
+        函数作用：
+            验证 loop_id/loop_name 只接受安全 ASCII 标识符，不允许 HTML 片段进入 UI 状态。
+
+        主要流程：
+            构造带 `<img...>` loop_id 的 PIDX 帧并解析，要求该帧被拒绝。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        bad_line = VALID_PIDX_LINE.replace("speed_l", "<img src=x onerror=alert(1)>", 1)
+
+        parsed = pid_ai_serial.parse_frame(bad_line)
+
+        self.assertFalse(parsed["valid"])
+        self.assertIn("loop_id", parsed["error"])
+
+    def test_normalize_command_rejects_embedded_newline_injection(self) -> None:
+        """
+        函数作用：
+            验证单条 `{CMD}` 命令不能携带额外换行和第二条命令。
+
+        主要流程：
+            调用 normalize_command 处理带 CRLF 的命令文本，要求抛出 ValueError。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        with self.assertRaises(ValueError):
+            pid_ai_serial.normalize_command("{CMD}GET_CFG\r\n{CMD}ENABLE,1")
+
+    def test_send_command_ignores_unrelated_ack_response(self) -> None:
+        """
+        函数作用：
+            验证 CLI send 子命令不会把其他命令的 ACK 当成本次命令成功。
+
+        主要流程：
+            1. 用 fake serial 替换 open_serial，先返回一条不匹配的 ACK，之后一直超时。
+            2. 发送 SET_PID。
+            3. 校验 cmd_send 返回失败，说明它等待匹配当前命令的 ACK/ERR。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+
+        class FakeSerial:
+            """
+            类作用：
+                模拟最小 pyserial 对象，只提供 cmd_send 用到的上下文管理、写入和 readline。
+            """
+
+            def __init__(self) -> None:
+                """初始化待返回的串口行。"""
+                self.lines = [b"{ACK}GET_CFG,OK\r\n"]
+
+            def __enter__(self) -> "FakeSerial":
+                """进入 with 块时返回自身。"""
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                """退出 with 块无需释放真实资源。"""
+                return None
+
+            def write(self, data: bytes) -> int:
+                """
+                函数作用：
+                    接收待写命令字节并模拟写入成功。
+
+                参数说明：
+                    data 为 cmd_send 编码后的 `{CMD}` 字节。
+
+                返回值：
+                    返回写入字节数。
+                """
+                return len(data)
+
+            def flush(self) -> None:
+                """模拟 pyserial flush，无返回值。"""
+                return None
+
+            def readline(self) -> bytes:
+                """
+                函数作用：
+                    依次返回预设串口行；耗尽后返回空字节模拟超时。
+
+                返回值：
+                    返回一行 bytes 或空 bytes。
+                """
+                if self.lines:
+                    return self.lines.pop(0)
+                return b""
+
+        args = argparse.Namespace(
+            command="{CMD}SET_PID,1.000,0.100,0.010",
+            port="COM1",
+            baud=115200,
+            auto=False,
+            response_seconds=0.01,
+            jsonl=True,
+        )
+        original_open_serial = pid_ai_serial.open_serial
+        pid_ai_serial.open_serial = lambda port, baud, timeout: FakeSerial()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                result = pid_ai_serial.cmd_send(args)
+        finally:
+            pid_ai_serial.open_serial = original_open_serial
+
+        self.assertEqual(result, 1)
 
 
 class PidAiAutoTuneTest(unittest.TestCase):

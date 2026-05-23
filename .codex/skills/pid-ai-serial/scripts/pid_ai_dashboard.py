@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import secrets
 import socket
 import sys
 import threading
@@ -685,6 +686,7 @@ class DashboardState:
         self._loops: dict[str, dict[str, Any]] = {}
         self._experiment_recorder = ExperimentRecorder(experiment_dir, experiment_window_seconds)
         self._binary_decoder = serial_tool.BinaryFrameDecoder()
+        self.api_token = secrets.token_urlsafe(32)
 
         # 串口资源字段只由 connect/disconnect 和读取线程修改，必须在锁内访问。
         self._serial_handle: Any | None = None
@@ -760,6 +762,33 @@ class DashboardState:
                 "command_history": json_safe_copy(list(self._command_history)),
                 "experiment_recording": self._experiment_recorder.snapshot(),
             }
+
+    def tick_autotune(self, now: float | None = None) -> dict[str, Any]:
+        """
+        函数作用：
+            在没有新串口帧到达时推进自动调参的超时检查。
+
+        主要流程：
+            只在自动调参启用且存在 pending step/rollback 时调用状态机 plan_next_action；
+            这样 `/api/status` 轮询或串口空读只会触发 ACK 超时/等待状态更新，不会凭旧样本生成新写参命令。
+
+        参数说明：
+            now 为当前时间戳；None 表示使用本机当前时间。
+
+        返回值：
+            返回更新后的 dashboard 快照。
+        """
+        current_time = time.time() if now is None else float(now)
+        with self._lock:
+            if self.autotune.get("enabled") and self._autotune_controller.pending_step is not None:
+                action = self._autotune_controller.plan_next_action(now=current_time)
+                self.scores = json_safe_copy(self._autotune_controller.scores)
+                self.rollback_history = json_safe_copy(self._autotune_controller.rollback_history)
+                self.autotune["state"] = self._autotune_controller.state
+                self.autotune["current_loop"] = action.get("loop_id")
+                self.autotune["last_action"] = json_safe_copy(action)
+                self.autotune["updated_at"] = current_time
+        return self.snapshot()
 
     def get_samples_after(self, since_id: int, limit: int | None = None) -> list[dict[str, Any]]:
         """
@@ -1433,6 +1462,7 @@ class DashboardState:
 
                 raw = serial_handle.read(256)
                 if not raw:
+                    self.tick_autotune()
                     continue
                 for parsed in decoder.feed(raw):
                     self.ingest_parsed_frame(parsed, raw_hint=str(parsed.get("raw", "")))
@@ -1446,7 +1476,7 @@ class DashboardState:
                 self._serial_handle = None
 
 
-INDEX_HTML = r"""<!doctype html>
+INDEX_HTML_TEMPLATE = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
@@ -2026,6 +2056,7 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
   <script>
+    window.PID_AI_API_TOKEN = "__PID_AI_API_TOKEN__";
     const series = [
       { key: "target", label: "target", color: "#0f766e", visible: true },
       { key: "feedback", label: "feedback", color: "#2563eb", visible: true },
@@ -2051,6 +2082,16 @@ INDEX_HTML = r"""<!doctype html>
       return String(value);
     };
 
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[char]));
+    }
+
     function buildLegend() {
       const legend = el("legend");
       legend.innerHTML = "";
@@ -2071,9 +2112,16 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function api(path, options = {}) {
+      const headers = {
+        "Content-Type": "application/json",
+        ...(options.headers || {})
+      };
+      if ((options.method || "GET").toUpperCase() !== "GET") {
+        headers["X-PID-AI-Token"] = window.PID_AI_API_TOKEN;
+      }
       const response = await fetch(path, {
-        headers: { "Content-Type": "application/json" },
-        ...options
+        ...options,
+        headers
       });
       const data = await response.json();
       if (!response.ok) {
@@ -2179,7 +2227,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function metricHtml(name, value) {
-      return `<div class="metric"><div class="metric-name">${name}</div><div class="metric-value">${fmt(value)}</div></div>`;
+      return `<div class="metric"><div class="metric-name">${escapeHtml(name)}</div><div class="metric-value">${escapeHtml(fmt(value))}</div></div>`;
     }
 
     function applyCfgToForm(cfg) {
@@ -2213,11 +2261,11 @@ INDEX_HTML = r"""<!doctype html>
         const cfg = loop.latest_cfg?.data || {};
         return `
           <div class="loop-row">
-            <strong>${loopId}</strong>
-            <span>kp ${fmt(cfg.kp)}</span>
-            <span>err ${fmt(pid.error)}</span>
-            <span>sat ${fmt(pid.sat)}</span>
-            <span>fault ${fmt(pid.fault ?? cfg.fault)}</span>
+            <strong>${escapeHtml(loopId)}</strong>
+            <span>kp ${escapeHtml(fmt(cfg.kp))}</span>
+            <span>err ${escapeHtml(fmt(pid.error))}</span>
+            <span>sat ${escapeHtml(fmt(pid.sat))}</span>
+            <span>fault ${escapeHtml(fmt(pid.fault ?? cfg.fault))}</span>
           </div>
         `;
       }).join("");
@@ -2251,11 +2299,11 @@ INDEX_HTML = r"""<!doctype html>
           .join(" ");
         return `
           <div class="history-row">
-            <span class="badge ${statusClass}">${item.status}</span>
+            <span class="badge ${escapeHtml(statusClass)}">${escapeHtml(item.status)}</span>
             <div>
-              <div class="history-command">${item.command || item.command_name}</div>
-              <div class="history-response muted">${meta}</div>
-              <div class="history-response muted">${response}</div>
+              <div class="history-command">${escapeHtml(item.command || item.command_name)}</div>
+              <div class="history-response muted">${escapeHtml(meta)}</div>
+              <div class="history-response muted">${escapeHtml(response)}</div>
             </div>
           </div>
         `;
@@ -2506,6 +2554,24 @@ INDEX_HTML = r"""<!doctype html>
 """
 
 
+def build_index_html(api_token: str) -> str:
+    """
+    函数作用：
+        将 dashboard 静态 HTML 模板实例化为包含本次进程 API token 的页面。
+
+    主要流程：
+        使用 JSON 字符串编码 token，避免特殊字符破坏 script 字面量；模板中的占位符只在服务端启动时替换。
+
+    参数说明：
+        api_token 为 DashboardState 启动时生成的随机写 API token。
+
+    返回值：
+        返回完整 HTML 文本。
+    """
+    encoded_token = json.dumps(str(api_token))[1:-1]
+    return INDEX_HTML_TEMPLATE.replace("__PID_AI_API_TOKEN__", encoded_token)
+
+
 class DashboardRequestHandler(BaseHTTPRequestHandler):
     """
     PID AI dashboard HTTP 请求处理器。
@@ -2539,7 +2605,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             响应浏览器预检请求。
 
         主要流程：
-            返回允许本机页面访问 JSON API 的基础 CORS 头。
+            仅返回 204 表示本地服务存活，不开放跨站 CORS 读取或写入权限。
+            dashboard 页面与 API 同源，正常 fetch 不需要依赖 Access-Control-Allow-Origin。
 
         参数说明：
             无参数。
@@ -2548,9 +2615,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             无返回值。
         """
         self.send_response(HTTPStatus.NO_CONTENT)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -2569,13 +2633,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         """
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            self.write_html(INDEX_HTML)
+            self.write_html(build_index_html(self.state.api_token))
             return
         if parsed.path == "/api/ports":
             self.handle_ports()
             return
         if parsed.path == "/api/status":
-            self.write_json(self.state.snapshot())
+            self.write_json(self.state.tick_autotune())
             return
         if parsed.path == "/api/samples":
             query = parse_qs(parsed.query)
@@ -2603,15 +2667,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         try:
             payload = self.read_json_body()
             if parsed.path == "/api/connect":
+                self.require_write_token()
                 self.handle_connect(payload)
                 return
             if parsed.path == "/api/disconnect":
+                self.require_write_token()
                 self.write_json(self.state.disconnect())
                 return
             if parsed.path == "/api/command":
+                self.require_write_token()
                 self.handle_command(payload)
                 return
             if parsed.path == "/api/autotune":
+                self.require_write_token()
                 self.handle_autotune(payload)
                 return
             self.write_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -2640,6 +2708,26 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             record["is_bluetooth"] = serial_tool.is_bluetooth_port(port)
             ports.append(record)
         self.write_json({"ports": ports})
+
+    def require_write_token(self) -> None:
+        """
+        函数作用：
+            校验本地 dashboard 写 API 的 CSRF token。
+
+        主要流程：
+            页面加载时服务端把随机 token 注入 HTML；所有 POST 请求必须通过
+            `X-PID-AI-Token` 带回同一值。其他网站无法读取本地页面中的 token，
+            因此不能直接诱导浏览器向本地串口服务发送写命令。
+
+        参数说明：
+            无参数，读取 self.headers 和 self.state.api_token。
+
+        返回值：
+            token 匹配时无返回；不匹配时抛出 ValueError，由 do_POST 转成 400。
+        """
+        token = str(self.headers.get("X-PID-AI-Token", ""))
+        if not secrets.compare_digest(token, self.state.api_token):
+            raise ValueError("invalid API token")
 
     def handle_connect(self, payload: dict[str, Any]) -> None:
         """
@@ -2796,7 +2884,8 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             写回 JSON 响应。
 
         主要流程：
-            将 payload 序列化为 UTF-8 JSON，并附加本地访问需要的基础响应头。
+            将 payload 序列化为 UTF-8 JSON，并附加 no-store 等基础响应头。
+            这里不设置 Access-Control-Allow-Origin，避免其他网页读取本机串口 dashboard 数据。
 
         参数说明：
             payload 为 JSON 兼容字典。
@@ -2809,7 +2898,6 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

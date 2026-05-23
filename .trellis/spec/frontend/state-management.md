@@ -147,7 +147,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | Step size | Default maximum change is `10%`; command builders format PID numbers with three decimals. |
 | ACK gate | `OBSERVE_RESULT` may start only after a matching `{ACK}` for the pending command and `loop_id`. |
 | Post-ACK scoring window | Evaluate keep/rollback using only samples received after the matching ACK; crop that post-ACK slice by `window_seconds`. |
-| ACK timeout | Store `sent_at` for each step and rollback command; if `ack_timeout_seconds` elapses without a matching ACK/ERR, move the controller to `ABORT`. |
+| ACK timeout | Store `sent_at` for each step and rollback command; if `ack_timeout_seconds` elapses without a matching ACK/ERR, move the controller to `ABORT` even when the serial stream is silent. |
 | ERR/timeout gate | `{ERR}`, ACK timeout, serial disconnect, or mismatched pending command moves the controller to `ABORT`. |
 | Regression rollback | If post-ACK score is worse and rollback is enabled, send old parameters using `SET_PIDX`, append `rollback_history`, and keep the loop pending until the rollback command receives a matching `{ACK}`. |
 | Rollback failure | Rollback `{ERR}` or rollback ACK timeout moves the controller to `ABORT`; do not mark the loop completed. |
@@ -165,6 +165,11 @@ matching ACK. The post-step score must start after that boundary so pre-change
 baseline telemetry cannot dilute or hide a regression. If a valid ACK/ERR arrives
 for a different command or `loop_id` while a step or rollback is pending, abort
 the auto-tune session and surface the mismatched response.
+
+ACK timeout progression must not depend solely on receiving another serial
+frame. The dashboard should tick the auto-tune state from `/api/status` polling,
+the reader thread's empty-read path, or an equivalent timer so a dropped ACK on a
+quiet board cannot leave `pending_step` or rollback pending forever.
 
 Auto-tune proposals must include explainable strategy metadata:
 
@@ -207,6 +212,7 @@ class DashboardState:
         experiment_dir: str | Path | None = None,
         experiment_window_seconds: float = DEFAULT_EXPERIMENT_WINDOW_SECONDS,
     ): ...
+    def tick_autotune(self, now: float | None = None) -> dict[str, Any]: ...
 
 class ExperimentRecorder:
     def start_command(
@@ -242,6 +248,16 @@ experiment_recording.latest_record
 experiment_recording.write_errors
 ```
 
+Dashboard write API signatures:
+
+```text
+POST /api/connect
+POST /api/disconnect
+POST /api/command
+POST /api/autotune
+Header: X-PID-AI-Token: <process-random-token>
+```
+
 ### 3. Contracts
 
 | Boundary | Contract |
@@ -252,6 +268,9 @@ experiment_recording.write_errors
 | ACK/ERR -> recorder | Update the same command id record after command history matches the response. |
 | Local send error -> recorder | Mark status `error` with a `local_error` response; do not fabricate board ACK/ERR. |
 | File output | Write JSON atomically with a temporary file and replacement; file IO errors must not stop serial processing. |
+| Status poll -> auto-tune | Advance pending ACK timeout checks without requiring a new serial frame. |
+| Browser write API -> state | Require the per-process `X-PID-AI-Token` for every POST that can connect, disconnect, send commands, or enable auto-tune. |
+| Cross-origin requests | Do not expose JSON API through wildcard CORS; the local HTML and API are same-origin. |
 
 Experiment JSON must contain these top-level fields:
 
@@ -272,6 +291,8 @@ before_samples, after_samples, result
 | Sample from another `loop_id` | Do not add it to a loop-specific record. |
 | Bad protocol frame | Do not enter experiment samples because it never enters typed dashboard state. |
 | Output directory write failure | Add a write error to `experiment_recording.write_errors`; keep runtime state alive. |
+| Missing or wrong `X-PID-AI-Token` on write API | Return an HTTP error and do not mutate serial connection, command history, or auto-tune settings. |
+| Silent serial stream during pending ACK | `tick_autotune()` eventually sets `autotune.state=ABORT` with an ACK timeout reason. |
 
 ### 5. Good/Base/Bad Cases
 
@@ -279,7 +300,9 @@ before_samples, after_samples, result
 |---|---|---|
 | Good | `SET_PIDX,speed_l` with matching ACK and later speed_l PIDX | JSON contains before/after samples for `speed_l`. |
 | Base | `SET_PID` while disconnected | JSON contains local error and no fake ACK. |
+| Base | POST `/api/autotune` without `X-PID-AI-Token` | Request is rejected before state changes. |
 | Bad | ACK received for unrelated command | Existing ACK matching rules decide unsolicited/mismatch; recorder must not update the wrong record. |
+| Bad | No frames arrive after a `SET_PIDX` step | ACK timeout is still enforced by status polling or reader idle ticks. |
 | Bad | Raw malformed `{PIDX}` line | Parse errors increase, but experiment record samples are unchanged. |
 
 ### 6. Tests Required
@@ -292,6 +315,8 @@ Add dashboard tests under `.codex/skills/pid-ai-serial/tests/`:
 | Local send error | A JSON file is created with `result.status=error` and `response.kind=local_error`. |
 | Cross-loop filtering | A `SET_PIDX` record does not include samples from a different `loop_id`. |
 | Status summary | `snapshot()["experiment_recording"]` reports enabled state, count, latest record, and write errors. |
+| Write API token | Missing token is rejected; matching token is accepted. |
+| Silent ACK timeout | A pending auto-tune step moves to `ABORT` after `ack_timeout_seconds` without ingesting another frame. |
 
 ### 7. Wrong vs Correct
 
@@ -307,6 +332,22 @@ Correct:
 ```python
 # Command history must first match a real ACK/ERR or local transport error.
 self._experiment_recorder.attach_response(entry, parsed_ack_or_err, now)
+```
+
+Wrong:
+
+```python
+# Timeout only runs when ingesting a new frame, so a silent board can stay pending forever.
+def ingest_parsed_frame(self, parsed):
+    self._autotune_controller.plan_next_action(...)
+```
+
+Correct:
+
+```python
+# Polling or idle reads advance timeout checks even without new telemetry.
+def tick_autotune(self, now=None):
+    self._autotune_controller.plan_next_action(now=now)
 ```
 
 Wrong:
@@ -337,5 +378,6 @@ self._experiment_recorder.observe_sample(sample, now)
 | Starting post-step evaluation before ACK. | The score may describe old parameters. | Record the ACK sample boundary and wait for new telemetry. |
 | Scoring rollback decisions with pre-ACK samples. | Old-parameter telemetry can hide a regression or trigger the wrong keep/rollback decision. | Filter the score input to samples after the matching ACK boundary. |
 | Ignoring mismatched ACK/ERR while a command is pending. | Board or host transaction drift can leave auto-tune waiting forever or trusting the wrong result. | Abort and show the mismatched command/loop evidence. |
+| Only checking ACK timeout when a new frame arrives. | A quiet board or dropped response can leave auto-tune pending forever. | Advance timeout from `/api/status`, reader idle ticks, or a timer. |
 | Treating a rollback write as completed immediately. | The dashboard may continue to the next loop while the board still runs bad parameters. | Model rollback as its own pending command and wait for matching ACK. |
 | Clearing auto-tune aborts on the next good frame. | Operators lose the reason the automatic write flow stopped. | Require explicit user action to re-enable after `ABORT`. |

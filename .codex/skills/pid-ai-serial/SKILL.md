@@ -114,8 +114,10 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | 字段数量 | 必须精确匹配协议文档，缺字段、多字段、尾随逗号都视为坏帧 |
 | 数值字段 | 必须能解析且为有限数，拒绝 `nan`、`inf`、`-inf` |
 | 枚举字段 | `sat`、`mode`、`enable`、`sensor_ok`、`line_lost` 等必须在合法范围 |
-| 文本字段 | `loop_id` 和 `loop_name` 只允许安全文本，不能为空 |
+| 文本字段 | `loop_id` 和 `loop_name` 只允许 `A-Za-z0-9_.:-`，不能为空 |
 | 坏帧处理 | 保留 raw line 和 parse error，不覆盖最新有效状态 |
+
+二进制帧 CRC 通过后仍要校验 payload 语义：所有 `float32` 必须为 finite，`loop_id` / `loop_name` 必须符合安全文本字符集。CRC 正确的 NaN/Inf 帧也必须当坏帧处理。
 
 ## 分环命令
 
@@ -189,6 +191,8 @@ POST /api/autotune
 
 `/api/status` 应包含 `loops`、`autotune`、`scores`、`rollback_history` 和命令历史；`POST /api/command` 记录 `loop_id` 和调参原因；`POST /api/autotune` 默认关闭，只有 `enabled=true` 且 `mode="auto-tune"` 时自动写参。
 
+本地 dashboard 不开放 wildcard CORS。所有写接口 `POST /api/connect`、`POST /api/disconnect`、`POST /api/command`、`POST /api/autotune` 必须带页面注入的 `X-PID-AI-Token`；缺失或不匹配时不得修改串口连接、命令历史或自动调参状态。前端把串口协议文本写入 DOM 前必须转义，不能直接拼进未转义 `innerHTML`。
+
 ## 验证命令
 
 修改本 skill、协议、C 库、parser、dashboard 或测试后，运行：
@@ -197,7 +201,7 @@ POST /api/autotune
 gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c src/pid_ai_binary_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; if ($LASTEXITCODE -eq 0) { .\tests\test_pid_ai.exe }
 python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v
 python -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py
-python C:\Users\caofengrui\.codex\skills\.system\skill-creator\scripts\quick_validate.py .codex\skills\pid-ai-serial
+python -X utf8 C:\Users\caofengrui\.codex\skills\.system\skill-creator\scripts\quick_validate.py .codex\skills\pid-ai-serial
 ```
 
 提交前确认 `.spec-workflow/` 仍是未跟踪目录，不要加入本任务提交。

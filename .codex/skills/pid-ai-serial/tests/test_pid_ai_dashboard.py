@@ -1,8 +1,10 @@
 import pathlib
+import io
 import sys
 import tempfile
 import unittest
 import json
+import time
 
 
 # 测试脚本目录，用于把 skill 自带的 scripts 目录加入导入路径。
@@ -471,6 +473,308 @@ class DashboardStateTest(unittest.TestCase):
 
         self.assertIsNotNone(handler.payload)
         self.assertEqual(handler.payload["autotune"]["ack_timeout_seconds"], 4.5)
+
+    def test_dashboard_autotune_tick_aborts_when_ack_timeout_elapses_without_frames(self) -> None:
+        """
+        函数作用：
+            验证 dashboard 在串口静默时也会推进自动调参 ACK 超时，而不是永远 pending。
+
+        主要流程：
+            1. 启用 auto-tune 并注入 CFGX/PIDX，使状态机生成 pending SET_PIDX。
+            2. 不再注入任何 ACK/ERR 或遥测帧。
+            3. 调用 tick_autotune，模拟 `/api/status` 轮询或读线程空闲 tick，校验进入 ABORT。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        class FakeSerial:
+            """
+            类作用：
+                模拟已连接串口，使 auto-tune 可以成功写入 step 命令但永远收不到 ACK。
+            """
+
+            def write(self, data: bytes) -> int:
+                """
+                函数作用：
+                    模拟 pyserial.write 成功，确保测试覆盖 ACK 超时而不是本地写失败。
+
+                参数说明：
+                    data 为待发送命令字节。
+
+                返回值：
+                    返回写入字节数。
+                """
+                return len(data)
+
+            def flush(self) -> None:
+                """模拟 pyserial.flush，无返回值。"""
+                return None
+
+        state = DashboardState(max_samples=8)
+        with state._lock:
+            state._serial_handle = FakeSerial()
+            state.connected = True
+        state.configure_autotune(
+            enabled=True,
+            mode="auto-tune",
+            ack_timeout_seconds=0.01,
+            window_seconds=0.1,
+        )
+        state.ingest_line(make_cfgx_line("speed_l", 1.0))
+        state.ingest_line(make_pidx_line("speed_l", 1, 90.0))
+
+        pending = state.snapshot()["autotune"]
+        self.assertEqual(pending["last_action"]["type"], "send")
+        time.sleep(0.02)
+        snapshot = state.tick_autotune()
+
+        self.assertEqual(snapshot["autotune"]["state"], "ABORT")
+        self.assertIn("ACK timeout", snapshot["autotune"]["last_action"]["reason"])
+
+    def test_write_api_requires_matching_csrf_token(self) -> None:
+        """
+        函数作用：
+            验证 dashboard 的写 API 需要启动时生成的本地 token，防止其他网页直接 POST 命令。
+
+        主要流程：
+            1. 创建 state 并取得 api_token。
+            2. 构造最小 fake handler，分别用缺失 token 和正确 token 调用 require_write_token。
+            3. 校验缺失 token 被拒绝，正确 token 通过。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+
+        class FakeHandler:
+            """
+            类作用：
+                为 require_write_token 单元测试提供 state 和请求头字段。
+            """
+
+            def __init__(self, state: DashboardState, token: str | None) -> None:
+                """初始化 fake handler 的 state 和 headers。"""
+                self.state = state
+                self.headers = {}
+                if token is not None:
+                    self.headers["X-PID-AI-Token"] = token
+
+        state = DashboardState(max_samples=4)
+        missing = FakeHandler(state, None)
+        with self.assertRaises(ValueError):
+            DashboardRequestHandler.require_write_token(missing)
+
+        allowed = FakeHandler(state, state.api_token)
+        DashboardRequestHandler.require_write_token(allowed)
+
+    def test_json_responses_do_not_enable_cross_origin_reads(self) -> None:
+        """
+        函数作用：
+            验证 dashboard JSON 响应不主动开放跨站读取权限。
+
+        主要流程：
+            构造最小 fake handler 调用 write_json，检查响应头中没有 Access-Control-Allow-Origin。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+
+        class FakeHandler:
+            """
+            类作用：
+                捕获 write_json 写出的状态码、响应头和 body，避免启动真实 HTTP 服务。
+            """
+
+            def __init__(self) -> None:
+                """初始化响应捕获容器。"""
+                self.headers = []
+                self.body = io.BytesIO()
+                self.wfile = self.body
+
+            def send_response(self, status) -> None:
+                """
+                函数作用：
+                    记录 HTTP 状态码。
+
+                参数说明：
+                    status 为 write_json 传入的 HTTPStatus。
+
+                返回值：
+                    无返回值。
+                """
+                self.status = status
+
+            def send_header(self, name: str, value: str) -> None:
+                """
+                函数作用：
+                    记录响应头键值。
+
+                参数说明：
+                    name 为响应头名称。
+                    value 为响应头值。
+
+                返回值：
+                    无返回值。
+                """
+                self.headers.append((name, value))
+
+            def end_headers(self) -> None:
+                """模拟 BaseHTTPRequestHandler.end_headers，无返回值。"""
+                return None
+
+        handler = FakeHandler()
+
+        DashboardRequestHandler.write_json(handler, {"ok": True})
+
+        header_names = {name.lower() for name, _value in handler.headers}
+        self.assertNotIn("access-control-allow-origin", header_names)
+
+    def test_status_endpoint_ticks_autotune_before_returning_snapshot(self) -> None:
+        """
+        函数作用：
+            验证 GET /api/status 会推进自动调参 ACK 超时检查。
+
+        主要流程：
+            构造最小 fake handler 调用 do_GET，要求响应来自 state.tick_autotune 而不是裸 snapshot。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+
+        class FakeState:
+            """
+            类作用：
+                为 do_GET 测试提供可观察的 tick_autotune 行为。
+            """
+
+            def __init__(self) -> None:
+                """初始化调用计数。"""
+                self.tick_count = 0
+
+            def tick_autotune(self) -> dict:
+                """
+                函数作用：
+                    模拟 status 轮询推进状态机并返回快照。
+
+                返回值：
+                    返回带 tick_count 的响应对象，供断言使用。
+                """
+                self.tick_count += 1
+                return {"tick_count": self.tick_count}
+
+        class FakeHandler:
+            """
+            类作用：
+                捕获 do_GET 对 `/api/status` 写出的 JSON 响应。
+            """
+
+            def __init__(self) -> None:
+                """初始化 path、state 和响应载荷。"""
+                self.path = "/api/status"
+                self.state = FakeState()
+                self.payload = None
+
+            def write_json(self, payload: dict, status=None) -> None:
+                """
+                函数作用：
+                    捕获 JSON 响应体。
+
+                参数说明：
+                    payload 为 do_GET 准备写出的响应对象。
+                    status 为可选 HTTP 状态码，本测试不使用。
+
+                返回值：
+                    无返回值。
+                """
+                self.payload = payload
+
+        handler = FakeHandler()
+
+        DashboardRequestHandler.do_GET(handler)
+
+        self.assertEqual(handler.state.tick_count, 1)
+        self.assertEqual(handler.payload, {"tick_count": 1})
+
+    def test_options_response_does_not_enable_cross_origin_access(self) -> None:
+        """
+        函数作用：
+            验证 dashboard 的 OPTIONS 响应不会重新开放跨站 CORS 入口。
+
+        主要流程：
+            构造最小 fake handler 调用 do_OPTIONS，检查响应状态为 204 且没有 Access-Control-Allow-* 头。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+
+        class FakeHandler:
+            """
+            类作用：
+                捕获 do_OPTIONS 写出的状态码和响应头，避免启动真实 HTTP 服务。
+            """
+
+            def __init__(self) -> None:
+                """初始化响应捕获容器。"""
+                self.headers = []
+
+            def send_response(self, status) -> None:
+                """
+                函数作用：
+                    记录 HTTP 状态码。
+
+                参数说明：
+                    status 为 do_OPTIONS 传入的 HTTPStatus。
+
+                返回值：
+                    无返回值。
+                """
+                self.status = status
+
+            def send_header(self, name: str, value: str) -> None:
+                """
+                函数作用：
+                    记录响应头键值。
+
+                参数说明：
+                    name 为响应头名称。
+                    value 为响应头值。
+
+                返回值：
+                    无返回值。
+                """
+                self.headers.append((name, value))
+
+            def end_headers(self) -> None:
+                """模拟 BaseHTTPRequestHandler.end_headers，无返回值。"""
+                return None
+
+        handler = FakeHandler()
+
+        DashboardRequestHandler.do_OPTIONS(handler)
+
+        header_names = {name.lower() for name, _value in handler.headers}
+        self.assertEqual(int(handler.status), 204)
+        self.assertNotIn("access-control-allow-origin", header_names)
+        self.assertNotIn("access-control-allow-headers", header_names)
+        self.assertNotIn("access-control-allow-methods", header_names)
+
+    def test_dashboard_html_uses_token_and_escape_helpers_for_dynamic_content(self) -> None:
+        """
+        函数作用：
+            验证 dashboard 页面会携带 API token，并提供 HTML 转义 helper 渲染动态协议文本。
+
+        主要流程：
+            读取 dashboard 模板，检查 `window.PID_AI_API_TOKEN`、`escapeHtml` 和写请求 token header。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        import pid_ai_dashboard
+
+        html = pid_ai_dashboard.build_index_html("token-for-test")
+
+        self.assertIn("window.PID_AI_API_TOKEN", html)
+        self.assertIn("function escapeHtml", html)
+        self.assertIn('headers["X-PID-AI-Token"] = window.PID_AI_API_TOKEN', html)
 
 
 if __name__ == "__main__":
