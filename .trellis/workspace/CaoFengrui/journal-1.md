@@ -730,3 +730,64 @@ without a battery-voltage sampling channel.
 ### Next Steps
 
 - None - task complete
+
+
+## Session 15: Session 15 - D-term early-return regression coverage
+
+**Date**: 2026-05-23
+**Task**: Session 15 - D-term early-return regression coverage
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+Completed the D-term first-frame hardening follow-up: added regression coverage
+for early-return paths before the first AUTO closed-loop calculation, verified
+the test fails against the previous `seq==1` implementation, and cleaned up the
+NaN sentinel write path for stricter MCU compiler compatibility.
+
+### Main Changes
+
+| Area | Result |
+|---|---|
+| PID D-term regression | Added `test_derivative_first_auto_after_early_return_is_suppressed()` covering STOP, disable, MANUAL, and bad-dt early-return paths before first AUTO closed-loop calculation. |
+| Compatibility cleanup | Replaced C99 compound literal NaN sentinel writes with `PIDAI_MarkLastFeedbackUninitialized()` using local `uint32_t` + `memcpy`, keeping strict-aliasing safe and C90-pedantic clean. |
+| Verification | Confirmed new regression fails against old `seq==1` implementation; current C regression passes; Python serial/dashboard tests pass; strict C99/C90 compilation passes. |
+| GitHub | Pushed `feat/pid-ai-autotune` to `origin` through commit `5e0de47`. |
+
+**Verification Commands**:
+- `gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c src/pid_ai_binary_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; if ($LASTEXITCODE -eq 0) { .\tests\test_pid_ai.exe }`
+- `git show 388be70:src/pid_ai.c | gcc -x c -Iinclude -c - -o tests\tmp_old_pid_ai.o; ... .\tests\tmp_old_pid_ai_tests.exe` (expected failure on old implementation)
+- `gcc -std=c99 -Wall -Wextra -Wpedantic -Werror -Iinclude -c src/pid_ai.c -o tests\tmp_pid_ai_strict.o`
+- `gcc -std=c90 -Wall -Wextra -Wpedantic -Iinclude -c src/pid_ai.c -o tests\tmp_pid_ai_c90.o`
+- `python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v`
+- `python -c "import pathlib; [compile(pathlib.Path(p).read_text(encoding='utf-8'), p, 'exec') for p in ['.codex/skills/pid-ai-serial/scripts/pid_ai_serial.py', '.codex/skills/pid-ai-serial/scripts/pid_ai_dashboard.py']]; print('syntax ok')"`
+- `python -X utf8 C:\Users\caofengrui\.codex\skills\.system\skill-creator\scripts\quick_validate.py .codex\skills\pid-ai-serial`
+
+**Updated Files**:
+- `src/pid_ai.c`
+- `tests/test_pid_ai.c`
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5e0de47` | (see git log) |
+| `85fe8ad` | (see git log) |
+| `212982a` | (see git log) |
+
+### Testing
+
+- [OK] C regression suite passed with `PASS: all pid_ai tests`.
+- [OK] New regression failed against old `seq==1` implementation as expected.
+- [OK] Python serial/dashboard unittest suite passed: 77 tests.
+- [OK] Strict C99 and C90-pedantic compile checks passed.
+- [OK] `pid-ai-serial` skill validation passed.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
