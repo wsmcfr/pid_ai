@@ -64,7 +64,7 @@ python .\.codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py --serial-port C
 ```powershell
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode observe
 python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode suggest
-python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode auto-tune --max-step 0.10 --window-seconds 2.0 --ack-timeout-seconds 2.0 --rollback-on-regression
+python .\.codex\skills\pid-ai-serial\scripts\pid_ai_serial.py autotune --auto --include-bluetooth --profile line-car-cascade --mode auto-tune --max-step 0.10 --window-seconds 2.0 --ack-timeout-seconds 2.0 --min-post-ack-samples 3 --rollback-on-regression
 ```
 
 核心状态机：
@@ -74,7 +74,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 -> SEND_STEP -> OBSERVE_RESULT -> KEEP_OR_ROLLBACK -> NEXT_LOOP
 ```
 
-任一安全门槛失败、收到 `{ERR}`、ACK 超时、蓝牙断流或用户停止时进入 `ABORT`。`window_seconds` 必须按接收时间或板端 `ms` 裁剪评分窗口；不能把固定样本数伪装成秒级窗口。
+任一安全门槛失败、收到 `{ERR}`、ACK 超时、蓝牙断流或用户停止时进入 `ABORT`。`window_seconds` 必须按接收时间或板端 `ms` 裁剪评分窗口；ACK 后至少等待 `--min-post-ack-samples` 条新 `{PIDX}` 样本后才允许 keep/rollback，不能用单个偶然样本决定是否回滚，也不能把固定样本数伪装成秒级窗口。
 
 ## 串级 PID 顺序
 
@@ -87,7 +87,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | 3 | `yaw_rate` | 角速度中环 | 依赖左右轮速度环响应 |
 | 4 | `line_outer` | 8 路循迹外环 | 依赖中环和内环已可控 |
 
-自动调参每次只改一个 loop 的 `kp/ki/kd`，默认单步变化不超过 `--max-step 0.10`，下发参数保留三位小数。策略会在稳态偏差时小步增加 `ki`，震荡时优先增加 `kd`，输出饱和且 `anti_windup` 频繁触发时降低 `ki`，`line_outer` 外环慢响应时用半步 `kp`。不要自动放大输出限幅、自动反转方向或自动启用危险手动输出；这些只能作为人工确认项或紧急停机项处理。
+自动调参每次只改一个 loop 的 `kp/ki/kd`，默认单步变化不超过 `--max-step 0.10`，下发参数保留三位小数。策略会在稳态偏差时小步增加 `ki`，震荡时优先增加 `kd`，输出饱和且 `anti_windup` 频繁触发时降低 `ki`，`line_outer` 外环慢响应时用半步 `kp`。如果新旧 `SET_PIDX` 按三位小数格式化后完全相同（例如参数全为 0 或过小），必须中止并要求人工先给非零 seed 参数；不要自动猜测硬件种子。不要自动放大输出限幅、自动反转方向或自动启用危险手动输出；这些只能作为人工确认项或紧急停机项处理。
 
 ## 协议帧
 
@@ -150,6 +150,7 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | Pending 匹配 | host 侧按命令名和 `loop_id` 匹配 pending 命令；旧 ACK/ERR 不带 `loop_id` 时禁止同名分环命令并发 pending |
 | ERR 处理 | 收到 `{ERR}` 后命令失败，自动调参进入停止状态 |
 | ACK 后观察 | `auto-tune` 必须等 ACK 后再开始 post-ACK 观察窗口 |
+| ACK 后样本数 | post-ACK 窗口默认至少需要 `--min-post-ack-samples 3` 条新 `{PIDX}`，样本不足时继续等待 |
 | ACK 超时 | step 和 rollback 都要记录发送时间，超过 `--ack-timeout-seconds` 未收到 ACK/ERR 必须 `ABORT` |
 | 回滚条件 | post-ACK 窗口评分变差且启用 `--rollback-on-regression` 时，发送旧参数 `SET_PIDX`；rollback 是独立 pending 命令，收到匹配 ACK 后才算当前 loop 完成 |
 

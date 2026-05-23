@@ -136,7 +136,7 @@ are board-specific.
 
 | Signal | Reason |
 |---|---|
-| `target`, `feedback`, `error`, `d_error` | Required to diagnose response speed, overshoot, and oscillation. |
+| `target`, `feedback`, `error`, `d_error` | Required to diagnose response speed, overshoot, and oscillation; `d_error` is the feedback delta used by Derivative-on-Measurement. |
 | `loop_id`, `loop_name` in extension frames | Required to route cascade telemetry and command results to the correct controller. |
 | `integral`, `i_out`, `anti_windup` | Required to diagnose integral buildup and anti-windup behavior. |
 | `out_raw`, `out_limited`, `actuator`, `sat` | Required to distinguish controller demand from actuator saturation. |

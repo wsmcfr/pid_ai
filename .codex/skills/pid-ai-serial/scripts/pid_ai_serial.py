@@ -218,6 +218,8 @@ COMMAND_STATUS_TEXTS = {
 }
 SAFE_TEXT_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
 DEFAULT_STREAM_MAX_BUFFER_SIZE = 4096
+# ACK 后至少等待多条新遥测再评分，避免单个偶然样本触发错误保留或回滚。
+DEFAULT_MIN_POST_ACK_SAMPLES = 3
 BINARY_MAGIC = b"\xA5\x5A"
 BINARY_VERSION = 1
 BINARY_HEADER_SIZE = 11
@@ -1847,6 +1849,7 @@ class AutoTuneConfig:
     max_step: float = 0.10
     window_seconds: float = 3.0
     ack_timeout_seconds: float = 2.0
+    min_post_ack_samples: int = DEFAULT_MIN_POST_ACK_SAMPLES
     rollback_on_regression: bool = True
 
 
@@ -2036,13 +2039,17 @@ class AutoTuneController:
                 }
 
             ack_sample_count = int(self.pending_step.get("ack_sample_count", 0))
-            if len(self.samples_by_loop.get(loop_id, [])) <= ack_sample_count:
+            post_ack_sample_count = max(0, len(self.samples_by_loop.get(loop_id, [])) - ack_sample_count)
+            min_post_ack_samples = max(1, int(self.config.min_post_ack_samples))
+            if post_ack_sample_count < min_post_ack_samples:
                 return {
                     "type": "wait",
                     "state": self.state,
                     "loop_id": loop_id,
                     "reason": "waiting for post-ACK telemetry",
                     "command": self.pending_step["command"],
+                    "post_ack_sample_count": post_ack_sample_count,
+                    "min_post_ack_samples": min_post_ack_samples,
                 }
             return self._evaluate_pending_step(current_time, ack_sample_count)
 
@@ -2052,11 +2059,14 @@ class AutoTuneController:
 
         score = self.score_loop(loop_id)
         self.scores[loop_id] = score
-        proposal = self._build_step(loop_id, score)
 
         if self.config.mode == "observe":
             self.state = "OBSERVE_BASELINE"
             return {"type": "observe", "loop_id": loop_id, "score": score}
+
+        proposal = self._build_step(loop_id, score)
+        if proposal.get("type") == "abort":
+            return proposal
 
         if self.config.mode == "suggest" or not self.config.auto:
             self.state = "PROPOSE_STEP"
@@ -2073,6 +2083,68 @@ class AutoTuneController:
             "reason": proposal["reason"],
             "strategy": proposal["strategy"],
             "changed_param": proposal["changed_param"],
+        }
+
+    def plan_timeout_action(self, now: float | None = None) -> dict[str, Any]:
+        """
+        函数作用：
+            在没有新有效串口帧时只推进自动调参的等待/超时状态。
+
+        主要流程：
+            1. 已经 ABORT 时直接返回停止原因。
+            2. 没有 pending step 时只返回等待有效帧，不能基于旧窗口创建新的 send/rollback。
+            3. 已有 pending step 时复用 ACK 超时和 post-ACK 等待逻辑，保证静默串口不会永久 pending。
+
+        参数说明：
+            now 为本机单调时间戳，允许测试注入；None 时使用 time.monotonic()。
+
+        返回值：
+            返回 wait 或 abort 动作；不会返回 send、suggest、rollback 或 keep。
+        """
+        current_time = time.monotonic() if now is None else float(now)
+
+        if self.state == "ABORT":
+            return {"type": "abort", "reason": self.abort_reason}
+
+        if self.pending_step is None:
+            return {"type": "wait", "state": self.state, "reason": "waiting for valid frame"}
+
+        loop_id = str(self.pending_step.get("loop_id", ""))
+        phase = str(self.pending_step.get("phase", "step"))
+        if not self.pending_step.get("ack_received"):
+            if self._pending_timed_out(current_time):
+                if phase == "rollback":
+                    self._mark_rollback_status("timeout")
+                self._abort(f"ACK timeout for {phase} {self.pending_step.get('command_name')} {loop_id}")
+                return {"type": "abort", "reason": self.abort_reason}
+            return {
+                "type": "wait",
+                "state": self.state,
+                "loop_id": loop_id,
+                "reason": "waiting for rollback ACK" if phase == "rollback" else "waiting for ACK",
+                "command": self.pending_step["command"],
+            }
+
+        if phase == "rollback":
+            return {
+                "type": "wait",
+                "state": self.state,
+                "loop_id": loop_id,
+                "reason": "waiting for rollback ACK",
+                "command": self.pending_step["command"],
+            }
+
+        ack_sample_count = int(self.pending_step.get("ack_sample_count", 0))
+        post_ack_sample_count = max(0, len(self.samples_by_loop.get(loop_id, [])) - ack_sample_count)
+        min_post_ack_samples = max(1, int(self.config.min_post_ack_samples))
+        return {
+            "type": "wait",
+            "state": self.state,
+            "loop_id": loop_id,
+            "reason": "waiting for post-ACK telemetry",
+            "command": self.pending_step["command"],
+            "post_ack_sample_count": post_ack_sample_count,
+            "min_post_ack_samples": min_post_ack_samples,
         }
 
     def score_loop(self, loop_id: str, start_index: int = 0) -> dict[str, float]:
@@ -2201,6 +2273,20 @@ class AutoTuneController:
         command = build_set_pidx_command(loop_id, new_kp, old_ki, old_kd)
         if changed_param != "kp":
             command = build_set_pidx_command(loop_id, new_kp, new_ki, new_kd)
+        old_command = build_set_pidx_command(loop_id, old_kp, old_ki, old_kd)
+        if command == old_command:
+            # 按板端实际接收的三位小数命令比较；相同则说明本次建议不会改变控制器参数。
+            self._abort(
+                f"no-op auto-tune step for {loop_id}; provide non-zero seed PID parameters before auto-tune"
+            )
+            return {
+                "type": "abort",
+                "reason": self.abort_reason,
+                "loop_id": loop_id,
+                "strategy": strategy_name,
+                "changed_param": changed_param,
+                "command": command,
+            }
         metadata = extract_command_metadata(command)
         return {
             **metadata,
@@ -2577,6 +2663,7 @@ def cmd_autotune(args: argparse.Namespace) -> int:
         max_step=args.max_step,
         window_seconds=args.window_seconds,
         ack_timeout_seconds=args.ack_timeout_seconds,
+        min_post_ack_samples=args.min_post_ack_samples,
         rollback_on_regression=args.rollback_on_regression,
     )
     controller = AutoTuneController(config)
@@ -2601,13 +2688,17 @@ def cmd_autotune(args: argparse.Namespace) -> int:
                 raw = ser.read(256)
                 if not raw:
                     # 串口暂时无新帧时仍推进状态机，确保丢 ACK 会按超时进入 ABORT。
-                    action = controller.plan_next_action(now=time.monotonic())
+                    action = controller.plan_timeout_action(now=time.monotonic())
                     if action.get("type") == "abort":
                         print_autotune_action(action, args.jsonl)
                         return 1
                     continue
                 for parsed in decoder.feed(raw):
                     frame_count += 1
+
+                    if not parsed.get("valid"):
+                        # 坏帧不能触发 proposal/send；否则自动调参会在串口异常时基于旧窗口继续写参。
+                        continue
 
                     if parsed.get("kind") in ("ack", "err"):
                         controller.handle_response(parsed, now=time.monotonic())
@@ -2721,6 +2812,12 @@ def build_parser() -> argparse.ArgumentParser:
     autotune_parser.add_argument("--max-step", type=float, default=0.10, help="Maximum one-step kp/ki/kd ratio change.")
     autotune_parser.add_argument("--window-seconds", type=float, default=3.0, help="Scoring window length in seconds.")
     autotune_parser.add_argument("--ack-timeout-seconds", type=float, default=2.0, help="Seconds to wait for ACK before aborting auto-tune.")
+    autotune_parser.add_argument(
+        "--min-post-ack-samples",
+        type=int,
+        default=DEFAULT_MIN_POST_ACK_SAMPLES,
+        help="Minimum new PIDX samples after ACK before keep/rollback decision.",
+    )
     autotune_parser.add_argument(
         "--rollback-on-regression",
         dest="rollback_on_regression",

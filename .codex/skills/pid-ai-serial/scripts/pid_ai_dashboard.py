@@ -781,7 +781,7 @@ class DashboardState:
         current_time = time.time() if now is None else float(now)
         with self._lock:
             if self.autotune.get("enabled") and self._autotune_controller.pending_step is not None:
-                action = self._autotune_controller.plan_next_action(now=current_time)
+                action = self._autotune_controller.plan_timeout_action(now=current_time)
                 self.scores = json_safe_copy(self._autotune_controller.scores)
                 self.rollback_history = json_safe_copy(self._autotune_controller.rollback_history)
                 self.autotune["state"] = self._autotune_controller.state
@@ -1168,6 +1168,7 @@ class DashboardState:
         max_step: float = 0.10,
         window_seconds: float = 3.0,
         ack_timeout_seconds: float = 2.0,
+        min_post_ack_samples: int = serial_tool.DEFAULT_MIN_POST_ACK_SAMPLES,
         rollback_on_regression: bool = True,
     ) -> dict[str, Any]:
         """
@@ -1186,6 +1187,7 @@ class DashboardState:
             max_step 为单次参数最大变化比例。
             window_seconds 为评分窗口秒数。
             ack_timeout_seconds 为等待板端 ACK 的最长秒数。
+            min_post_ack_samples 为 ACK 后至少等待的新 PIDX 样本数，避免单点噪声决定保留或回滚。
             rollback_on_regression 表示评分变差时是否生成回滚命令。
 
         返回值：
@@ -1201,6 +1203,8 @@ class DashboardState:
             raise ValueError("window_seconds must be positive")
         if ack_timeout_seconds <= 0.0:
             raise ValueError("ack_timeout_seconds must be positive")
+        if min_post_ack_samples <= 0:
+            raise ValueError("min_post_ack_samples must be positive")
 
         config = serial_tool.AutoTuneConfig(
             auto=bool(enabled and mode == "auto-tune"),
@@ -1209,6 +1213,7 @@ class DashboardState:
             max_step=max_step,
             window_seconds=window_seconds,
             ack_timeout_seconds=ack_timeout_seconds,
+            min_post_ack_samples=int(min_post_ack_samples),
             rollback_on_regression=rollback_on_regression,
         )
         with self._lock:
@@ -1225,6 +1230,7 @@ class DashboardState:
                 "max_step": max_step,
                 "window_seconds": window_seconds,
                 "ack_timeout_seconds": ack_timeout_seconds,
+                "min_post_ack_samples": int(min_post_ack_samples),
                 "rollback_on_regression": bool(rollback_on_regression),
             }
         return self.snapshot()
@@ -1972,6 +1978,9 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
               <label>ack_timeout_s
                 <input id="autotuneAckTimeout" type="number" value="2.0" min="0.1" step="0.1" />
               </label>
+              <label>post_ack_n
+                <input id="autotuneMinPostAckSamples" type="number" value="3" min="1" step="1" />
+              </label>
             </div>
             <div class="command-preview" id="autotunePreview">IDLE</div>
             <div class="actions">
@@ -2528,6 +2537,7 @@ INDEX_HTML_TEMPLATE = r"""<!doctype html>
           max_step: Number(value("autotuneMaxStep")) || 0.10,
           window_seconds: Number(value("autotuneWindow")) || 3.0,
           ack_timeout_seconds: Number(value("autotuneAckTimeout")) || 2.0,
+          min_post_ack_samples: Number(value("autotuneMinPostAckSamples")) || 3,
           rollback_on_regression: true
         })
       });
@@ -2813,8 +2823,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             配置 dashboard 内置自动调参状态机。
 
         主要流程：
-            读取 enabled、mode、profile、max_step、window_seconds、ack_timeout_seconds
-            和 rollback_on_regression，调用 DashboardState.configure_autotune 后返回最新状态快照。
+            读取 enabled、mode、profile、max_step、window_seconds、ack_timeout_seconds、
+            min_post_ack_samples 和 rollback_on_regression，调用 DashboardState.configure_autotune
+            后返回最新状态快照。
 
         参数说明：
             payload 为 JSON body，字段均可选；未传时使用安全默认值并保持自动写参关闭。
@@ -2829,6 +2840,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             max_step=float(payload.get("max_step") or 0.10),
             window_seconds=float(payload.get("window_seconds") or 3.0),
             ack_timeout_seconds=float(payload.get("ack_timeout_seconds") or 2.0),
+            min_post_ack_samples=int(payload.get("min_post_ack_samples") or serial_tool.DEFAULT_MIN_POST_ACK_SAMPLES),
             rollback_on_regression=bool(payload.get("rollback_on_regression", True)),
         )
         self.write_json(status)

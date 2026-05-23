@@ -58,11 +58,11 @@
 | 4 | `target` | float | 目标值 | 识别阶跃、目标变化和稳态误差 |
 | 5 | `feedback` | float | 实际反馈值 | 判断系统响应、超调、震荡 |
 | 6 | `error` | float | 当前误差，通常为 `target - feedback` | 判断收敛速度和稳态误差 |
-| 7 | `d_error` | float | 误差变化量，通常为 `error - last_error` | 判断震荡趋势和微分项合理性 |
+| 7 | `d_error` | float | 反馈变化量，等于 `feedback - last_feedback`，用于 Derivative-on-Measurement | 判断震荡趋势和微分项合理性 |
 | 8 | `integral` | float | 积分累计量 | 判断积分饱和、长期偏差 |
 | 9 | `p_out` | float | P 项输出 | 判断比例项是否过大或过小 |
 | 10 | `i_out` | float | I 项输出 | 判断积分项是否堆积 |
-| 11 | `d_out` | float | D 项输出 | 判断微分抑制是否过强或过弱 |
+| 11 | `d_out` | float | D 项输出，按 `d_error / (dt_ms / 1000)` 计算，方向随 `reverse` 反转 | 判断微分抑制是否过强或过弱 |
 | 12 | `ff_out` | float | 前馈输出，没有前馈时为 `0` | 区分 PID 输出和前馈补偿 |
 | 13 | `out_raw` | float | 未限幅原始输出 | 判断 PID 算法想输出多少 |
 | 14 | `out_limited` | float | 限幅后的 PID 输出 | 判断执行器限制后的控制量 |
@@ -382,7 +382,7 @@ CRC 正确不代表 payload 数值有效。二进制 payload 中的所有 `float
 | 6 | 板端回复 `{ACK}` | 没有 ACK 不认为生效 |
 | 7 | 继续观察 `{PID}` | 对比超调、稳定时间和稳态误差 |
 
-串级小车 profile 的默认顺序为 `speed_l`、`speed_r`、`yaw_rate`、`line_outer`。内环没有完成前不要调外环；每次只修改一个 loop 的一组 `kp/ki/kd`，默认最大变化幅度不超过 10%。自动写参必须等待 `{ACK}` 后进入观察窗口，观察评分应按 `window_seconds` 使用本机接收时间或板端 `ms` 裁剪窗口，不能固定取任意样本数。策略规则：稳态同向误差且未饱和时增加 `ki`；误差频繁过零时增加 `kd`；输出饱和且 `anti_windup` 频繁触发时降低 `ki`；`line_outer` 外环慢响应时使用半步 `kp`，避免外环过激。若评分变差则发送旧参数的 `SET_PIDX` 回滚命令；回滚本身也是独立 pending 命令，必须收到匹配 `{ACK}` 后才允许把该 loop 标记完成，回滚 `{ERR}` 或回滚 ACK 超时必须进入停止状态。出现 `fault != 0`、`sensor_ok = 0`、`line_lost = 1`、`{ERR}`、ACK 超时或蓝牙断流时进入停止状态。
+串级小车 profile 的默认顺序为 `speed_l`、`speed_r`、`yaw_rate`、`line_outer`。内环没有完成前不要调外环；每次只修改一个 loop 的一组 `kp/ki/kd`，默认最大变化幅度不超过 10%。自动写参必须等待 `{ACK}` 后进入观察窗口，观察评分应按 `window_seconds` 使用本机接收时间或板端 `ms` 裁剪窗口，并且默认至少等待 3 条 ACK 后新 `{PIDX}` 样本，不能用单个偶然样本决定 keep/rollback，也不能固定取任意样本数伪装成秒级窗口。策略规则：稳态同向误差且未饱和时增加 `ki`；误差频繁过零时增加 `kd`；输出饱和且 `anti_windup` 频繁触发时降低 `ki`；`line_outer` 外环慢响应时使用半步 `kp`，避免外环过激。若新旧 `SET_PIDX` 按三位小数格式化后完全相同，自动调参必须中止并要求人工先给非零 seed 参数，不能发送 no-op 命令。若评分变差则发送旧参数的 `SET_PIDX` 回滚命令；回滚本身也是独立 pending 命令，必须收到匹配 `{ACK}` 后才允许把该 loop 标记完成，回滚 `{ERR}` 或回滚 ACK 超时必须进入停止状态。出现 `fault != 0`、`sensor_ok = 0`、`line_lost = 1`、`{ERR}`、ACK 超时或蓝牙断流时进入停止状态。
 
 ## 10. 上位机字段配置模板
 

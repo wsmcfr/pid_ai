@@ -145,8 +145,10 @@ DISCOVER -> SYNC_CONFIG -> OBSERVE_BASELINE -> SELECT_LOOP -> PROPOSE_STEP
 | Cascade order | Tune `speed_l`, then `speed_r`, then `yaw_rate`, then `line_outer`; do not tune outer loops while inner loops are failing. |
 | Single-loop mutation | Only one loop and one `kp/ki/kd` tuple may be changed per step. |
 | Step size | Default maximum change is `10%`; command builders format PID numbers with three decimals. |
+| No-op prevention | If the formatted three-decimal `SET_PIDX` command would not change any applied `kp/ki/kd`, abort auto-tune and require a human-provided non-zero seed instead of sending a no-op. |
 | ACK gate | `OBSERVE_RESULT` may start only after a matching `{ACK}` for the pending command and `loop_id`. |
 | Post-ACK scoring window | Evaluate keep/rollback using only samples received after the matching ACK; crop that post-ACK slice by `window_seconds`. |
+| Post-ACK sample floor | Wait for at least `min_post_ack_samples` new samples after ACK before keep/rollback; the current default is `3` to avoid single-sample noise decisions. |
 | ACK timeout | Store `sent_at` for each step and rollback command; if `ack_timeout_seconds` elapses without a matching ACK/ERR, move the controller to `ABORT` even when the serial stream is silent. |
 | ERR/timeout gate | `{ERR}`, ACK timeout, serial disconnect, or mismatched pending command moves the controller to `ABORT`. |
 | Regression rollback | If post-ACK score is worse and rollback is enabled, send old parameters using `SET_PIDX`, append `rollback_history`, and keep the loop pending until the rollback command receives a matching `{ACK}`. |

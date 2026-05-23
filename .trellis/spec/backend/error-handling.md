@@ -98,6 +98,12 @@ Existing behavior:
 | Disabled, stopped, or sensor fault | Clear outputs and return actuator `0.0f` |
 
 Do not let invalid sensor data or invalid time deltas produce actuator output.
+Runtime input faults must still produce parseable safety telemetry: `PIDAI_Update()`
+must not copy NaN or infinity into fields emitted by `{PID}` / `{PIDX}`. Keep the
+last finite `feedback` when a bad sensor value arrives, normalize invalid
+`dt_ms` to `0.0f`, and expose the condition through `sensor_ok` and `fault`.
+Tests must assert telemetry strings do not contain `nan` or `inf` after invalid
+runtime inputs.
 
 ### Protocol Parser Mapping
 

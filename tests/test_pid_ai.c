@@ -661,6 +661,86 @@ static int test_derivative_kick_suppressed(void)
 
 /*
  * 函数作用：
+ *   测试非法 feedback 和 dt_ms 不会把 NaN/Inf 写入可序列化遥测字段。
+ *
+ * 主要流程：
+ *   1. 先运行一帧合法 PID，建立上一帧有限 feedback。
+ *   2. 注入 NAN feedback，要求输出停机、sensor_ok=0、fault 可见，遥测字符串不含 nan/inf。
+ *   3. 注入 INFINITY dt_ms，要求 dt_ms 在遥测中规范为 0.000，避免上位机丢弃安全帧。
+ *
+ * 返回值：
+ *   返回 1 表示安全遥测保持有限数；返回 0 表示非法输入污染协议帧。
+ */
+static int test_invalid_runtime_inputs_emit_finite_fault_telemetry(void)
+{
+    PIDAI_Handle pid;
+    char frame[512];
+    int written;
+
+    PIDAI_Init(&pid);
+    PIDAI_SetTunings(&pid, 1.0f, 0.1f, 0.0f);
+    PIDAI_SetTarget(&pid, 10.0f);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&pid, 1);
+    PIDAI_Update(&pid, 7.0f, 10U, 10.0f);
+
+    PIDAI_Update(&pid, NAN, 20U, 10.0f);
+    written = PIDAI_ProtocolBuildTelemetry(&pid, frame, sizeof(frame));
+    if (written <= 0) return 0;
+    if (strstr(frame, "nan") != NULL || strstr(frame, "inf") != NULL) return 0;
+    if (pid.sensor_ok != 0) return 0;
+    if ((pid.fault & PIDAI_FAULT_PARAM_RANGE) == 0U) return 0;
+    if (strstr(frame, ",0,") == NULL) return 0;
+    if (strstr(frame, "7.000") == NULL) return 0;
+
+    PIDAI_ClearFault(&pid);
+    PIDAI_SetSensorOk(&pid, 1);
+    PIDAI_Update(&pid, 8.0f, 30U, INFINITY);
+    written = PIDAI_ProtocolBuildTelemetry(&pid, frame, sizeof(frame));
+    if (written <= 0) return 0;
+    if (strstr(frame, "nan") != NULL || strstr(frame, "inf") != NULL) return 0;
+    if ((pid.fault & PIDAI_FAULT_BAD_DT) == 0U) return 0;
+    if (strstr(frame, "{PID}3,30,0.000") == NULL) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   测试 reverse 模式下 D 项方向会随控制方向反转。
+ *
+ * 主要流程：
+ *   1. 在 reverse=1 下让 feedback 先稳定到 10。
+ *   2. feedback 上升到 12 时，反向误差 error=feedback-target 增大。
+ *   3. 校验 d_out 为正，说明 D 项跟反向误差变化方向一致。
+ *
+ * 返回值：
+ *   返回 1 表示 reverse 微分方向正确；返回 0 表示 D 项仍按普通方向计算。
+ */
+static int test_reverse_derivative_direction_tracks_reversed_error(void)
+{
+    PIDAI_Handle pid;
+
+    PIDAI_Init(&pid);
+    PIDAI_SetTunings(&pid, 0.0f, 0.0f, 1.0f);
+    PIDAI_SetOutputLimits(&pid, -10000.0f, 10000.0f);
+    PIDAI_SetTarget(&pid, 10.0f);
+    PIDAI_SetReverse(&pid, 1);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&pid, 1);
+
+    PIDAI_Update(&pid, 10.0f, 10U, 10.0f);
+    PIDAI_Update(&pid, 12.0f, 20U, 10.0f);
+
+    if (!float_close(pid.d_error, 2.0f)) return 0;
+    if (!float_close(pid.d_out, 200.0f)) return 0;
+    if (!float_close(pid.out_raw, 200.0f)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
  *   测试二进制协议使用的 CRC-16/CCITT-FALSE 是否符合标准向量。
  *
  * 主要流程：
@@ -885,6 +965,14 @@ int main(void)
     }
     if (!test_derivative_kick_suppressed()) {
         printf("FAIL: test_derivative_kick_suppressed\n");
+        return 1;
+    }
+    if (!test_invalid_runtime_inputs_emit_finite_fault_telemetry()) {
+        printf("FAIL: test_invalid_runtime_inputs_emit_finite_fault_telemetry\n");
+        return 1;
+    }
+    if (!test_reverse_derivative_direction_tracks_reversed_error()) {
+        printf("FAIL: test_reverse_derivative_direction_tracks_reversed_error\n");
         return 1;
     }
     if (!test_binary_crc16_standard_vector()) {

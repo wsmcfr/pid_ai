@@ -829,6 +829,52 @@ class PidAiAutoTuneTest(unittest.TestCase):
         self.assertEqual(timeout["type"], "abort")
         self.assertIn("ACK timeout", timeout["reason"])
 
+    def test_timeout_tick_does_not_create_phantom_pending_step(self) -> None:
+        """
+        函数作用：
+            验证串口空读 tick 只能检查 pending 超时，不能凭旧窗口创建未发送的 pending step。
+
+        主要流程：
+            1. 注入 CFGX 和 PIDX，让控制器具备生成 SET_PIDX 的条件。
+            2. 调用 timeout-only tick，模拟 CLI 串口暂时无数据。
+            3. 校验没有生成 send 动作，也没有写入 pending_step。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [5.0, 4.0, 3.0])
+
+        action = controller.plan_timeout_action(now=100.0)
+
+        self.assertEqual(action["type"], "wait")
+        self.assertEqual(action["reason"], "waiting for valid frame")
+        self.assertIsNone(controller.pending_step)
+
+    def test_timeout_tick_still_aborts_existing_pending_step(self) -> None:
+        """
+        函数作用：
+            验证 timeout-only tick 不生成新 step，但已有 pending step 仍会按 ACK 超时中止。
+
+        主要流程：
+            1. 正常生成一个 pending SET_PIDX。
+            2. 调用 timeout-only tick 并推进时间超过 ACK 超时。
+            3. 校验控制器进入 ABORT。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [5.0, 4.0, 3.0])
+        self.assertEqual(controller.plan_next_action(now=100.0)["type"], "send")
+
+        timeout = controller.plan_timeout_action(now=100.6)
+
+        self.assertEqual(timeout["type"], "abort")
+        self.assertIn("ACK timeout", timeout["reason"])
+
     def test_mismatched_pending_response_aborts_autotune(self) -> None:
         """
         函数作用：
@@ -885,11 +931,40 @@ class PidAiAutoTuneTest(unittest.TestCase):
         self.assertEqual(controller.plan_next_action(now=100.0)["type"], "send")
         controller.handle_response(pid_ai_serial.parse_frame("{ACK}SET_PIDX,OK"), now=100.1)
 
-        self.ingest_window(controller, "speed_l", [2.0], start_ms=1010)
+        self.ingest_window(controller, "speed_l", [2.0, 2.0, 2.0], start_ms=1010)
         keep = controller.plan_next_action(now=100.2)
 
         self.assertEqual(keep["type"], "keep")
         self.assertAlmostEqual(keep["current_score"], 2.5)
+
+    def test_post_ack_requires_minimum_new_samples_before_decision(self) -> None:
+        """
+        函数作用：
+            验证 ACK 后新遥测样本不足时，自动调参必须继续等待而不是立即 keep 或 rollback。
+
+        主要流程：
+            1. 使用默认最少 ACK 后样本门槛构造控制器。
+            2. 生成并 ACK 一个 speed_l 调参 step。
+            3. 只注入 1 条 ACK 后遥测，校验状态机继续等待更多样本。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [5.0, 4.0, 3.0], start_ms=1000)
+        self.assertEqual(controller.plan_next_action(now=100.0)["type"], "send")
+        controller.handle_response(pid_ai_serial.parse_frame("{ACK}SET_PIDX,OK"), now=100.1)
+
+        self.ingest_window(controller, "speed_l", [20.0], start_ms=1100)
+        wait = controller.plan_next_action(now=100.2)
+
+        self.assertEqual(wait["type"], "wait")
+        self.assertEqual(wait["reason"], "waiting for post-ACK telemetry")
+        self.assertEqual(wait["post_ack_sample_count"], 1)
+        self.assertEqual(wait["min_post_ack_samples"], 3)
+        self.assertEqual(controller.state, "OBSERVE_RESULT")
+        self.assertEqual(controller.rollback_history, [])
 
     def test_rollback_ack_is_required_before_loop_completed(self) -> None:
         """
@@ -1006,6 +1081,54 @@ class PidAiAutoTuneTest(unittest.TestCase):
         self.assertEqual(action["changed_param"], "ki")
         self.assertEqual(action["strategy"], "increase_ki_for_steady_bias")
         self.assertEqual(action["command"], "{CMD}SET_PIDX,speed_l,1.200,0.033,0.080")
+
+    def test_zero_pid_config_aborts_instead_of_sending_noop_step(self) -> None:
+        """
+        函数作用：
+            验证 PID 参数全为 0 时自动调参不会发送无实际变化的 SET_PIDX。
+
+        主要流程：
+            1. 注入 speed_l 的零参数 CFGX 和有效遥测窗口。
+            2. 调用 plan_next_action 生成动作。
+            3. 校验状态机进入 ABORT，提示需要人工 seed 参数，而不是发送 0,0,0。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        zero_cfg = VALID_CFGX_LINE.replace("1.200000,0.030000,0.080000", "0.000000,0.000000,0.000000")
+        controller.ingest_frame(pid_ai_serial.parse_frame(zero_cfg))
+        self.ingest_window(controller, "speed_l", [6.0, 5.8, 5.6], start_ms=1000, step_ms=10)
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["type"], "abort")
+        self.assertIn("no-op", action["reason"])
+        self.assertIsNone(controller.pending_step)
+
+    def test_tiny_pid_change_that_rounds_to_same_command_aborts(self) -> None:
+        """
+        函数作用：
+            验证小参数按三位小数格式化后没有变化时，自动调参不会发送 no-op 命令。
+
+        主要流程：
+            1. 注入 kp 很小的 CFGX，使 10% 调整后仍格式化为 0.000。
+            2. 注入慢响应窗口触发增加 Kp 策略。
+            3. 校验状态机进入 ABORT 并保留原因。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        tiny_cfg = VALID_CFGX_LINE.replace("1.200000,0.030000,0.080000", "0.000100,0.000000,0.000000")
+        controller.ingest_frame(pid_ai_serial.parse_frame(tiny_cfg))
+        self.ingest_window(controller, "speed_l", [6.0, 5.0, 4.0], start_ms=1000, step_ms=10)
+
+        action = controller.plan_next_action(now=100.0)
+
+        self.assertEqual(action["type"], "abort")
+        self.assertIn("no-op", action["reason"])
+        self.assertIsNone(controller.pending_step)
 
     def test_oscillation_strategy_increases_kd_before_reducing_kp(self) -> None:
         """

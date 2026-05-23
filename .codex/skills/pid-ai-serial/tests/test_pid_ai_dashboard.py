@@ -468,11 +468,13 @@ class DashboardStateTest(unittest.TestCase):
                 "enabled": True,
                 "mode": "auto-tune",
                 "ack_timeout_seconds": 4.5,
+                "min_post_ack_samples": 5,
             },
         )
 
         self.assertIsNotNone(handler.payload)
         self.assertEqual(handler.payload["autotune"]["ack_timeout_seconds"], 4.5)
+        self.assertEqual(handler.payload["autotune"]["min_post_ack_samples"], 5)
 
     def test_dashboard_autotune_tick_aborts_when_ack_timeout_elapses_without_frames(self) -> None:
         """

@@ -368,6 +368,7 @@ float PIDAI_Update(PIDAI_Handle *pid, float feedback, uint32_t ms, float dt_ms)
     float computed_error;
     float candidate_raw;
     float candidate_limited;
+    float d_sign;
     PIDAI_Saturation candidate_sat;
 
     if (pid == 0) {
@@ -375,17 +376,26 @@ float PIDAI_Update(PIDAI_Handle *pid, float feedback, uint32_t ms, float dt_ms)
     }
 
     pid->ms = ms;
-    pid->dt_ms = dt_ms;
-    pid->feedback = feedback;
     pid->seq += 1U;
     pid->anti_windup = 0;
 
     if (!PIDAI_IsFiniteParam(feedback)) {
+        /*
+         * feedback 非有限时不能直接写入遥测字段，否则 {PID} 会输出 nan/inf 并被上位机丢弃。
+         * 保留上一帧有限 feedback，同时用 sensor_ok=0 和 fault 明确暴露传感器异常。
+         */
         pid->sensor_ok = 0;
         pid->fault |= PIDAI_FAULT_PARAM_RANGE;
+    } else {
+        pid->feedback = feedback;
     }
 
     if (dt_ms <= 0.0f || !PIDAI_IsFiniteParam(dt_ms)) {
+        /*
+         * dt_ms 非法时将可序列化周期规范为 0.0，避免安全停机帧中出现 nan/inf。
+         * BAD_DT fault 是真实错误信号，调用方和上位机据此停止调参或控制输出。
+         */
+        pid->dt_ms = 0.0f;
         pid->fault |= PIDAI_FAULT_BAD_DT;
         pid->out_raw = 0.0f;
         pid->out_limited = 0.0f;
@@ -393,6 +403,7 @@ float PIDAI_Update(PIDAI_Handle *pid, float feedback, uint32_t ms, float dt_ms)
         pid->sat = PIDAI_SAT_NONE;
         return pid->actuator;
     }
+    pid->dt_ms = dt_ms;
 
     if (pid->enable == 0 || pid->mode == PIDAI_MODE_STOP || pid->sensor_ok == 0) {
         pid->out_raw = 0.0f;
@@ -415,11 +426,12 @@ float PIDAI_Update(PIDAI_Handle *pid, float feedback, uint32_t ms, float dt_ms)
 
     /*
      * D 项对 feedback 求值，避免 target 阶跃时产生尖峰（Derivative Kick 问题）。
-     * 符号取反是因为 feedback 增大时误差会减小，D 项应该抑制输出。
+     * 普通方向下 feedback 增大代表误差减小，D 项取负；reverse 下误差定义反转，D 项也要反向。
      * dt_ms / 1000.0f 把变化量归一到秒，使 kd 的物理含义与采样周期无关。
      */
     pid->d_error = pid->feedback - pid->last_feedback;
-    pid->d_out   = -pid->kd * pid->d_error / (dt_ms / 1000.0f);
+    d_sign = pid->reverse ? 1.0f : -1.0f;
+    pid->d_out = d_sign * pid->kd * pid->d_error / (dt_ms / 1000.0f);
 
     /* 积分归一化到物理时间单位（秒），使 ki 的含义与控制周期无关。 */
     next_integral = pid->integral + pid->error * (dt_ms / 1000.0f);
