@@ -250,7 +250,7 @@ tests, and synchronized project documentation/specs.
 
 ### Summary
 
-(Add summary)
+Generalized PID AI auto-tune from a line-car-specific cascade profile into a generic multi-loop tuning workflow with explicit loop ordering, conservative outer-loop behavior, and profile-specific line-safety defaults.
 
 ### Main Changes
 
@@ -283,7 +283,10 @@ tests, and synchronized project documentation/specs.
 
 ### Testing
 
-- [OK] (Add test results)
+- [OK] Python unit tests passed: `python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v`
+- [OK] Python syntax check passed for `pid_ai_serial.py` and `pid_ai_dashboard.py`
+- [OK] Skill validation passed for `.codex\skills\pid-ai-serial`
+- [OK] C regression test passed: `PASS: all pid_ai tests`
 
 ### Status
 
@@ -586,6 +589,53 @@ without a battery-voltage sampling channel.
 - [OK] C PID/protocol regression executable: `PASS: all pid_ai tests`
 - [OK] `git diff --check`
 - [OK] pid-ai-serial skill validation
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 12: Session 12 - generic multi-loop PID autotune
+
+**Date**: 2026-05-23
+**Task**: Session 12 - generic multi-loop PID autotune
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| Area | Summary |
+|---|---|
+| Auto-tune profiles | Added generic `multi-loop` profile while preserving `single-loop` and `line-car-cascade` compatibility. |
+| Loop sequencing | Added configurable `loop_order`, discovery-order fallback, and `conservative_loops` for half-step Kp outer-loop behavior. |
+| Safety | Made `{SENS}.line_lost` line-safety optional: enabled by default for `line-car-cascade`, disabled by default for generic `multi-loop`, and excluded from scoring when disabled. |
+| Dashboard | Extended `/api/autotune` and the local UI to pass `loop_order`, `conservative_loops`, and `line_safety_enabled`. |
+| Docs/spec | Updated the PID AI serial skill, protocol docs, dashboard docs, and Trellis frontend state-management contract to describe generic multi-loop tuning. |
+| Tests | Added regression coverage for generic multi-loop order, discovery fallback, conservative loops, line-safety behavior, and dashboard payload handling. |
+
+**Verification**:
+- `python -m unittest discover -s .codex\skills\pid-ai-serial\tests -v`
+- `python -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py`
+- `python -X utf8 C:\Users\caofengrui\.codex\skills\.system\skill-creator\scripts\quick_validate.py .codex\skills\pid-ai-serial`
+- `gcc -Iinclude src/pid_ai.c src/pid_ai_protocol.c src/pid_ai_binary_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; if ($LASTEXITCODE -eq 0) { .\tests\test_pid_ai.exe }`
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `8921007` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
 
 ### Status
 
