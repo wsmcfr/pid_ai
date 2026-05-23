@@ -31,6 +31,29 @@
 
 /*
  * 函数作用：
+ *   将 last_feedback 写成内部 NaN 哨兵，表示 D 项尚未拥有有效前一帧 feedback。
+ *
+ * 主要流程：
+ *   1. 使用 uint32_t 保存 quiet NaN 的固定 IEEE 754 位模式。
+ *   2. 通过 memcpy 写入 float 字段，避免违反严格别名规则。
+ *   3. 不使用 C99 compound literal，兼容更保守的 C90 MCU 编译器警告设置。
+ *
+ * 参数说明：
+ *   pid 指向需要标记 D 项前值未初始化的 PID 控制器，调用方保证非空。
+ *
+ * 返回值：
+ *   无返回值。
+ */
+static void PIDAI_MarkLastFeedbackUninitialized(PIDAI_Handle *pid)
+{
+    uint32_t bits;
+
+    bits = PIDAI_LAST_FEEDBACK_UNINIT_BITS;
+    memcpy(&pid->last_feedback, &bits, sizeof(pid->last_feedback));
+}
+
+/*
+ * 函数作用：
  *   判断一个浮点数是否是可接受的有限参数。
  *
  * 主要流程：
@@ -144,7 +167,7 @@ int PIDAI_Init(PIDAI_Handle *pid)
     pid->sat = PIDAI_SAT_NONE;
     pid->fault = PIDAI_FAULT_NONE;
     /* last_feedback NaN 哨兵：标记"尚未有有效前值"，首次 AUTO 帧到达时跳过 D 项计算。 */
-    memcpy(&pid->last_feedback, &(uint32_t){PIDAI_LAST_FEEDBACK_UNINIT_BITS}, sizeof(float));
+    PIDAI_MarkLastFeedbackUninitialized(pid);
 
     return 0;
 }
@@ -203,7 +226,7 @@ int PIDAI_Reset(PIDAI_Handle *pid)
     pid->sat = PIDAI_SAT_NONE;
     pid->fault = PIDAI_FAULT_NONE;
     /* Reset 后 last_feedback 同样置为 NaN 哨兵，确保下一次 AUTO 帧不产生 D 项尖峰。 */
-    memcpy(&pid->last_feedback, &(uint32_t){PIDAI_LAST_FEEDBACK_UNINIT_BITS}, sizeof(float));
+    PIDAI_MarkLastFeedbackUninitialized(pid);
 
     return 0;
 }

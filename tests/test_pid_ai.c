@@ -661,6 +661,73 @@ static int test_derivative_kick_suppressed(void)
 
 /*
  * 函数作用：
+ *   回归测试早返回路径不会破坏第一次真实 AUTO 闭环计算的 D 项初始化。
+ *
+ * 主要流程：
+ *   1. 初始化后让 STOP、disable、MANUAL 和 bad-dt 路径各自先调用一次 Update。
+ *   2. 再切回 AUTO 并使能，用相同 feedback 执行第一次真实闭环计算。
+ *   3. 校验 d_error 和 d_out 都为 0，证明早返回消耗 seq 后不会误用 last_feedback=0。
+ *
+ * 返回值：
+ *   返回 1 表示所有早返回路径后的首个 AUTO 帧都跳过 D 项；返回 0 表示仍存在首帧尖峰。
+ */
+static int test_derivative_first_auto_after_early_return_is_suppressed(void)
+{
+    PIDAI_Handle pid;
+    float out;
+
+    PIDAI_Init(&pid);
+    PIDAI_SetTunings(&pid, 0.0f, 0.0f, 1.0f);
+    PIDAI_SetOutputLimits(&pid, -10000.0f, 10000.0f);
+    PIDAI_SetTarget(&pid, 10.0f);
+
+    /* STOP 早返回会递增 seq；之后第一次 AUTO 不能因此产生 D 项尖峰。 */
+    PIDAI_Update(&pid, 10.0f, 10U, 10.0f);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&pid, 1);
+    out = PIDAI_Update(&pid, 10.0f, 20U, 10.0f);
+    if (!float_close(pid.d_error, 0.0f)) return 0;
+    if (!float_close(pid.d_out, 0.0f)) return 0;
+    if (!float_close(out, 0.0f)) return 0;
+
+    PIDAI_Reset(&pid);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&pid, 0);
+    /* disable 早返回也会递增 seq；重新使能后的首个闭环帧仍应只初始化 D 项前值。 */
+    PIDAI_Update(&pid, 10.0f, 30U, 10.0f);
+    PIDAI_Enable(&pid, 1);
+    out = PIDAI_Update(&pid, 10.0f, 40U, 10.0f);
+    if (!float_close(pid.d_error, 0.0f)) return 0;
+    if (!float_close(pid.d_out, 0.0f)) return 0;
+    if (!float_close(out, 0.0f)) return 0;
+
+    PIDAI_Reset(&pid);
+    PIDAI_SetMode(&pid, PIDAI_MODE_MANUAL);
+    PIDAI_Enable(&pid, 1);
+    /* MANUAL 只输出 manual_out，不应把 last_feedback 当作已初始化的闭环 D 项前值。 */
+    PIDAI_Update(&pid, 10.0f, 50U, 10.0f);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    out = PIDAI_Update(&pid, 10.0f, 60U, 10.0f);
+    if (!float_close(pid.d_error, 0.0f)) return 0;
+    if (!float_close(pid.d_out, 0.0f)) return 0;
+    if (!float_close(out, 0.0f)) return 0;
+
+    PIDAI_Reset(&pid);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&pid, 1);
+    /* bad-dt 帧必须安全停机；修复 dt 后首个闭环帧仍不能使用未初始化 last_feedback。 */
+    PIDAI_Update(&pid, 10.0f, 70U, 0.0f);
+    PIDAI_ClearFault(&pid);
+    out = PIDAI_Update(&pid, 10.0f, 80U, 10.0f);
+    if (!float_close(pid.d_error, 0.0f)) return 0;
+    if (!float_close(pid.d_out, 0.0f)) return 0;
+    if (!float_close(out, 0.0f)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
  *   测试非法 feedback 和 dt_ms 不会把 NaN/Inf 写入可序列化遥测字段。
  *
  * 主要流程：
@@ -965,6 +1032,10 @@ int main(void)
     }
     if (!test_derivative_kick_suppressed()) {
         printf("FAIL: test_derivative_kick_suppressed\n");
+        return 1;
+    }
+    if (!test_derivative_first_auto_after_early_return_is_suppressed()) {
+        printf("FAIL: test_derivative_first_auto_after_early_return_is_suppressed\n");
         return 1;
     }
     if (!test_invalid_runtime_inputs_emit_finite_fault_telemetry()) {
