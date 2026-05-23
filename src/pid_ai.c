@@ -19,6 +19,16 @@
 #define PIDAI_DEFAULT_I_MAX (10000.0f)
 
 /*
+ * last_feedback 未初始化哨兵的 IEEE 754 位模式（quiet NaN）。
+ *
+ * 使用 NaN 而不是 seq 计数器来判断"首次闭环计算"，原因：
+ *   seq 在 Update() 入口就递增，STOP/disable/MANUAL/bad-dt 帧都会增加 seq，
+ *   导致 seq==1 条件在真正的第一次 AUTO 计算到达之前就已失效。
+ *   NaN 哨兵不依赖计数器，只要 last_feedback 未被有效 feedback 覆盖，条件就成立。
+ */
+#define PIDAI_LAST_FEEDBACK_UNINIT_BITS (0x7FC00000U)
+
+/*
  * 函数作用：
  *   判断一个浮点数是否是可接受的有限参数。
  *
@@ -132,6 +142,8 @@ int PIDAI_Init(PIDAI_Handle *pid)
     pid->sensor_ok = 1;
     pid->sat = PIDAI_SAT_NONE;
     pid->fault = PIDAI_FAULT_NONE;
+    /* last_feedback NaN 哨兵：标记"尚未有有效前值"，首次 AUTO 帧到达时跳过 D 项计算。 */
+    memcpy(&pid->last_feedback, &(uint32_t){PIDAI_LAST_FEEDBACK_UNINIT_BITS}, sizeof(float));
 
     return 0;
 }
@@ -189,6 +201,8 @@ int PIDAI_Reset(PIDAI_Handle *pid)
     pid->sensor_ok = 1;
     pid->sat = PIDAI_SAT_NONE;
     pid->fault = PIDAI_FAULT_NONE;
+    /* Reset 后 last_feedback 同样置为 NaN 哨兵，确保下一次 AUTO 帧不产生 D 项尖峰。 */
+    memcpy(&pid->last_feedback, &(uint32_t){PIDAI_LAST_FEEDBACK_UNINIT_BITS}, sizeof(float));
 
     return 0;
 }
@@ -429,10 +443,13 @@ float PIDAI_Update(PIDAI_Handle *pid, float feedback, uint32_t ms, float dt_ms)
      * 普通方向下 feedback 增大代表误差减小，D 项取负；reverse 下误差定义反转，D 项也要反向。
      * dt_ms / 1000.0f 把变化量归一到秒，使 kd 的物理含义与采样周期无关。
      *
-     * 首次调用（seq == 1）时 last_feedback 为 0，直接计算会产生与初始 feedback 等幅的 D 项尖峰。
-     * 首帧将 last_feedback 初始化为当前 feedback，d_error 和 d_out 置零，跳过 D 项计算。
+     * 用 NaN 哨兵判断"首次闭环计算"，而不是 seq 计数器：
+     *   seq 在 Update() 入口递增，STOP/disable/MANUAL/bad-dt 帧都会增加 seq，
+     *   导致 seq==1 条件在真正的第一次 AUTO 帧到达之前就已失效。
+     *   Init() 和 Reset() 将 last_feedback 置为 NaN 哨兵；
+     *   只要 last_feedback 是 NaN（自比较不等），就跳过 D 项计算并初始化前值。
      */
-    if (pid->seq == 1U)
+    if (pid->last_feedback != pid->last_feedback)
     {
         pid->last_feedback = pid->feedback;
         pid->d_error = 0.0f;
