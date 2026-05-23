@@ -66,7 +66,10 @@ Implemented and pushed the PID AI serial dashboard skill, local Web upper-comput
 
 ### Summary
 
-(Add summary)
+Completed the follow-up hardening pass for the PID AI serial host tooling after
+code review. The session fixed response-frame validation gaps, tightened
+auto-tune transaction handling, synchronized frontend specs, committed the fix,
+and pushed the feature branch to GitHub.
 
 ### Main Changes
 
@@ -94,7 +97,9 @@ Implemented and pushed the PID AI serial dashboard skill, local Web upper-comput
 
 ### Testing
 
-- [OK] (Add test results)
+- [OK] `python -m pytest .codex\skills\pid-ai-serial\tests` -> 34 passed
+- [OK] `python -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py`
+- [OK] `gcc -Wall -Wextra -Werror -Iinclude src/pid_ai.c src/pid_ai_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; .\tests\test_pid_ai.exe` -> PASS: all pid_ai tests
 
 ### Status
 
@@ -212,6 +217,58 @@ Implemented and pushed the PID AI serial dashboard skill, local Web upper-comput
 | Hash | Message |
 |------|---------|
 | `f7b8ded` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
+
+
+## Session 5: Session 5 - ACK hardening and post-ACK autotune scoring
+
+**Date**: 2026-05-23
+**Task**: Session 5 - ACK hardening and post-ACK autotune scoring
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| Work | Details |
+|---|---|
+| Serial parser hardening | Split ACK/ERR parsing into exact field-count helpers; reject extra ACK/ERR fields and unknown ERR status text before responses can enter typed state. |
+| Auto-tune safety | Abort active auto-tune on mismatched pending ACK/ERR responses, and evaluate keep/rollback using only post-ACK telemetry samples. |
+| Regression coverage | Added parser/state-machine tests for malformed ACK/ERR frames, mismatched loop responses, and post-ACK scoring boundaries. |
+| Spec sync | Updated frontend type-safety and state-management specs with ACK/ERR validation, mismatched-response aborts, and post-ACK scoring rules. |
+| GitHub upload | Added .spec-workflow/ to .gitignore, committed e70d073, and pushed feat/pid-ai-autotune to origin. |
+
+**Verification**:
+- `python -m pytest .codex\skills\pid-ai-serial\tests` -> 34 passed
+- `python -m py_compile .codex\skills\pid-ai-serial\scripts\pid_ai_serial.py .codex\skills\pid-ai-serial\scripts\pid_ai_dashboard.py` -> passed
+- `gcc -Wall -Wextra -Werror -Iinclude src/pid_ai.c src/pid_ai_protocol.c tests/test_pid_ai.c -o tests/test_pid_ai.exe; .\tests\test_pid_ai.exe` -> PASS: all pid_ai tests
+
+**Updated Files**:
+- `.codex/skills/pid-ai-serial/scripts/pid_ai_serial.py`
+- `.codex/skills/pid-ai-serial/tests/test_pid_ai_serial_parser.py`
+- `.trellis/spec/frontend/state-management.md`
+- `.trellis/spec/frontend/type-safety.md`
+- `.gitignore`
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e70d073` | (see git log) |
 
 ### Testing
 
