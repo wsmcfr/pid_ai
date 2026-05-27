@@ -791,3 +791,49 @@ NaN sentinel write path for stricter MCU compiler compatibility.
 ### Next Steps
 
 - None - task complete
+
+
+## Session 16: Session 15 - D-term transition spike + test coverage
+
+**Date**: 2026-05-28
+**Task**: Session 15 - D-term transition spike + test coverage
+**Branch**: `feat/pid-ai-autotune`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| 修复项 | 说明 |
+|--------|------|
+| MANUAL→AUTO D 项冲击 | `PIDAI_SetMode(AUTO)` 检测从非 AUTO 切入时重置 NaN 哨兵，首帧跳过 D 项 |
+| disable→enable D 项冲击 | `PIDAI_Enable(1)` 检测从 0→1 转换时重置 NaN 哨兵 |
+| C 回归测试 | 新增 `test_manual_to_auto_transition_skips_d_term` 和 `test_disable_to_enable_transition_skips_d_term` |
+| window_fallback 语义 | 空样本时 `window_fallback` 从 `True` 改为 `False` |
+| Python 测试 | 新增 3 个 `window_fallback` 覆盖用例：有时间戳/无时间戳/空样本 |
+
+**修改文件**:
+- `src/pid_ai.c`
+- `tests/test_pid_ai.c`
+- `.codex/skills/pid-ai-serial/scripts/pid_ai_serial.py`
+- `.codex/skills/pid-ai-serial/tests/test_pid_ai_serial_parser.py`
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `3c35cd8` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
