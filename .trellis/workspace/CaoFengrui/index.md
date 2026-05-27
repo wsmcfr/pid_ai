@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 16
+- **Total Sessions**: 17
 - **Last Active**: 2026-05-28
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~839 | Active |
+| `journal-1.md` | ~877 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 17 | 2026-05-28 | Session 16 - Push to GitHub | `54a9b03` | `feat/pid-ai-autotune` |
 | 16 | 2026-05-28 | Session 15 - D-term transition spike + test coverage | `3c35cd8` | `feat/pid-ai-autotune` |
 | 15 | 2026-05-23 | Session 15 - D-term early-return regression coverage | `5e0de47`, `85fe8ad`, `212982a` | `feat/pid-ai-autotune` |
 | 14 | 2026-05-23 | Session 14 - D-term NaN sentinel fix | `212982a` | `feat/pid-ai-autotune` |
