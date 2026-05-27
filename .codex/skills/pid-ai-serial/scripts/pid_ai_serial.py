@@ -2342,7 +2342,7 @@ class AutoTuneController:
                 "anti_windup_ratio": 1.0,
                 "sensor_bad_ratio": 1.0,
                 "line_lost_count": line_lost_count,
-                "window_fallback": True,
+                "window_fallback": False,
                 "score": float("inf"),
             }
 

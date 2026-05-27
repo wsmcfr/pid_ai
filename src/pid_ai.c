@@ -330,6 +330,15 @@ int PIDAI_SetMode(PIDAI_Handle *pid, PIDAI_Mode mode)
         return -2;
     }
 
+    /*
+     * 切入 AUTO 时重置 last_feedback NaN 哨兵，避免 STOP/MANUAL 期间 feedback
+     * 漂移导致首帧 D 项产生意外冲击。首帧 AUTO 会检测 NaN 并跳过 D 项计算，
+     * 用当前 feedback 初始化前值，后续帧 D 项才能正常反映真实变化率。
+     */
+    if (mode == PIDAI_MODE_AUTO && pid->mode != PIDAI_MODE_AUTO) {
+        PIDAI_MarkLastFeedbackUninitialized(pid);
+    }
+
     pid->mode = mode;
     return 0;
 }
@@ -338,6 +347,14 @@ int PIDAI_Enable(PIDAI_Handle *pid, int enable)
 {
     if (pid == 0) {
         return -1;
+    }
+
+    /*
+     * 从禁用切到使能时重置 last_feedback NaN 哨兵，避免禁用期间 feedback
+     * 变化导致重新使能后首帧 D 项产生意外冲击。
+     */
+    if (enable && !pid->enable) {
+        PIDAI_MarkLastFeedbackUninitialized(pid);
     }
 
     pid->enable = enable ? 1 : 0;

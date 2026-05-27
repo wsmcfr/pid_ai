@@ -728,6 +728,97 @@ static int test_derivative_first_auto_after_early_return_is_suppressed(void)
 
 /*
  * 函数作用：
+ *   回归测试不经过 Reset 的 MANUAL→AUTO 切换不会产生 D 项首帧尖峰。
+ *
+ * 主要流程：
+ *   1. AUTO 运行几帧建立 last_feedback 前值。
+ *   2. 切 MANUAL 运行一帧（feedback 漂移到不同值）。
+ *   3. 切回 AUTO，验证首帧 D 项被跳过（d_error=0, d_out=0）。
+ *
+ * 返回值：
+ *   返回 1 表示 MANUAL→AUTO 切换后首帧无 D 项冲击；返回 0 表示仍存在尖峰。
+ */
+static int test_manual_to_auto_transition_skips_d_term(void)
+{
+    PIDAI_Handle pid;
+    float out;
+
+    PIDAI_Init(&pid);
+    PIDAI_SetTunings(&pid, 0.0f, 0.0f, 1.0f);
+    PIDAI_SetOutputLimits(&pid, -10000.0f, 10000.0f);
+    PIDAI_SetTarget(&pid, 10.0f);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&pid, 1);
+
+    /* AUTO 下运行两帧，让 last_feedback 建立为 10。 */
+    PIDAI_Update(&pid, 10.0f, 10U, 10.0f);
+    PIDAI_Update(&pid, 10.0f, 20U, 10.0f);
+
+    /* 切 MANUAL，feedback 漂移到 50。MANUAL 不更新 last_feedback。 */
+    PIDAI_SetMode(&pid, PIDAI_MODE_MANUAL);
+    PIDAI_Update(&pid, 50.0f, 30U, 10.0f);
+
+    /* 切回 AUTO，首帧 feedback 仍为 50。如果 last_feedback 未重置，
+     * d_error = 50 - 10 = 40，d_out 会产生巨大冲击。
+     * 修复后 SetMode(AUTO) 重置 NaN 哨兵，首帧跳过 D 项。 */
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    out = PIDAI_Update(&pid, 50.0f, 40U, 10.0f);
+    if (!float_close(pid.d_error, 0.0f)) return 0;
+    if (!float_close(pid.d_out, 0.0f)) return 0;
+
+    /* 第二帧 feedback 变为 51，D 项应正常工作。 */
+    out = PIDAI_Update(&pid, 51.0f, 50U, 10.0f);
+    if (!float_close(pid.d_error, 1.0f)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
+ *   回归测试不经过 Reset 的 disable→enable 切换不会产生 D 项首帧尖峰。
+ *
+ * 主要流程：
+ *   1. AUTO+enable 运行几帧建立 last_feedback 前值。
+ *   2. 禁用 PID 后运行一帧（feedback 漂移）。
+ *   3. 重新使能，验证首帧 D 项被跳过。
+ *
+ * 返回值：
+ *   返回 1 表示 disable→enable 切换后首帧无 D 项冲击；返回 0 表示仍存在尖峰。
+ */
+static int test_disable_to_enable_transition_skips_d_term(void)
+{
+    PIDAI_Handle pid;
+
+    PIDAI_Init(&pid);
+    PIDAI_SetTunings(&pid, 0.0f, 0.0f, 1.0f);
+    PIDAI_SetOutputLimits(&pid, -10000.0f, 10000.0f);
+    PIDAI_SetTarget(&pid, 10.0f);
+    PIDAI_SetMode(&pid, PIDAI_MODE_AUTO);
+    PIDAI_Enable(&pid, 1);
+
+    /* AUTO+enable 下运行两帧。 */
+    PIDAI_Update(&pid, 10.0f, 10U, 10.0f);
+    PIDAI_Update(&pid, 10.0f, 20U, 10.0f);
+
+    /* 禁用 PID，feedback 漂移到 80。 */
+    PIDAI_Enable(&pid, 0);
+    PIDAI_Update(&pid, 80.0f, 30U, 10.0f);
+
+    /* 重新使能，首帧应跳过 D 项。 */
+    PIDAI_Enable(&pid, 1);
+    PIDAI_Update(&pid, 80.0f, 40U, 10.0f);
+    if (!float_close(pid.d_error, 0.0f)) return 0;
+    if (!float_close(pid.d_out, 0.0f)) return 0;
+
+    /* 第二帧 D 项正常工作。 */
+    PIDAI_Update(&pid, 82.0f, 50U, 10.0f);
+    if (!float_close(pid.d_error, 2.0f)) return 0;
+
+    return 1;
+}
+
+/*
+ * 函数作用：
  *   测试非法 feedback 和 dt_ms 不会把 NaN/Inf 写入可序列化遥测字段。
  *
  * 主要流程：
@@ -1036,6 +1127,14 @@ int main(void)
     }
     if (!test_derivative_first_auto_after_early_return_is_suppressed()) {
         printf("FAIL: test_derivative_first_auto_after_early_return_is_suppressed\n");
+        return 1;
+    }
+    if (!test_manual_to_auto_transition_skips_d_term()) {
+        printf("FAIL: test_manual_to_auto_transition_skips_d_term\n");
+        return 1;
+    }
+    if (!test_disable_to_enable_transition_skips_d_term()) {
+        printf("FAIL: test_disable_to_enable_transition_skips_d_term\n");
         return 1;
     }
     if (!test_invalid_runtime_inputs_emit_finite_fault_telemetry()) {

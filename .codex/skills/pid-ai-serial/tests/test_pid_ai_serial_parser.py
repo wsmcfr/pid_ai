@@ -1548,6 +1548,79 @@ class PidAiAutoTuneTest(unittest.TestCase):
         self.assertEqual(action["strategy"], "increase_kp_for_slow_response")
         self.assertEqual(action["command"], "{CMD}SET_PIDX,line_outer,1.260,0.030,0.080")
 
+    def test_score_loop_with_timestamps_returns_window_fallback_false(self) -> None:
+        """
+        函数作用：
+            验证有时间戳样本的评分返回 window_fallback=False。
+
+        主要流程：
+            1. 注入带 ms 时间戳的遥测窗口。
+            2. 校验 score_loop 返回 window_fallback=False。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+        self.ingest_window(controller, "speed_l", [5.0, 4.0, 3.0], start_ms=1000, step_ms=10)
+
+        score = controller.score_loop("speed_l")
+
+        self.assertFalse(score["window_fallback"])
+
+    def test_score_loop_without_timestamps_returns_window_fallback_true(self) -> None:
+        """
+        函数作用：
+            验证缺少时间戳的样本回退到最近 50 条时返回 window_fallback=True。
+
+        主要流程：
+            1. 直接向 samples_by_loop 注入无 received_at 且 ms=None 的样本，
+               模拟缺少时间信息的遥测。
+            2. 校验 score_loop 返回 window_fallback=True。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+
+        for i in range(3):
+            sample = {
+                "loop_id": "speed_l",
+                "loop_name": "left_speed",
+                "seq": float(i + 1),
+                "error": 5.0 - i,
+                "sat": 0,
+                "anti_windup": 0,
+                "sensor_ok": 1,
+                "fault": 0,
+            }
+            controller.samples_by_loop.setdefault("speed_l", []).append(sample)
+
+        score = controller.score_loop("speed_l")
+
+        self.assertTrue(score["window_fallback"])
+
+    def test_score_loop_empty_samples_returns_window_fallback_false(self) -> None:
+        """
+        函数作用：
+            验证空样本时 window_fallback=False（没有回退行为发生）。
+
+        主要流程：
+            1. 注入配置但不注入遥测。
+            2. 校验 score_loop 返回 window_fallback=False。
+
+        返回值：
+            unittest 断言失败时抛出异常；通过时无返回值。
+        """
+        controller = self.make_controller()
+        self.ingest_cfgs(controller)
+
+        score = controller.score_loop("speed_l")
+
+        self.assertFalse(score["window_fallback"])
+        self.assertEqual(score["score"], float("inf"))
+
 
 if __name__ == "__main__":
     unittest.main()
